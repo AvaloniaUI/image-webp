@@ -1,4 +1,4 @@
-//! Encodes a large image built by tiling a PNG, with image-webp or libwebp, for timing and
+//! Encodes a large image built by tiling an RGB or RGBA PNG, with image-webp or libwebp, for timing and
 //! peak-memory measurement (`/usr/bin/time -v` / `-l`).
 //!
 //! cargo run --release --example lossy_bench -- ours|ours-rows|libwebp in.png [WxH] [quality] [method]
@@ -17,7 +17,16 @@ fn main() {
     let mut reader = decoder.read_info().unwrap();
     let mut buf = vec![0; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buf).unwrap();
-    assert_eq!(info.color_type, png::ColorType::Rgb);
+    let bpp = match info.color_type {
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        c => panic!("{c:?}"),
+    };
+    let color = if bpp == 4 {
+        ColorType::Rgba8
+    } else {
+        ColorType::Rgb8
+    };
     let (sw, sh) = (info.width as usize, info.height as usize);
     let (w, h) = args
         .get(3)
@@ -37,14 +46,14 @@ fn main() {
         for x in 0..w {
             let tx = x / sw;
             let sx = if tx % 2 == 0 { x % sw } else { sw - 1 - x % sw };
-            row[x * 3..][..3].copy_from_slice(&buf[(sy * sw + sx) * 3..][..3]);
+            row[x * bpp..][..bpp].copy_from_slice(&buf[(sy * sw + sx) * bpp..][..bpp]);
         }
     };
     let rgb = if which == "ours-rows" {
         Vec::new()
     } else {
-        let mut rgb = vec![0u8; w * h * 3];
-        for (y, row) in rgb.chunks_exact_mut(w * 3).enumerate() {
+        let mut rgb = vec![0u8; w * h * bpp];
+        for (y, row) in rgb.chunks_exact_mut(w * bpp).enumerate() {
             tile_row(y, row);
         }
         rgb
@@ -60,9 +69,7 @@ fn main() {
             params.lossy_quality = quality;
             params.lossy_method = method;
             encoder.set_params(params);
-            encoder
-                .encode(&rgb, w as u32, h as u32, ColorType::Rgb8)
-                .unwrap();
+            encoder.encode(&rgb, w as u32, h as u32, color).unwrap();
             out.len()
         }
         "ours-rows" => {
@@ -74,7 +81,7 @@ fn main() {
             params.lossy_method = method;
             encoder.set_params(params);
             encoder
-                .encode_rows(w as u32, h as u32, ColorType::Rgb8, |y, row| {
+                .encode_rows(w as u32, h as u32, color, |y, row| {
                     tile_row(y as usize, row)
                 })
                 .unwrap();
@@ -93,7 +100,11 @@ fn main() {
             sys::WebPPictureInitInternal(&mut pic, sys::WEBP_ENCODER_ABI_VERSION as i32);
             pic.width = w as i32;
             pic.height = h as i32;
-            sys::WebPPictureImportRGB(&mut pic, rgb.as_ptr(), (w * 3) as i32);
+            if bpp == 4 {
+                sys::WebPPictureImportRGBA(&mut pic, rgb.as_ptr(), (w * 4) as i32);
+            } else {
+                sys::WebPPictureImportRGB(&mut pic, rgb.as_ptr(), (w * 3) as i32);
+            }
             let mut writer = std::mem::zeroed::<sys::WebPMemoryWriter>();
             sys::WebPMemoryWriterInit(&mut writer);
             pic.writer = Some(sys::WebPMemoryWrite);

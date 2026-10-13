@@ -5,14 +5,16 @@
 //! libwebp's animation decoder and with image-webp's, which have to agree.
 //!
 //! cargo run --release --example anim_vs_libwebp -- [-q 30,75,90] [-m 0,4,6] [--lossless]
-//!     [--argb] [--frames N] [--size WxH] [animated.webp ...]
+//!     [--argb] [--frames N] [--size WxH] [--crc] [--bench N] [animated.webp ...]
 //!
 //! Without files the synthetic animations run: a moving square, small changes, full-frame
 //! noise, an alpha fade, identical frames, one frame, 2x2, a sprite over transparency.
 //! `--argb` feeds libwebp ARGB frames as this crate is fed, instead of the YUV libvips imports
 //! lossy frames as (which libwebp turns back into ARGB, losing chroma). The gate check fails the run
 //! (exit 1) where a lossy case is more than 0.5 dB under libwebp or more than 5% larger, or a
-//! lossless case is not pixel-identical.
+//! lossless case is not pixel-identical. `--crc` prints a checksum of this crate's file per case
+//! instead, to hold a speed change to the bytes it wrote before; `--bench N` times each side N
+//! times in turn and prints the fastest and the median run.
 
 use std::io::Cursor;
 use std::process::Command;
@@ -195,6 +197,12 @@ pub fn synthetic(frames: usize, width: u32, height: u32) -> Vec<Animation> {
         frames: sprite,
     });
     out
+}
+
+fn fnv1a(data: &[u8]) -> u64 {
+    data.iter().fold(0xcbf29ce484222325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
+    })
 }
 
 fn load(path: &str) -> Animation {
@@ -545,6 +553,8 @@ fn main() {
     let mut size = (256, 192);
     let mut files = Vec::new();
     let mut child_mode = None;
+    let mut crc = false;
+    let mut bench = 0;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -558,6 +568,11 @@ fn main() {
             }
             "--lossless" => lossless = true,
             "--argb" => argb = true,
+            "--crc" => crc = true,
+            "--bench" => {
+                bench = args[i + 1].parse().unwrap();
+                i += 1;
+            }
             "--frames" => {
                 frames = args[i + 1].parse().unwrap();
                 i += 1;
@@ -612,6 +627,50 @@ fn main() {
             start.elapsed().as_secs_f64() * 1000.,
             peak_rss_kb()
         );
+        return;
+    }
+
+    if crc || bench > 0 {
+        for a in &animations {
+            for s in &settings {
+                let label = format!(
+                    "q{} m{}{}",
+                    s.quality,
+                    s.method,
+                    if s.lossless { " ll" } else { "" }
+                );
+                if crc {
+                    let data = encode_ours(a, *s);
+                    println!(
+                        "crc {:<24} {:>10} {:016x} {:>9}",
+                        a.name,
+                        label,
+                        fnv1a(&data),
+                        data.len()
+                    );
+                }
+                if bench > 0 {
+                    let (mut ours, mut theirs) = (Vec::new(), Vec::new());
+                    for _ in 0..bench {
+                        let start = Instant::now();
+                        std::hint::black_box(encode_ours(a, *s));
+                        ours.push(start.elapsed().as_secs_f64() * 1000.);
+                        let start = Instant::now();
+                        std::hint::black_box(encode_libwebp(a, *s));
+                        theirs.push(start.elapsed().as_secs_f64() * 1000.);
+                    }
+                    let stats = |v: &mut Vec<f64>| {
+                        v.sort_by(f64::total_cmp);
+                        (v[0], v[v.len() / 2])
+                    };
+                    let ((omin, omed), (lmin, lmed)) = (stats(&mut ours), stats(&mut theirs));
+                    println!(
+                        "bench {:<24} {:>10} ours {omin:7.1} min {omed:7.1} med  libwebp {lmin:7.1} min {lmed:7.1} med",
+                        a.name, label
+                    );
+                }
+            }
+        }
         return;
     }
 

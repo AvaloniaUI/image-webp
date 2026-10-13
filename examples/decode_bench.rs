@@ -126,12 +126,17 @@ fn main() {
         decoder
             .read_image_rows(|_, band| rows.extend_from_slice(band))
             .unwrap();
-        let diff = rows.iter().zip(&lib).filter(|(a, b)| a != b).count();
+        let mut decoder = image_webp::WebPDecoder::new(std::io::Cursor::new(&data)).unwrap();
+        let mut whole = vec![0; decoder.output_buffer_size().unwrap()];
+        decoder.read_image(&mut whole).unwrap();
+        let differ = |px: &[u8]| px.iter().zip(&lib).filter(|(a, b)| a != b).count();
+        let (diff, diff_whole) = (differ(&rows), differ(&whole));
         println!(
-            "check {file}: {} bytes, {diff} differ from libwebp",
+            "check {file}: {} bytes, {diff} differ from libwebp ({diff_whole} with read_image)",
             lib.len()
         );
         assert!(diff == 0 && rows.len() == lib.len());
+        assert!(diff_whole == 0 && whole.len() == lib.len());
         return;
     }
     for _ in 0..n {
