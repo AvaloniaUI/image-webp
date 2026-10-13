@@ -125,6 +125,9 @@ pub struct EncoderParams {
     pub use_lossy: bool,
     /// A quality value for the lossy encoding that must be between 0 and 100. Defaults to 95.
     pub lossy_quality: u8,
+    /// Lossy speed/size trade-off, 0 (fastest) to 6 (smallest), as libwebp's `method`.
+    /// Defaults to 4.
+    pub lossy_method: u8,
 }
 
 impl Default for EncoderParams {
@@ -133,6 +136,7 @@ impl Default for EncoderParams {
             use_predictor_transform: true,
             use_lossy: false,
             lossy_quality: 95,
+            lossy_method: 4,
         }
     }
 }

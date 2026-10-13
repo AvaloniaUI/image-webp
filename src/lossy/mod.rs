@@ -9,12 +9,11 @@ use prediction::*;
 use arithmetic_decoder::ArithmeticDecoder;
 
 mod arithmetic_decoder;
-mod arithmetic_encoder;
 mod common;
-pub(crate) mod encoder;
 mod loop_filter;
 mod prediction;
 mod transform;
+pub(crate) mod vp8enc;
 mod yuv;
 
 #[derive(Clone, Copy)]

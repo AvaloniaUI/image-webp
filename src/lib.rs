@@ -1,6 +1,6 @@
 //! Decoding and Encoding of WebP Images
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![deny(missing_docs)]
 // Increase recursion limit for the `quick_error!` macro.
 #![recursion_limit = "256"]

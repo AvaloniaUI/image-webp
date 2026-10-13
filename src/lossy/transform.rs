@@ -85,49 +85,7 @@ pub(crate) fn iwht4x4(block: &mut [i32]) {
     }
 }
 
-pub(crate) fn wht4x4(block: &mut [i32; 16]) {
-    // The intermediate results may overflow the types, so we stretch the type.
-    fn fetch(block: &[i32], idx: usize) -> i64 {
-        i64::from(block[idx])
-    }
-
-    // vertical
-    for i in 0..4 {
-        let a = fetch(block, i * 4) + fetch(block, i * 4 + 3);
-        let b = fetch(block, i * 4 + 1) + fetch(block, i * 4 + 2);
-        let c = fetch(block, i * 4 + 1) - fetch(block, i * 4 + 2);
-        let d = fetch(block, i * 4) - fetch(block, i * 4 + 3);
-
-        block[i * 4] = (a + b) as i32;
-        block[i * 4 + 1] = (c + d) as i32;
-        block[i * 4 + 2] = (a - b) as i32;
-        block[i * 4 + 3] = (d - c) as i32;
-    }
-
-    // horizontal
-    for i in 0..4 {
-        let a1 = fetch(block, i) + fetch(block, i + 12);
-        let b1 = fetch(block, i + 4) + fetch(block, i + 8);
-        let c1 = fetch(block, i + 4) - fetch(block, i + 8);
-        let d1 = fetch(block, i) - fetch(block, i + 12);
-
-        let a2 = a1 + b1;
-        let b2 = c1 + d1;
-        let c2 = a1 - b1;
-        let d2 = d1 - c1;
-
-        let a3 = (a2 + if a2 > 0 { 1 } else { 0 }) / 2;
-        let b3 = (b2 + if b2 > 0 { 1 } else { 0 }) / 2;
-        let c3 = (c2 + if c2 > 0 { 1 } else { 0 }) / 2;
-        let d3 = (d2 + if d2 > 0 { 1 } else { 0 }) / 2;
-
-        block[i] = a3 as i32;
-        block[i + 4] = b3 as i32;
-        block[i + 8] = c3 as i32;
-        block[i + 12] = d3 as i32;
-    }
-}
-
+#[cfg(test)]
 pub(crate) fn dct4x4(block: &mut [i32; 16]) {
     // The intermediate results may overflow the types, so we stretch the type.
     fn fetch(block: &[i32], idx: usize) -> i64 {

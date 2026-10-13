@@ -5,7 +5,7 @@ use quick_error::quick_error;
 
 use crate::{
     lossless::{encode_frame_lossless, EncoderParams},
-    lossy::encoder::encode_frame_lossy,
+    lossy::vp8enc::encode_frame_lossy,
 };
 
 /// Color type of the image.
@@ -26,6 +26,15 @@ pub enum ColorType {
 }
 
 impl ColorType {
+    fn bytes_per_pixel(self) -> usize {
+        match self {
+            ColorType::L8 => 1,
+            ColorType::La8 => 2,
+            ColorType::Rgb8 => 3,
+            ColorType::Rgba8 => 4,
+        }
+    }
+
     fn has_alpha(self) -> bool {
         self == ColorType::La8 || self == ColorType::Rgba8
     }
@@ -50,28 +59,13 @@ quick_error! {
     }
 }
 
-/// Encodes the alpha part of the image data losslessly.
-/// Used for lossy images that include transparency.
-///
-/// # Panics
-///
-/// Panics if the image data is not of the indicated dimensions.
+/// Encodes an alpha plane losslessly, as the payload of an `ALPH` chunk.
 fn encode_alpha_lossless<W: Write>(
     mut writer: W,
-    data: &[u8],
+    alpha_data: &[u8],
     width: u32,
     height: u32,
-    color: ColorType,
 ) -> Result<(), EncodingError> {
-    let bytes_per_pixel = match color {
-        ColorType::La8 => 2,
-        ColorType::Rgba8 => 4,
-        _ => unreachable!(),
-    };
-    if width == 0 || width > 16384 || height == 0 || height > 16384 {
-        return Err(EncodingError::InvalidDimensions);
-    }
-
     let preprocessing = 0u8;
     let filtering_method = 0u8;
     // 0 is raw alpha data
@@ -82,19 +76,11 @@ fn encode_alpha_lossless<W: Write>(
 
     writer.write_all(&[initial_byte])?;
 
-    // uncompressed raw alpha data
-    let alpha_data: Vec<u8> = data
-        .iter()
-        .skip(bytes_per_pixel - 1)
-        .step_by(bytes_per_pixel)
-        .copied()
-        .collect();
-
     debug_assert_eq!(alpha_data.len(), (width * height) as usize);
 
     encode_frame_lossless(
         writer,
-        &alpha_data,
+        alpha_data,
         width,
         height,
         ColorType::L8,
@@ -113,13 +99,20 @@ const fn chunk_size(inner_bytes: usize) -> u32 {
     }
 }
 
-fn write_chunk<W: Write>(mut w: W, name: &[u8], data: &[u8]) -> io::Result<()> {
+fn write_chunk<W: Write>(w: W, name: &[u8], data: &[u8]) -> io::Result<()> {
+    write_chunk_parts(w, name, &[data])
+}
+
+fn write_chunk_parts<W: Write>(mut w: W, name: &[u8], parts: &[&[u8]]) -> io::Result<()> {
     debug_assert!(name.len() == 4);
+    let len: usize = parts.iter().map(|p| p.len()).sum();
 
     w.write_all(name)?;
-    w.write_all(&(data.len() as u32).to_le_bytes())?;
-    w.write_all(data)?;
-    if data.len() % 2 == 1 {
+    w.write_all(&(len as u32).to_le_bytes())?;
+    for part in parts {
+        w.write_all(part)?;
+    }
+    if len % 2 == 1 {
         w.write_all(&[0])?;
     }
     Ok(())
@@ -174,30 +167,75 @@ impl<W: Write> WebPEncoder<W> {
     ///
     /// Panics if the image data is not of the indicated dimensions.
     pub fn encode(
-        mut self,
+        self,
         data: &[u8],
         width: u32,
         height: u32,
         color: ColorType,
     ) -> Result<(), EncodingError> {
+        if self.params.use_lossy {
+            let stride = width as usize * color.bytes_per_pixel();
+            return self.encode_rows(width, height, color, |y, row| {
+                row.copy_from_slice(&data[y as usize * stride..][..stride]);
+            });
+        }
         let mut frame = Vec::new();
+        encode_frame_lossless(
+            &mut frame,
+            data,
+            width,
+            height,
+            color,
+            self.params.clone(),
+            false,
+        )?;
+        self.write_container(b"VP8L", vec![frame], None, color.has_alpha(), width, height)
+    }
 
-        let lossy_with_alpha = self.params.use_lossy && color.has_alpha();
+    /// Encodes an image whose rows of `color` pixels `read_row(y, row)` writes into `row`, so
+    /// that the whole image never has to be in memory. Lossy encoding reads the rows top to
+    /// bottom, once for each of its two or three passes, and holds about 16 rows at a time;
+    /// lossless encoding reads each row once and keeps the whole image.
+    pub fn encode_rows(
+        self,
+        width: u32,
+        height: u32,
+        color: ColorType,
+        mut read_row: impl FnMut(u32, &mut [u8]),
+    ) -> Result<(), EncodingError> {
+        if !self.params.use_lossy {
+            let stride = width as usize * color.bytes_per_pixel();
+            let mut data = vec![0; stride * height as usize];
+            for (y, row) in data.chunks_exact_mut(stride).enumerate() {
+                read_row(y as u32, row);
+            }
+            return self.encode(&data, width, height, color);
+        }
+        let (parts, alpha) = encode_frame_lossy(
+            width,
+            height,
+            color,
+            self.params.lossy_quality,
+            self.params.lossy_method,
+            read_row,
+        )?;
+        self.write_container(b"VP8 ", parts, alpha, false, width, height)
+    }
 
-        let frame_chunk = if self.params.use_lossy {
-            encode_frame_lossy(
-                &mut frame,
-                data,
-                width,
-                height,
-                color,
-                self.params.lossy_quality,
-            )?;
-            b"VP8 "
-        } else {
-            encode_frame_lossless(&mut frame, data, width, height, color, self.params, false)?;
-            b"VP8L"
-        };
+    /// Writes the RIFF container around a frame chunk of `frame_parts`, with the `ALPH` chunk
+    /// of a lossy frame's `alpha_plane`.
+    fn write_container(
+        mut self,
+        frame_chunk: &[u8; 4],
+        frame_parts: Vec<Vec<u8>>,
+        alpha_plane: Option<Vec<u8>>,
+        lossless_with_alpha: bool,
+        width: u32,
+        height: u32,
+    ) -> Result<(), EncodingError> {
+        let frame: Vec<&[u8]> = frame_parts.iter().map(Vec::as_slice).collect();
+        let frame_len: usize = frame.iter().map(|p| p.len()).sum();
+        let lossy_with_alpha = alpha_plane.is_some();
 
         // If the image has no metadata and isn't lossy with alpha,
         // it can be encoded with the "simple" WebP container format.
@@ -209,11 +247,11 @@ impl<W: Write> WebPEncoder<W> {
         if use_simple_container {
             self.writer.write_all(b"RIFF")?;
             self.writer
-                .write_all(&(chunk_size(frame.len()) + 4).to_le_bytes())?;
+                .write_all(&(chunk_size(frame_len) + 4).to_le_bytes())?;
             self.writer.write_all(b"WEBP")?;
-            write_chunk(&mut self.writer, frame_chunk, &frame)?;
+            write_chunk_parts(&mut self.writer, frame_chunk, &frame)?;
         } else {
-            let mut total_bytes = 22 + chunk_size(frame.len());
+            let mut total_bytes = 22 + chunk_size(frame_len);
             if !self.icc_profile.is_empty() {
                 total_bytes += chunk_size(self.icc_profile.len());
             }
@@ -224,9 +262,9 @@ impl<W: Write> WebPEncoder<W> {
                 total_bytes += chunk_size(self.xmp_metadata.len());
             }
 
-            let alpha_chunk_data = if lossy_with_alpha {
+            let alpha_chunk_data = if let Some(alpha) = &alpha_plane {
                 let mut alpha_chunk = Vec::new();
-                encode_alpha_lossless(&mut alpha_chunk, data, width, height, color)?;
+                encode_alpha_lossless(&mut alpha_chunk, alpha, width, height)?;
 
                 total_bytes += chunk_size(alpha_chunk.len());
                 Some(alpha_chunk)
@@ -241,7 +279,7 @@ impl<W: Write> WebPEncoder<W> {
             if !self.exif_metadata.is_empty() {
                 flags |= 1 << 3;
             }
-            if color.has_alpha() {
+            if lossy_with_alpha || lossless_with_alpha {
                 flags |= 1 << 4;
             }
             if !self.icc_profile.is_empty() {
@@ -267,7 +305,7 @@ impl<W: Write> WebPEncoder<W> {
                 write_chunk(&mut self.writer, b"ALPH", &alpha_chunk)?;
             }
 
-            write_chunk(&mut self.writer, frame_chunk, &frame)?;
+            write_chunk_parts(&mut self.writer, frame_chunk, &frame)?;
 
             if !self.exif_metadata.is_empty() {
                 write_chunk(&mut self.writer, b"EXIF", &self.exif_metadata)?;
@@ -284,7 +322,7 @@ impl<W: Write> WebPEncoder<W> {
 
 #[cfg(test)]
 mod tests {
-    use rand::RngCore;
+    use rand::{Rng, RngCore, SeedableRng};
 
     use super::*;
 
@@ -338,6 +376,156 @@ mod tests {
         });
     }
 
+    #[allow(unsafe_code)]
+    fn libwebp_decode(data: &[u8]) -> Vec<u8> {
+        use libwebp_sys as sys;
+        let mut features = unsafe { std::mem::zeroed::<sys::WebPBitstreamFeatures>() };
+        let status = unsafe { sys::WebPGetFeatures(data.as_ptr(), data.len(), &mut features) };
+        assert_eq!(status, sys::VP8StatusCode::VP8_STATUS_OK);
+        let (mut w, mut h) = (0, 0);
+        let bpp = if features.has_alpha != 0 { 4 } else { 3 };
+        let ptr = unsafe {
+            if bpp == 4 {
+                sys::WebPDecodeRGBA(data.as_ptr(), data.len(), &mut w, &mut h)
+            } else {
+                sys::WebPDecodeRGB(data.as_ptr(), data.len(), &mut w, &mut h)
+            }
+        };
+        assert!(!ptr.is_null());
+        let out = unsafe { std::slice::from_raw_parts(ptr, (w * h * bpp) as usize) }.to_vec();
+        unsafe { sys::WebPFree(ptr.cast()) };
+        out
+    }
+
+    #[allow(unsafe_code)]
+    fn libwebp_encode_lossy(
+        data: &[u8],
+        width: u32,
+        height: u32,
+        rgba: bool,
+        quality: f32,
+        method: i32,
+    ) -> Vec<u8> {
+        use libwebp_sys as sys;
+        unsafe {
+            let mut config = std::mem::zeroed::<sys::WebPConfig>();
+            let preset = sys::WebPPreset::WEBP_PRESET_DEFAULT;
+            assert_ne!(
+                sys::WebPConfigInitInternal(
+                    &mut config,
+                    preset,
+                    quality,
+                    sys::WEBP_ENCODER_ABI_VERSION as i32
+                ),
+                0
+            );
+            config.method = method;
+            let mut pic = std::mem::zeroed::<sys::WebPPicture>();
+            assert_ne!(
+                sys::WebPPictureInitInternal(&mut pic, sys::WEBP_ENCODER_ABI_VERSION as i32),
+                0
+            );
+            pic.width = width as i32;
+            pic.height = height as i32;
+            if rgba {
+                sys::WebPPictureImportRGBA(&mut pic, data.as_ptr(), (width * 4) as i32);
+            } else {
+                sys::WebPPictureImportRGB(&mut pic, data.as_ptr(), (width * 3) as i32);
+            }
+            let mut writer = std::mem::zeroed::<sys::WebPMemoryWriter>();
+            sys::WebPMemoryWriterInit(&mut writer);
+            pic.writer = Some(sys::WebPMemoryWrite);
+            pic.custom_ptr = (&mut writer as *mut sys::WebPMemoryWriter).cast();
+            assert_ne!(sys::WebPEncode(&config, &mut pic), 0);
+            let out = std::slice::from_raw_parts(writer.mem, writer.size).to_vec();
+            sys::WebPMemoryWriterClear(&mut writer);
+            sys::WebPPictureFree(&mut pic);
+            out
+        }
+    }
+
+    /// A smooth gradient with noise, flat and sharp areas, in odd dimensions.
+    fn test_pattern(width: u32, height: u32, bpp: usize) -> Vec<u8> {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let mut img = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                let noise: u8 = rng.gen_range(0..24);
+                let px = if x < width / 4 {
+                    [90, 160, 200]
+                } else if (x / 8 + y / 8) % 2 == 0 && y > height / 2 {
+                    [250, 250, 250]
+                } else {
+                    [
+                        (x * 255 / width) as u8 ^ noise,
+                        (y * 255 / height) as u8,
+                        noise * 4,
+                    ]
+                };
+                img.extend_from_slice(&px);
+                if bpp == 4 {
+                    img.push(if x + 9 > width {
+                        0
+                    } else if y < 5 {
+                        128
+                    } else {
+                        255
+                    });
+                }
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn lossy_matches_libwebp() {
+        let (width, height) = (83, 61);
+        for rgba in [false, true] {
+            let img = test_pattern(width, height, if rgba { 4 } else { 3 });
+            let color = if rgba {
+                crate::ColorType::Rgba8
+            } else {
+                crate::ColorType::Rgb8
+            };
+            for method in 0..=6u8 {
+                for quality in [10u8, 75, 99] {
+                    let mut params = EncoderParams::default();
+                    params.use_lossy = true;
+                    params.lossy_quality = quality;
+                    params.lossy_method = method;
+                    let mut ours = Vec::new();
+                    let mut encoder = WebPEncoder::new(&mut ours);
+                    encoder.set_params(params);
+                    encoder.encode(&img, width, height, color).unwrap();
+                    let lib = libwebp_encode_lossy(
+                        &img,
+                        width,
+                        height,
+                        rgba,
+                        f32::from(quality),
+                        i32::from(method),
+                    );
+                    if rgba {
+                        // The ALPH chunk comes from our own lossless encoder; the VP8 chunk must match.
+                        let vp8 = |d: &[u8]| {
+                            d.windows(4)
+                                .position(|w| w == b"VP8 ")
+                                .map(|i| d[i..].to_vec())
+                                .unwrap()
+                        };
+                        assert_eq!(
+                            vp8(&ours),
+                            vp8(&lib),
+                            "rgba method {method} quality {quality}"
+                        );
+                    } else {
+                        assert_eq!(ours, lib, "rgb method {method} quality {quality}");
+                    }
+                }
+            }
+        }
+    }
+
     fn roundtrip_libwebp_params(params: EncoderParams) {
         println!("Testing {params:?}");
 
@@ -350,7 +538,7 @@ mod tests {
         encoder
             .encode(&img[..256 * 256 * 3], 256, 256, crate::ColorType::Rgb8)
             .unwrap();
-        let decoded = webp::Decoder::new(&output).decode().unwrap();
+        let decoded = libwebp_decode(&output);
         assert_eq!(img[..256 * 256 * 3], *decoded);
 
         let mut output = Vec::new();
@@ -359,7 +547,7 @@ mod tests {
         encoder
             .encode(&img, 256, 256, crate::ColorType::Rgba8)
             .unwrap();
-        let decoded = webp::Decoder::new(&output).decode().unwrap();
+        let decoded = libwebp_decode(&output);
         assert_eq!(img, *decoded);
 
         let mut output = Vec::new();
@@ -369,7 +557,7 @@ mod tests {
         encoder
             .encode(&img, 256, 256, crate::ColorType::Rgba8)
             .unwrap();
-        let decoded = webp::Decoder::new(&output).decode().unwrap();
+        let decoded = libwebp_decode(&output);
         assert_eq!(img, *decoded);
 
         let mut output = Vec::new();
@@ -379,7 +567,7 @@ mod tests {
         encoder
             .encode(&img, 256, 256, crate::ColorType::Rgba8)
             .unwrap();
-        let decoded = webp::Decoder::new(&output).decode().unwrap();
+        let decoded = libwebp_decode(&output);
         assert_eq!(img, *decoded);
 
         let mut output = Vec::new();
@@ -391,7 +579,7 @@ mod tests {
         encoder
             .encode(&img, 256, 256, crate::ColorType::Rgba8)
             .unwrap();
-        let decoded = webp::Decoder::new(&output).decode().unwrap();
+        let decoded = libwebp_decode(&output);
         assert_eq!(img, *decoded);
     }
 }
