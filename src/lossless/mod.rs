@@ -1,10 +1,46 @@
 mod decoder;
-mod encoder;
-
-pub use encoder::EncoderParams;
+pub(crate) mod vp8l;
 
 pub(crate) use decoder::LosslessDecoder;
-pub(crate) use encoder::encode_frame_lossless;
+
+/// Allows fine-tuning some encoder parameters.
+///
+/// Pass to [`WebPEncoder::set_params()`](crate::WebPEncoder::set_params).
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct EncoderParams {
+    /// Let lossless encoding use the predictor transform. Enabled by default.
+    pub use_predictor_transform: bool,
+    /// Use the lossy encoding to encode the image using the VP8 compression format.
+    pub use_lossy: bool,
+    /// A quality value for the lossy encoding that must be between 0 and 100. Defaults to 95.
+    pub lossy_quality: u8,
+    /// Lossy speed/size trade-off, 0 (fastest) to 6 (smallest), as libwebp's `method`.
+    /// It also sets the effort spent on the alpha plane. Defaults to 4.
+    pub lossy_method: u8,
+    /// Lossless effort, 0 to 100, as libwebp's `quality` with `lossless = 1`. Defaults to 75.
+    pub lossless_quality: u8,
+    /// Lossless speed/size trade-off, 0 (fastest) to 6 (smallest), as libwebp's `method`.
+    /// Defaults to 4.
+    pub lossless_method: u8,
+    /// Keep the RGB values of fully transparent pixels in lossless encoding, as libwebp's
+    /// `exact`. Off by default, which lets them become black for better compression.
+    pub lossless_exact: bool,
+}
+
+impl Default for EncoderParams {
+    fn default() -> Self {
+        Self {
+            use_predictor_transform: true,
+            use_lossy: false,
+            lossy_quality: 95,
+            lossy_method: 4,
+            lossless_quality: 75,
+            lossless_method: 4,
+            lossless_exact: false,
+        }
+    }
+}
 
 const CODE_LENGTH_CODES: usize = 19;
 const CODE_LENGTH_CODE_ORDER: [usize; CODE_LENGTH_CODES] = [
