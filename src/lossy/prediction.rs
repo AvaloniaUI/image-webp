@@ -9,140 +9,66 @@ use super::common::IntraMode;
 pub(crate) const LUMA_BLOCK_SIZE: usize = (1 + 16 + 4) * (1 + 16);
 pub(crate) const LUMA_STRIDE: usize = 1 + 16 + 4;
 
-/// Creates a luma block with border used for luma prediction
-pub(crate) fn create_border_luma(
+/// Sets the borders of the luma block `ws` of macroblock `mbx`, `mby` from the row above,
+/// `top`, and from the block of the previous macroblock in the row that `ws` still holds.
+pub(crate) fn update_border_luma(
+    ws: &mut [u8; LUMA_BLOCK_SIZE],
     mbx: usize,
     mby: usize,
     mbw: usize,
     top: &[u8],
-    left: &[u8],
-) -> [u8; LUMA_BLOCK_SIZE] {
+) {
     let stride = LUMA_STRIDE;
-    let mut ws = [0u8; LUMA_BLOCK_SIZE];
-
-    // A
-    {
-        let above = &mut ws[1..stride];
-        if mby == 0 {
-            for above in above.iter_mut() {
-                *above = 127;
-            }
-        } else {
-            for (above, &top) in above[..16].iter_mut().zip(&top[mbx * 16..]) {
-                *above = top;
-            }
-
-            if mbx == mbw - 1 {
-                for above in &mut above[16..] {
-                    *above = top[mbx * 16 + 15];
-                }
-            } else {
-                for (above, &top) in above[16..].iter_mut().zip(&top[mbx * 16 + 16..]) {
-                    *above = top;
-                }
-            }
-        }
-    }
-
-    for i in 17usize..stride {
-        ws[4 * stride + i] = ws[i];
-        ws[8 * stride + i] = ws[i];
-        ws[12 * stride + i] = ws[i];
-    }
-
-    // L
     if mbx == 0 {
-        for i in 0usize..16 {
-            ws[(i + 1) * stride] = 129;
+        for y in 1..17 {
+            ws[y * stride] = 129;
         }
+        ws[0] = if mby == 0 { 127 } else { 129 };
     } else {
-        for (i, &left) in (0usize..16).zip(&left[1..]) {
-            ws[(i + 1) * stride] = left;
+        for y in 0..17 {
+            ws[y * stride] = ws[y * stride + 16];
         }
     }
-
-    // P
-    ws[0] = if mby == 0 {
-        127
-    } else if mbx == 0 {
-        129
+    if mby == 0 {
+        ws[1..stride].fill(127);
     } else {
-        left[0]
-    };
-
-    ws
+        ws[1..17].copy_from_slice(&top[mbx * 16..][..16]);
+        if mbx == mbw - 1 {
+            ws[17..stride].fill(top[mbx * 16 + 15]);
+        } else {
+            ws[17..stride].copy_from_slice(&top[mbx * 16 + 16..][..4]);
+        }
+    }
+    for y in [4, 8, 12] {
+        ws.copy_within(17..stride, y * stride + 17);
+    }
 }
 
 pub(crate) const CHROMA_BLOCK_SIZE: usize = (8 + 1) * (8 + 1);
 pub(crate) const CHROMA_STRIDE: usize = 8 + 1;
 
-/// Creates a chroma block with border used for chroma prediction
-pub(crate) fn create_border_chroma(
+/// [`update_border_luma`] of a chroma block.
+pub(crate) fn update_border_chroma(
+    ws: &mut [u8; CHROMA_BLOCK_SIZE],
     mbx: usize,
     mby: usize,
     top: &[u8],
-    left: &[u8],
-) -> [u8; CHROMA_BLOCK_SIZE] {
-    let stride: usize = CHROMA_STRIDE;
-    let mut chroma_block = [0u8; CHROMA_BLOCK_SIZE];
-
-    // above
-    {
-        let above = &mut chroma_block[1..stride];
-        if mby == 0 {
-            for above in above.iter_mut() {
-                *above = 127;
-            }
-        } else {
-            for (above, &top) in above.iter_mut().zip(&top[mbx * 8..]) {
-                *above = top;
-            }
-        }
-    }
-
-    // left
-    if mbx == 0 {
-        for y in 0usize..8 {
-            chroma_block[(y + 1) * stride] = 129;
-        }
-    } else {
-        for (y, &left) in (0usize..8).zip(&left[1..]) {
-            chroma_block[(y + 1) * stride] = left;
-        }
-    }
-
-    chroma_block[0] = if mby == 0 {
-        127
-    } else if mbx == 0 {
-        129
-    } else {
-        left[0]
-    };
-
-    chroma_block
-}
-
-// Helper function for adding residue to a 4x4 sub-block
-// from a contiguous block of 16
-//
-// Only 16 elements from rblock are used to add residue, so it is restricted to 16 elements
-// to enable SIMD and other optimizations.
-//
-// Clippy suggests the clamp method, but it seems to optimize worse as of rustc 1.82.0 nightly.
-#[allow(clippy::manual_clamp)]
-pub(crate) fn add_residue(
-    pblock: &mut [u8],
-    rblock: &[i32; 16],
-    y0: usize,
-    x0: usize,
-    stride: usize,
 ) {
-    let mut pos = y0 * stride + x0;
-    for row in rblock.chunks(4) {
-        for (p, &a) in pblock[pos..][..4].iter_mut().zip(row.iter()) {
-            *p = (a + i32::from(*p)).max(0).min(255) as u8;
+    let stride = CHROMA_STRIDE;
+    if mbx == 0 {
+        for y in 1..9 {
+            ws[y * stride] = 129;
         }
-        pos += stride;
+        ws[0] = if mby == 0 { 127 } else { 129 };
+    } else {
+        for y in 0..9 {
+            ws[y * stride] = ws[y * stride + 8];
+        }
+    }
+    if mby == 0 {
+        ws[1..stride].fill(127);
+    } else {
+        ws[1..stride].copy_from_slice(&top[mbx * 8..][..8]);
     }
 }
 
@@ -156,7 +82,13 @@ fn avg2(this: u8, right: u8) -> u8 {
     avg as u8
 }
 
-pub(crate) fn predict_4x4(ws: &mut [u8], stride: usize, modes: &[IntraMode], resdata: &[i32]) {
+pub(crate) fn predict_4x4(
+    ws: &mut [u8],
+    stride: usize,
+    modes: &[IntraMode],
+    resdata: &[i32],
+    kinds: &[u8],
+) {
     for sby in 0usize..4 {
         for sbx in 0usize..4 {
             let i = sbx + sby * 4;
@@ -164,22 +96,61 @@ pub(crate) fn predict_4x4(ws: &mut [u8], stride: usize, modes: &[IntraMode], res
             let x0 = sbx * 4 + 1;
 
             match modes[i] {
-                IntraMode::TM => predict_tmpred(ws, 4, x0, y0, stride),
-                IntraMode::VE => predict_bvepred(ws, x0, y0, stride),
+                IntraMode::TM => tm4(ws, x0, y0, stride),
+                IntraMode::VE => ve4(ws, x0, y0, stride),
                 IntraMode::HE => predict_bhepred(ws, x0, y0, stride),
                 IntraMode::DC => predict_bdcpred(ws, x0, y0, stride),
-                IntraMode::LD => predict_bldpred(ws, x0, y0, stride),
-                IntraMode::RD => predict_brdpred(ws, x0, y0, stride),
-                IntraMode::VR => predict_bvrpred(ws, x0, y0, stride),
-                IntraMode::VL => predict_bvlpred(ws, x0, y0, stride),
+                IntraMode::LD => ld4(ws, x0, y0, stride),
+                IntraMode::RD => rd4(ws, x0, y0, stride),
+                IntraMode::VR => vr4(ws, x0, y0, stride),
+                IntraMode::VL => vl4(ws, x0, y0, stride),
                 IntraMode::HD => predict_bhdpred(ws, x0, y0, stride),
                 IntraMode::HU => predict_bhupred(ws, x0, y0, stride),
             }
 
-            let rb: &[i32; 16] = resdata[i * 16..][..16].try_into().unwrap();
-            add_residue(ws, rb, y0, x0, stride);
+            super::transform::add_coeffs(
+                ws,
+                &resdata[i * 16..][..16],
+                kinds[i],
+                y0 * stride + x0,
+                stride,
+            );
         }
     }
+}
+
+macro_rules! simd_or_portable {
+    ($($name:ident: $simd:expr, $portable:ident;)*) => {$(
+        #[inline(always)]
+        fn $name(ws: &mut [u8], x0: usize, y0: usize, stride: usize) {
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            $simd(ws, y0 * stride + x0, stride);
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            $portable(ws, x0, y0, stride);
+        }
+    )*};
+}
+
+simd_or_portable! {
+    tm4: super::simd::tm::<4>, predict_btmpred;
+    ve4: super::simd::ve4, predict_bvepred;
+    ld4: super::simd::ld4, predict_bldpred;
+    rd4: super::simd::rd4, predict_brdpred;
+    vr4: super::simd::vr4, predict_bvrpred;
+    vl4: super::simd::vl4, predict_bvlpred;
+}
+
+/// TrueMotion of a `SIZE`x`SIZE` block at `x0`, `y0`.
+pub(crate) fn predict_tm<const SIZE: usize>(ws: &mut [u8], x0: usize, y0: usize, stride: usize) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    super::simd::tm::<SIZE>(ws, y0 * stride + x0, stride);
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    predict_tmpred(ws, SIZE, x0, y0, stride);
+}
+
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+fn predict_btmpred(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
+    predict_tmpred(a, 4, x0, y0, stride);
 }
 
 pub(crate) fn predict_vpred(a: &mut [u8], size: usize, x0: usize, y0: usize, stride: usize) {
@@ -202,6 +173,16 @@ pub(crate) fn predict_hpred(a: &mut [u8], size: usize, x0: usize, y0: usize, str
     }
 }
 
+/// DC prediction of the `SIZE`x`SIZE` block at 1, 1 from the row above and the column to the
+/// left, as far as they are given.
+pub(crate) fn predict_dc<const SIZE: usize>(ws: &mut [u8], stride: usize, above: bool, left: bool) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    super::simd::dc::<SIZE>(ws, stride + 1, stride, above, left);
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    predict_dcpred(ws, SIZE, stride, above, left);
+}
+
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 pub(crate) fn predict_dcpred(a: &mut [u8], size: usize, stride: usize, above: bool, left: bool) {
     let mut sum = 0;
     let mut shf = if size == 8 { 2 } else { 3 };
@@ -235,6 +216,7 @@ pub(crate) fn predict_dcpred(a: &mut [u8], size: usize, stride: usize, above: bo
 
 // Clippy suggests the clamp method, but it seems to optimize worse as of rustc 1.82.0 nightly.
 #[allow(clippy::manual_clamp)]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 pub(crate) fn predict_tmpred(a: &mut [u8], size: usize, x0: usize, y0: usize, stride: usize) {
     // The formula for tmpred is:
     // X_ij = L_i + A_j - P (i, j=0, 1, 2, 3)
@@ -336,6 +318,7 @@ fn edge_pixels(
     (e0, e1, e2, e3, e4, e5, e6, e7, e8)
 }
 
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 pub(crate) fn predict_bvepred(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     let p = topleft_pixel(a, x0, y0, stride);
     let (a0, a1, a2, a3, a4, ..) = top_pixels(a, x0, y0, stride);
@@ -373,6 +356,7 @@ pub(crate) fn predict_bhepred(a: &mut [u8], x0: usize, y0: usize, stride: usize)
     }
 }
 
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 pub(crate) fn predict_bldpred(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     let (a0, a1, a2, a3, a4, a5, a6, a7) = top_pixels(a, x0, y0, stride);
 
@@ -394,6 +378,7 @@ pub(crate) fn predict_bldpred(a: &mut [u8], x0: usize, y0: usize, stride: usize)
     }
 }
 
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 pub(crate) fn predict_brdpred(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     let (e0, e1, e2, e3, e4, e5, e6, e7, e8) = edge_pixels(a, x0, y0, stride);
 
@@ -414,6 +399,7 @@ pub(crate) fn predict_brdpred(a: &mut [u8], x0: usize, y0: usize, stride: usize)
     }
 }
 
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 pub(crate) fn predict_bvrpred(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     let (_, e1, e2, e3, e4, e5, e6, e7, e8) = edge_pixels(a, x0, y0, stride);
 
@@ -435,6 +421,7 @@ pub(crate) fn predict_bvrpred(a: &mut [u8], x0: usize, y0: usize, stride: usize)
     a[y0 * stride + x0 + 3] = avg2(e7, e8);
 }
 
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 pub(crate) fn predict_bvlpred(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     let (a0, a1, a2, a3, a4, a5, a6, a7) = top_pixels(a, x0, y0, stride);
 
@@ -607,6 +594,86 @@ mod benches {
 mod tests {
     use super::*;
 
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn simd_predictors_match_portable() {
+        use crate::lossy::simd;
+        use rand::{Rng, SeedableRng};
+        type Pair = (
+            fn(&mut [u8], usize, usize),
+            fn(&mut [u8], usize, usize, usize),
+        );
+        let pairs: [Pair; 6] = [
+            (simd::tm::<4>, predict_btmpred),
+            (simd::ve4, predict_bvepred),
+            (simd::ld4, predict_bldpred),
+            (simd::rd4, predict_brdpred),
+            (simd::vr4, predict_bvrpred),
+            (simd::vl4, predict_bvlpred),
+        ];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        for round in 0..3000 {
+            let ws: Vec<u8> = (0..LUMA_BLOCK_SIZE)
+                .map(|_| {
+                    if round % 3 == 0 {
+                        rng.gen_range(0..2) * 255
+                    } else {
+                        rng.gen()
+                    }
+                })
+                .collect();
+            let (x0, y0) = (1 + 4 * rng.gen_range(0..4), 1 + 4 * rng.gen_range(0..4));
+            for (mode, (simd, portable)) in pairs.iter().enumerate() {
+                let (mut a, mut b) = (ws.clone(), ws.clone());
+                simd(&mut a, y0 * LUMA_STRIDE + x0, LUMA_STRIDE);
+                portable(&mut b, x0, y0, LUMA_STRIDE);
+                assert_eq!(a, b, "mode {mode} at {x0} {y0}");
+            }
+            let (mut a, mut b) = (ws.clone(), ws.clone());
+            simd::tm::<16>(&mut a, LUMA_STRIDE + 1, LUMA_STRIDE);
+            predict_tmpred(&mut b, 16, 1, 1, LUMA_STRIDE);
+            assert_eq!(a, b);
+            let (mut a, mut b) = (
+                ws[..CHROMA_BLOCK_SIZE].to_vec(),
+                ws[..CHROMA_BLOCK_SIZE].to_vec(),
+            );
+            simd::tm::<8>(&mut a, CHROMA_STRIDE + 1, CHROMA_STRIDE);
+            predict_tmpred(&mut b, 8, 1, 1, CHROMA_STRIDE);
+            assert_eq!(a, b);
+        }
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn simd_dc_matches_portable() {
+        use crate::lossy::simd;
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        for round in 0..4000 {
+            let ws: Vec<u8> = (0..LUMA_BLOCK_SIZE)
+                .map(|_| {
+                    if round % 3 == 0 {
+                        rng.gen_range(0..2) * 255
+                    } else {
+                        rng.gen()
+                    }
+                })
+                .collect();
+            let (top, left) = (round & 1 != 0, round & 2 != 0);
+            let (mut a, mut b) = (ws.clone(), ws.clone());
+            simd::dc::<16>(&mut a, LUMA_STRIDE + 1, LUMA_STRIDE, top, left);
+            predict_dcpred(&mut b, 16, LUMA_STRIDE, top, left);
+            assert_eq!(a, b);
+            let (mut a, mut b) = (
+                ws[..CHROMA_BLOCK_SIZE].to_vec(),
+                ws[..CHROMA_BLOCK_SIZE].to_vec(),
+            );
+            simd::dc::<8>(&mut a, CHROMA_STRIDE + 1, CHROMA_STRIDE, top, left);
+            predict_dcpred(&mut b, 8, CHROMA_STRIDE, top, left);
+            assert_eq!(a, b);
+        }
+    }
+
     #[test]
     fn test_avg2() {
         for i in 0u8..=255 {
@@ -701,21 +768,6 @@ mod tests {
         assert_eq!(e5, 6);
         assert_eq!(e6, 7);
         assert_eq!(e7, 8);
-    }
-
-    #[test]
-    fn test_add_residue() {
-        let mut pblock = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
-        let rblock = [
-            -1, -2, -3, -4, 250, 249, 248, 250, -10, -18, -192, -17, -3, 15, 18, 9,
-        ];
-        let expected: [u8; 16] = [0, 0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 0, 10, 29, 33, 25];
-
-        add_residue(&mut pblock, &rblock, 0, 0, 4);
-
-        for (&e, &i) in expected.iter().zip(&pblock) {
-            assert_eq!(e, i);
-        }
     }
 
     #[test]

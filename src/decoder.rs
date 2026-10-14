@@ -6,10 +6,12 @@ use std::io::{self, BufRead, Cursor, Read, Seek};
 use std::num::NonZeroU16;
 use std::ops::Range;
 
-use crate::extended::{self, get_alpha_predictor, read_alpha_chunk, WebPExtendedInfo};
+use crate::extended::{
+    self, get_alpha_predictor, read_alpha_chunk, unfilter_alpha_row, AlphaChunk, WebPExtendedInfo,
+};
 
 use super::lossless::LosslessDecoder;
-use super::lossy::Vp8Decoder;
+use super::lossy::{BandDecoder, Vp8Decoder};
 
 quick_error! {
     /// Errors that can occur when attempting to decode a WebP image
@@ -691,53 +693,114 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
                 }
             }
         } else {
-            let range = self
-                .chunks
-                .get(&WebPRiffChunk::VP8)
-                .ok_or(DecodingError::ChunkMissing)?;
-            let reader = range_reader(&mut self.r, range.start..range.end)?;
-            let frame = Vp8Decoder::decode_frame(reader)?;
-            if u32::from(frame.width) != self.width || u32::from(frame.height) != self.height {
-                return Err(DecodingError::InconsistentImageSizes);
-            }
-
-            if self.has_alpha() {
-                frame.fill_rgba(buf, self.webp_decode_options.lossy_upsampling);
-
-                let range = self
-                    .chunks
-                    .get(&WebPRiffChunk::ALPH)
-                    .ok_or(DecodingError::ChunkMissing)?
-                    .clone();
-                let alpha_chunk = read_alpha_chunk(
-                    &mut range_reader(&mut self.r, range)?,
-                    self.width as u16,
-                    self.height as u16,
-                )?;
-
-                for y in 0..frame.height {
-                    for x in 0..frame.width {
-                        let predictor: u8 = get_alpha_predictor(
-                            x.into(),
-                            y.into(),
-                            frame.width.into(),
-                            alpha_chunk.filtering_method,
-                            buf,
-                        );
-
-                        let alpha_index =
-                            usize::from(y) * usize::from(frame.width) + usize::from(x);
-                        let buffer_index = alpha_index * 4 + 3;
-
-                        buf[buffer_index] = predictor.wrapping_add(alpha_chunk.data[alpha_index]);
-                    }
-                }
-            } else {
-                frame.fill_rgb(buf, self.webp_decode_options.lossy_upsampling);
+            // The band decoder's kernels and alpha unfiltering, one macroblock row at a time.
+            let mut at = 0;
+            let mut bands = self.band_reader()?;
+            while let Some((_, rows)) = bands.next_band()? {
+                buf[at..at + rows.len()].copy_from_slice(rows);
+                at += rows.len();
             }
         }
 
         Ok(())
+    }
+
+    /// Decodes the image a band of rows at a time, top to bottom, calling `f(first_row, rows)`
+    /// with whole rows in the layout of [`read_image`](Self::read_image). For animated images
+    /// this is the first frame. See [`band_reader`](Self::band_reader).
+    pub fn read_image_rows(&mut self, mut f: impl FnMut(u32, &[u8])) -> Result<(), DecodingError> {
+        let mut bands = self.band_reader()?;
+        while let Some((y, rows)) = bands.next_band()? {
+            f(y, rows);
+        }
+        Ok(())
+    }
+
+    /// Returns a reader that decodes the image a band of rows at a time, top to bottom, each
+    /// time [`BandReader::next_band`] is called. For animated images this is the first frame.
+    ///
+    /// A lossy image is decoded one macroblock row (16 rows) at a time, so only a band of rows
+    /// and the alpha plane are held instead of the whole image; lossless images are decoded
+    /// whole when the reader is created, and animations into the output layout.
+    ///
+    /// The reader does all its work on the calling thread. It is `Send` when `R` is, so a
+    /// pipeline can drive it on a thread of its own and pass the bands on.
+    pub fn band_reader(&mut self) -> Result<BandReader<'_, R>, DecodingError> {
+        let (width, height) = (self.width, self.height);
+        let bpp = if self.has_alpha() { 4 } else { 3 };
+        let buffered = |pixels: Vec<u8>| BandReader {
+            width,
+            height,
+            bpp,
+            max_band_rows: (BUFFERED_BAND_ROWS as u32).min(height),
+            source: BandSource::Buffered {
+                pixels,
+                next_row: 0,
+            },
+        };
+        if self.is_animated() {
+            let size = self
+                .output_buffer_size()
+                .ok_or(DecodingError::ImageTooLarge)?;
+            let mut buf = vec![0; size];
+            self.read_image(&mut buf)?;
+            return Ok(buffered(buf));
+        }
+        if let Some(range) = self.chunks.get(&WebPRiffChunk::VP8L).cloned() {
+            let mut decoder = LosslessDecoder::new(range_reader(&mut self.r, range)?);
+            let mut rgba = vec![0; width as usize * height as usize * 4];
+            decoder.decode_frame(width, height, false, &mut rgba)?;
+            if bpp == 3 {
+                for i in 0..width as usize * height as usize {
+                    rgba.copy_within(i * 4..i * 4 + 3, i * 3);
+                }
+                rgba.truncate(width as usize * height as usize * 3);
+            }
+            return Ok(buffered(rgba));
+        }
+        let range = self
+            .chunks
+            .get(&WebPRiffChunk::VP8)
+            .ok_or(DecodingError::ChunkMissing)?
+            .clone();
+        let upsampling = self.webp_decode_options.lossy_upsampling;
+        let check = |(w, h): (u16, u16)| {
+            if u32::from(w) != width || u32::from(h) != height {
+                Err(DecodingError::InconsistentImageSizes)
+            } else {
+                Ok(())
+            }
+        };
+        let (source, max_band_rows) = if bpp == 3 {
+            self.r.seek(io::SeekFrom::Start(range.start))?;
+            let bands = BandDecoder::new((&mut self.r).take(range.end - range.start), upsampling)?;
+            check(bands.dimensions())?;
+            let rows = bands.max_band_rows();
+            (BandSource::Rgb(bands), rows)
+        } else {
+            let alpha_range = self
+                .chunks
+                .get(&WebPRiffChunk::ALPH)
+                .ok_or(DecodingError::ChunkMissing)?
+                .clone();
+            let alpha = read_alpha_chunk(
+                &mut range_reader(&mut self.r, alpha_range)?,
+                width as u16,
+                height as u16,
+            )?;
+            self.r.seek(io::SeekFrom::Start(range.start))?;
+            let bands = BandDecoder::new((&mut self.r).take(range.end - range.start), upsampling)?;
+            check(bands.dimensions())?;
+            let rows = bands.max_band_rows();
+            (BandSource::Rgba(bands, alpha), rows)
+        };
+        Ok(BandReader {
+            width,
+            height,
+            bpp,
+            max_band_rows: max_band_rows as u32,
+            source,
+        })
     }
 
     /// Reads the next frame of the animation.
@@ -937,6 +1000,76 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
     /// Sets the upsampling method that is used in lossy decoding
     pub fn set_lossy_upsampling(&mut self, upsampling_method: UpsamplingMethod) {
         self.webp_decode_options.lossy_upsampling = upsampling_method;
+    }
+}
+
+const BUFFERED_BAND_ROWS: usize = 16;
+
+/// Decodes an image a band of rows at a time, see [`WebPDecoder::band_reader`].
+pub struct BandReader<'a, R> {
+    width: u32,
+    height: u32,
+    bpp: usize,
+    max_band_rows: u32,
+    source: BandSource<'a, R>,
+}
+
+enum BandSource<'a, R> {
+    Rgb(BandDecoder<io::Take<&'a mut R>, 3>),
+    Rgba(BandDecoder<io::Take<&'a mut R>, 4>, AlphaChunk),
+    Buffered { pixels: Vec<u8>, next_row: usize },
+}
+
+impl<R: BufRead> BandReader<'_, R> {
+    /// Decodes the next band and returns its first row and its whole rows in the layout of
+    /// [`WebPDecoder::read_image`], or `None` after the last band.
+    pub fn next_band(&mut self) -> Result<Option<(u32, &[u8])>, DecodingError> {
+        let w = self.width as usize;
+        match &mut self.source {
+            BandSource::Rgb(bands) => Ok(bands.next_band()?.map(|(y, rows)| (y, &*rows))),
+            BandSource::Rgba(bands, alpha) => {
+                let Some((y0, rows)) = bands.next_band()? else {
+                    return Ok(None);
+                };
+                for (y, row) in (y0 as usize..).zip(rows.chunks_exact_mut(w * 4)) {
+                    let (above, rest) = alpha.data.split_at_mut(y * w);
+                    let prev = (y > 0).then(|| &above[(y - 1) * w..]);
+                    let cur = &mut rest[..w];
+                    unfilter_alpha_row(alpha.filtering_method, prev, cur);
+                    for (px, &a) in row.chunks_exact_mut(4).zip(cur.iter()) {
+                        let rgb = u32::from_le_bytes(px.try_into().unwrap()) & 0x00ff_ffff;
+                        px.copy_from_slice(&(rgb | u32::from(a) << 24).to_le_bytes());
+                    }
+                }
+                Ok(Some((y0, rows)))
+            }
+            BandSource::Buffered { pixels, next_row } => {
+                let stride = w * self.bpp;
+                let y = *next_row;
+                if y >= self.height as usize {
+                    return Ok(None);
+                }
+                let rows = BUFFERED_BAND_ROWS.min(self.height as usize - y);
+                *next_row += rows;
+                Ok(Some((y as u32, &pixels[y * stride..(y + rows) * stride])))
+            }
+        }
+    }
+
+    /// Returns the (width, height) of the image in pixels.
+    pub fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// Returns the bytes per pixel of the bands: 4 (RGBA) if the image has alpha, 3 (RGB)
+    /// otherwise.
+    pub fn bytes_per_pixel(&self) -> usize {
+        self.bpp
+    }
+
+    /// Returns the most rows a band has.
+    pub fn max_band_rows(&self) -> u32 {
+        self.max_band_rows
     }
 }
 

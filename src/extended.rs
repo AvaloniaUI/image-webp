@@ -190,6 +190,70 @@ pub(crate) fn get_alpha_predictor(
     }
 }
 
+/// Reverses the alpha filter on one row, in place, given the unfiltered row above.
+pub(crate) fn unfilter_alpha_row(method: FilteringMethod, prev: Option<&[u8]>, row: &mut [u8]) {
+    if row.is_empty() {
+        return;
+    }
+    // The left neighbour stays in a register rather than being read back from `row`.
+    match (method, prev) {
+        (FilteringMethod::None, _) => {}
+        (FilteringMethod::Horizontal, _) | (_, None) => {
+            if let (FilteringMethod::Horizontal, Some(prev)) = (method, prev) {
+                row[0] = row[0].wrapping_add(prev[0]);
+            }
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            let x = crate::lossy::unfilter_horizontal(row, 1);
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            let x = 1;
+            let mut left = row[x - 1];
+            for a in &mut row[x..] {
+                left = a.wrapping_add(left);
+                *a = left;
+            }
+        }
+        (FilteringMethod::Vertical, Some(prev)) => {
+            for (a, &p) in row.iter_mut().zip(prev) {
+                *a = a.wrapping_add(p);
+            }
+        }
+        (FilteringMethod::Gradient, Some(prev)) => {
+            row[0] = row[0].wrapping_add(prev[0]);
+            let mut x = 1;
+            while x < row.len() {
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                {
+                    x = crate::lossy::unfilter_gradient(prev, row, x);
+                }
+                // After a block the running sum stopped at, the next 16 pixels; without it, all.
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                let end = row.len().min(x + 16);
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let end = row.len();
+                let mut left = row[x - 1];
+                for ((a, &top), &top_left) in
+                    row[x..end].iter_mut().zip(&prev[x..]).zip(&prev[x - 1..])
+                {
+                    let mut g = i32::from(left) + (i32::from(top) - i32::from(top_left));
+                    // Rarely taken, so the clamp stays off the chain from one pixel to the next.
+                    if g as u32 > 255 {
+                        g = clamp_gradient(g);
+                    }
+                    left = a.wrapping_add(g as u8);
+                    *a = left;
+                }
+                x = end;
+            }
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn clamp_gradient(g: i32) -> i32 {
+    g.clamp(0, 255)
+}
+
 pub(crate) fn read_extended_header<R: Read>(
     reader: &mut R,
 ) -> Result<WebPExtendedInfo, DecodingError> {
@@ -415,5 +479,70 @@ mod tests {
         // Pixels outside both rectangles should be untouched.
         let pixel = &canvas[7 * 4..7 * 4 + 4];
         assert_eq!(pixel, [0xAA, 0xAA, 0xAA, 0xAA], "untouched pixel modified");
+    }
+
+    #[test]
+    fn horizontal_unfilter_is_a_running_sum() {
+        for len in 0..80usize {
+            let prev: Vec<u8> = (0..len).map(|i| (i * 37 % 251) as u8).collect();
+            let row: Vec<u8> = (0..len).map(|i| (i * 91 % 253) as u8).collect();
+            for p in [None, Some(&prev[..])] {
+                let mut expected = row.clone();
+                if let (Some(p), true) = (p, len > 0) {
+                    expected[0] = expected[0].wrapping_add(p[0]);
+                }
+                for x in 1..len {
+                    expected[x] = expected[x].wrapping_add(expected[x - 1]);
+                }
+                let mut got = row.clone();
+                unfilter_alpha_row(FilteringMethod::Horizontal, p, &mut got);
+                assert_eq!(got, expected, "{len}");
+                if p.is_none() {
+                    let mut got = row.clone();
+                    unfilter_alpha_row(FilteringMethod::Gradient, None, &mut got);
+                    assert_eq!(got, expected, "{len}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gradient_unfilter_clamps() {
+        let mut seed = 1u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 24) as u8
+        };
+        for round in 0..400 {
+            let len = 1 + round % 300;
+            // Smooth rows with rare jumps take both the running sum and the clamping path.
+            let smooth = round % 2 == 0;
+            let mut prev = vec![next(); len];
+            for x in 1..len {
+                prev[x] = if smooth && next() > 8 {
+                    prev[x - 1].wrapping_add(next() % 3)
+                } else {
+                    next()
+                };
+            }
+            let mut row: Vec<u8> = (0..len)
+                .map(|_| {
+                    if smooth && next() > 8 {
+                        next() % 2
+                    } else {
+                        next()
+                    }
+                })
+                .collect();
+            let mut expected = row.clone();
+            expected[0] = expected[0].wrapping_add(prev[0]);
+            for x in 1..expected.len() {
+                let g = (i16::from(expected[x - 1]) + i16::from(prev[x]) - i16::from(prev[x - 1]))
+                    .clamp(0, 255) as u8;
+                expected[x] = expected[x].wrapping_add(g);
+            }
+            unfilter_alpha_row(FilteringMethod::Gradient, Some(&prev), &mut row);
+            assert_eq!(row, expected, "round {round}");
+        }
     }
 }

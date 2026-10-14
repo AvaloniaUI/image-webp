@@ -642,25 +642,7 @@ pub(crate) const COEFF_PROBS: TokenProbTables = [
     ],
 ];
 
-// DCT Tokens
-pub(crate) const DCT_0: i8 = 0;
-pub(crate) const DCT_1: i8 = 1;
-pub(crate) const DCT_2: i8 = 2;
-pub(crate) const DCT_3: i8 = 3;
-pub(crate) const DCT_4: i8 = 4;
-pub(crate) const DCT_CAT1: i8 = 5;
-pub(crate) const DCT_CAT2: i8 = 6;
-pub(crate) const DCT_CAT3: i8 = 7;
-pub(crate) const DCT_CAT4: i8 = 8;
-pub(crate) const DCT_CAT5: i8 = 9;
-pub(crate) const DCT_CAT6: i8 = 10;
-pub(crate) const DCT_EOB: i8 = 11;
-
-pub(crate) const DCT_TOKEN_TREE: [i8; 22] = [
-    -DCT_EOB, 2, -DCT_0, 4, -DCT_1, 6, 8, 12, -DCT_2, 10, -DCT_3, -DCT_4, 14, 16, -DCT_CAT1,
-    -DCT_CAT2, 18, 20, -DCT_CAT3, -DCT_CAT4, -DCT_CAT5, -DCT_CAT6,
-];
-
+/// Extra bit probabilities of the DCT token categories.
 pub(crate) const PROB_DCT_CAT: [[Prob; 12]; 6] = [
     [159, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
     [165, 145, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -669,9 +651,6 @@ pub(crate) const PROB_DCT_CAT: [[Prob; 12]; 6] = [
     [180, 157, 141, 134, 130, 0, 0, 0, 0, 0, 0, 0],
     [254, 254, 243, 230, 196, 177, 153, 140, 133, 130, 129, 0],
 ];
-
-pub(crate) const DCT_CAT_BASE: [u8; 6] = [5, 7, 11, 19, 35, 67];
-pub(crate) const COEFF_BANDS: [u8; 16] = [0, 1, 2, 3, 6, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7];
 
 #[rustfmt::skip]
 pub(crate) const DC_QUANT: [i16; 128] = [

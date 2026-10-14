@@ -11,7 +11,17 @@ use arithmetic_decoder::ArithmeticDecoder;
 mod arithmetic_decoder;
 mod common;
 mod loop_filter;
+#[cfg(target_arch = "aarch64")]
+mod neon;
 mod prediction;
+#[cfg(target_arch = "x86_64")]
+mod sse2;
+#[cfg(target_arch = "aarch64")]
+use neon as simd;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) use simd::{unfilter_gradient, unfilter_horizontal};
+#[cfg(target_arch = "x86_64")]
+use sse2 as simd;
 mod transform;
 pub(crate) mod vp8enc;
 mod yuv;
@@ -87,26 +97,6 @@ const KEYFRAME_BPRED_MODE_NODES: [[[TreeNode; 9]; 10]; 10] = {
 
 const KEYFRAME_UV_MODE_NODES: [TreeNode; 3] =
     tree_nodes_from(KEYFRAME_UV_MODE_TREE, KEYFRAME_UV_MODE_PROBS);
-
-type TokenProbTreeNodes = [[[[TreeNode; NUM_DCT_TOKENS - 1]; 3]; 8]; 4];
-
-const COEFF_PROB_NODES: TokenProbTreeNodes = {
-    let mut output = [[[[TreeNode::UNINIT; 11]; 3]; 8]; 4];
-    let mut i = 0;
-    while i < output.len() {
-        let mut j = 0;
-        while j < output[i].len() {
-            let mut k = 0;
-            while k < output[i][j].len() {
-                output[i][j][k] = tree_nodes_from(DCT_TOKEN_TREE, COEFF_PROBS[i][j][k]);
-                k += 1;
-            }
-            j += 1;
-        }
-        i += 1;
-    }
-    output
-};
 
 #[derive(Default, Clone, Copy)]
 struct MacroBlock {
@@ -270,7 +260,7 @@ pub struct Vp8Decoder<R> {
     num_partitions: u8,
 
     segment_tree_nodes: [TreeNode; 3],
-    token_probs: Box<TokenProbTreeNodes>,
+    token_probs: Box<TokenProbTables>,
 
     // Section 9.11
     prob_skip_false: Option<Prob>,
@@ -278,17 +268,23 @@ pub struct Vp8Decoder<R> {
     top: Vec<PreviousMacroBlock>,
     left: PreviousMacroBlock,
 
-    // The borders from the previous macroblock, used for predictions
+    // The bottom rows of the previous macroblock row, used for predictions
     // See Section 12
-    // Note that the left border contains the top left pixel
     top_border_y: Vec<u8>,
-    left_border_y: Vec<u8>,
-
     top_border_u: Vec<u8>,
-    left_border_u: Vec<u8>,
-
     top_border_v: Vec<u8>,
-    left_border_v: Vec<u8>,
+
+    // The macroblock being reconstructed with its borders, kept from one macroblock to the
+    // next for the left border.
+    ws_y: [u8; LUMA_BLOCK_SIZE],
+    ws_u: [u8; CHROMA_BLOCK_SIZE],
+    ws_v: [u8; CHROMA_BLOCK_SIZE],
+
+    // Luma and chroma row held in the first row of ybuf and u/vbuf; with `band_rows`,
+    // the buffers hold only a band of rows instead of the whole frame.
+    y_base: usize,
+    uv_base: usize,
+    band_rows: bool,
 }
 
 impl<R: Read> Vp8Decoder<R> {
@@ -329,7 +325,7 @@ impl<R: Read> Vp8Decoder<R> {
             num_partitions: 1,
 
             segment_tree_nodes: SEGMENT_TREE_NODE_DEFAULTS,
-            token_probs: Box::new(COEFF_PROB_NODES),
+            token_probs: Box::new(COEFF_PROBS),
 
             // Section 9.11
             prob_skip_false: None,
@@ -338,13 +334,16 @@ impl<R: Read> Vp8Decoder<R> {
             left: PreviousMacroBlock::default(),
 
             top_border_y: Vec::new(),
-            left_border_y: Vec::new(),
-
             top_border_u: Vec::new(),
-            left_border_u: Vec::new(),
-
             top_border_v: Vec::new(),
-            left_border_v: Vec::new(),
+
+            ws_y: [0; LUMA_BLOCK_SIZE],
+            ws_u: [0; CHROMA_BLOCK_SIZE],
+            ws_v: [0; CHROMA_BLOCK_SIZE],
+
+            y_base: 0,
+            uv_base: 0,
+            band_rows: false,
         }
     }
 
@@ -356,7 +355,7 @@ impl<R: Read> Vp8Decoder<R> {
                     for (t, prob) in ks.iter().enumerate().take(NUM_DCT_TOKENS - 1) {
                         if self.b.read_bool(*prob).or_accumulate(&mut res) {
                             let v = self.b.read_literal(8).or_accumulate(&mut res);
-                            self.token_probs[i][j][k][t].prob = v;
+                            self.token_probs[i][j][k][t] = v;
                         }
                     }
                 }
@@ -542,20 +541,24 @@ impl<R: Read> Vp8Decoder<R> {
         self.top = vec![PreviousMacroBlock::default(); self.mbwidth.into()];
         self.left = PreviousMacroBlock::default();
 
-        self.frame.ybuf =
-            vec![0u8; usize::from(self.mbwidth) * 16 * usize::from(self.mbheight) * 16];
-        self.frame.ubuf = vec![0u8; usize::from(self.mbwidth) * 8 * usize::from(self.mbheight) * 8];
-        self.frame.vbuf = vec![0u8; usize::from(self.mbwidth) * 8 * usize::from(self.mbheight) * 8];
+        let (luma_rows, chroma_rows) = if self.band_rows {
+            (BAND_KEEP_Y + 16, BAND_KEEP_UV + 8)
+        } else {
+            (
+                usize::from(self.mbheight) * 16,
+                usize::from(self.mbheight) * 8,
+            )
+        };
+        self.frame.ybuf = vec![0u8; usize::from(self.mbwidth) * 16 * luma_rows];
+        self.frame.ubuf = vec![0u8; usize::from(self.mbwidth) * 8 * chroma_rows];
+        self.frame.vbuf = vec![0u8; usize::from(self.mbwidth) * 8 * chroma_rows];
 
         self.top_border_y = vec![127u8; self.frame.width as usize + 4 + 16];
-        self.left_border_y = vec![129u8; 1 + 16];
 
         // 8 pixels per macroblock
         self.top_border_u = vec![127u8; 8 * self.mbwidth as usize];
-        self.left_border_u = vec![129u8; 1 + 8];
 
         self.top_border_v = vec![127u8; 8 * self.mbwidth as usize];
-        self.left_border_v = vec![129u8; 1 + 8];
 
         let size = first_partition_size as usize;
         let mut buf = vec![[0; 4]; size.div_ceil(4)];
@@ -669,114 +672,115 @@ impl<R: Read> Vp8Decoder<R> {
         self.b.check(res, mb)
     }
 
-    fn intra_predict_luma(&mut self, mbx: usize, mby: usize, mb: &MacroBlock, resdata: &[i32]) {
+    fn intra_predict_luma(
+        &mut self,
+        mbx: usize,
+        mby: usize,
+        mb: &MacroBlock,
+        resdata: &[i32],
+        kinds: &[u8; 24],
+    ) {
         let stride = 1usize + 16 + 4;
         let mw = self.mbwidth as usize;
-        let mut ws = create_border_luma(mbx, mby, mw, &self.top_border_y, &self.left_border_y);
+        let ws = &mut self.ws_y;
+        update_border_luma(ws, mbx, mby, mw, &self.top_border_y);
 
         match mb.luma_mode {
-            LumaMode::V => predict_vpred(&mut ws, 16, 1, 1, stride),
-            LumaMode::H => predict_hpred(&mut ws, 16, 1, 1, stride),
-            LumaMode::TM => predict_tmpred(&mut ws, 16, 1, 1, stride),
-            LumaMode::DC => predict_dcpred(&mut ws, 16, stride, mby != 0, mbx != 0),
-            LumaMode::B => predict_4x4(&mut ws, stride, &mb.bpred, resdata),
+            LumaMode::V => predict_vpred(ws, 16, 1, 1, stride),
+            LumaMode::H => predict_hpred(ws, 16, 1, 1, stride),
+            LumaMode::TM => predict_tm::<16>(ws, 1, 1, stride),
+            LumaMode::DC => predict_dc::<16>(ws, stride, mby != 0, mbx != 0),
+            LumaMode::B => predict_4x4(ws, stride, &mb.bpred, resdata, kinds),
         }
 
         if mb.luma_mode != LumaMode::B {
             for y in 0usize..4 {
                 for x in 0usize..4 {
                     let i = x + y * 4;
-                    // Create a reference to a [i32; 16] array for add_residue (slices of size 16 do not work).
-                    let rb: &[i32; 16] = resdata[i * 16..][..16].try_into().unwrap();
-                    let y0 = 1 + y * 4;
-                    let x0 = 1 + x * 4;
-
-                    add_residue(&mut ws, rb, y0, x0, stride);
+                    let pos = (1 + y * 4) * stride + 1 + x * 4;
+                    transform::add_coeffs(ws, &resdata[i * 16..][..16], kinds[i], pos, stride);
                 }
             }
         }
 
-        self.left_border_y[0] = ws[16];
+        self.top_border_y[mbx * 16..][..16].copy_from_slice(&ws[16 * stride + 1..][..16]);
 
-        for (i, left) in self.left_border_y[1..][..16].iter_mut().enumerate() {
-            *left = ws[(i + 1) * stride + 16];
-        }
-
-        for (top, &w) in self.top_border_y[mbx * 16..][..16]
-            .iter_mut()
-            .zip(&ws[16 * stride + 1..][..16])
-        {
-            *top = w;
-        }
-
+        let lw = mw * 16;
+        let base = (mby * 16).wrapping_sub(self.y_base) * lw + mbx * 16;
+        let dst = &mut self.frame.ybuf[base..][..15 * lw + 16];
         for y in 0usize..16 {
-            for (ybuf, &ws) in self.frame.ybuf[(mby * 16 + y) * mw * 16 + mbx * 16..][..16]
-                .iter_mut()
-                .zip(ws[(1 + y) * stride + 1..][..16].iter())
-            {
-                *ybuf = ws;
-            }
+            dst[y * lw..][..16].copy_from_slice(&ws[(1 + y) * stride + 1..][..16]);
         }
     }
 
-    fn intra_predict_chroma(&mut self, mbx: usize, mby: usize, mb: &MacroBlock, resdata: &[i32]) {
+    fn intra_predict_chroma(
+        &mut self,
+        mbx: usize,
+        mby: usize,
+        mb: &MacroBlock,
+        resdata: &[i32],
+        kinds: &[u8; 24],
+    ) {
         let stride = 1usize + 8;
 
         let mw = self.mbwidth as usize;
 
-        //8x8 with left top border of 1
-        let mut uws = create_border_chroma(mbx, mby, &self.top_border_u, &self.left_border_u);
-        let mut vws = create_border_chroma(mbx, mby, &self.top_border_v, &self.left_border_v);
+        let (uws, vws) = (&mut self.ws_u, &mut self.ws_v);
+        update_border_chroma(uws, mbx, mby, &self.top_border_u);
+        update_border_chroma(vws, mbx, mby, &self.top_border_v);
 
         match mb.chroma_mode {
             ChromaMode::DC => {
-                predict_dcpred(&mut uws, 8, stride, mby != 0, mbx != 0);
-                predict_dcpred(&mut vws, 8, stride, mby != 0, mbx != 0);
+                predict_dc::<8>(uws, stride, mby != 0, mbx != 0);
+                predict_dc::<8>(vws, stride, mby != 0, mbx != 0);
             }
             ChromaMode::V => {
-                predict_vpred(&mut uws, 8, 1, 1, stride);
-                predict_vpred(&mut vws, 8, 1, 1, stride);
+                predict_vpred(uws, 8, 1, 1, stride);
+                predict_vpred(vws, 8, 1, 1, stride);
             }
             ChromaMode::H => {
-                predict_hpred(&mut uws, 8, 1, 1, stride);
-                predict_hpred(&mut vws, 8, 1, 1, stride);
+                predict_hpred(uws, 8, 1, 1, stride);
+                predict_hpred(vws, 8, 1, 1, stride);
             }
             ChromaMode::TM => {
-                predict_tmpred(&mut uws, 8, 1, 1, stride);
-                predict_tmpred(&mut vws, 8, 1, 1, stride);
+                predict_tm::<8>(uws, 1, 1, stride);
+                predict_tm::<8>(vws, 1, 1, stride);
             }
         }
 
         for y in 0usize..2 {
             for x in 0usize..2 {
                 let i = x + y * 2;
-                let urb: &[i32; 16] = resdata[16 * 16 + i * 16..][..16].try_into().unwrap();
-
-                let y0 = 1 + y * 4;
-                let x0 = 1 + x * 4;
-                add_residue(&mut uws, urb, y0, x0, stride);
-
-                let vrb: &[i32; 16] = resdata[20 * 16 + i * 16..][..16].try_into().unwrap();
-
-                add_residue(&mut vws, vrb, y0, x0, stride);
+                let pos = (1 + y * 4) * stride + 1 + x * 4;
+                transform::add_coeffs(
+                    uws,
+                    &resdata[(16 + i) * 16..][..16],
+                    kinds[16 + i],
+                    pos,
+                    stride,
+                );
+                transform::add_coeffs(
+                    vws,
+                    &resdata[(20 + i) * 16..][..16],
+                    kinds[20 + i],
+                    pos,
+                    stride,
+                );
             }
         }
 
-        set_chroma_border(&mut self.left_border_u, &mut self.top_border_u, &uws, mbx);
-        set_chroma_border(&mut self.left_border_v, &mut self.top_border_v, &vws, mbx);
+        self.top_border_u[mbx * 8..][..8].copy_from_slice(&uws[8 * stride + 1..][..8]);
+        self.top_border_v[mbx * 8..][..8].copy_from_slice(&vws[8 * stride + 1..][..8]);
 
-        for y in 0usize..8 {
-            let uv_buf_index = (mby * 8 + y) * mw * 8 + mbx * 8;
-            let ws_index = (1 + y) * stride + 1;
-
-            for (((ub, vb), &uw), &vw) in self.frame.ubuf[uv_buf_index..][..8]
-                .iter_mut()
-                .zip(self.frame.vbuf[uv_buf_index..][..8].iter_mut())
-                .zip(uws[ws_index..][..8].iter())
-                .zip(vws[ws_index..][..8].iter())
-            {
-                *ub = uw;
-                *vb = vw;
+        let cw = mw * 8;
+        let base = (mby * 8).wrapping_sub(self.uv_base) * cw + mbx * 8;
+        for (buf, ws) in [
+            (&mut self.frame.ubuf, &self.ws_u),
+            (&mut self.frame.vbuf, &self.ws_v),
+        ] {
+            let dst = &mut buf[base..][..7 * cw + 8];
+            for y in 0usize..8 {
+                dst[y * cw..][..8].copy_from_slice(&ws[(1 + y) * stride + 1..][..8]);
             }
         }
     }
@@ -789,95 +793,30 @@ impl<R: Read> Vp8Decoder<R> {
         complexity: usize,
         dcq: i16,
         acq: i16,
-    ) -> Result<bool, DecodingError> {
-        // perform bounds checks once up front,
-        // so that the compiler doesn't have to insert them in the hot loop below
+    ) -> Result<usize, DecodingError> {
         assert!(complexity <= 2);
-
-        let first_coeff = if plane == Plane::YCoeff1 {
-            1usize
-        } else {
-            0usize
-        };
+        let first = usize::from(plane == Plane::YCoeff1);
         let probs = &self.token_probs[plane as usize];
-        let decoder = &mut self.partitions[p];
-
-        let mut res = decoder.start_accumulated_result();
-
-        let mut complexity = complexity;
-        let mut has_coefficients = false;
-        let mut skip = false;
-
-        for i in first_coeff..16usize {
-            let band = COEFF_BANDS[i] as usize;
-            let tree = &probs[band][complexity];
-
-            let token = decoder
-                .read_with_tree_with_first_node(tree, tree[skip as usize])
-                .or_accumulate(&mut res);
-
-            let mut abs_value = i32::from(match token {
-                DCT_EOB => break,
-
-                DCT_0 => {
-                    skip = true;
-                    has_coefficients = true;
-                    complexity = 0;
-                    continue;
-                }
-
-                literal @ DCT_1..=DCT_4 => i16::from(literal),
-
-                category @ DCT_CAT1..=DCT_CAT6 => {
-                    let probs = PROB_DCT_CAT[(category - DCT_CAT1) as usize];
-
-                    let mut extra = 0i16;
-
-                    for t in probs.iter().copied() {
-                        if t == 0 {
-                            break;
-                        }
-                        let b = decoder.read_bool(t).or_accumulate(&mut res);
-                        extra = extra + extra + i16::from(b);
-                    }
-
-                    i16::from(DCT_CAT_BASE[(category - DCT_CAT1) as usize]) + extra
-                }
-
-                c => panic!("unknown token: {c}"),
-            });
-
-            skip = false;
-
-            complexity = if abs_value == 0 {
-                0
-            } else if abs_value == 1 {
-                1
-            } else {
-                2
-            };
-
-            if decoder.read_sign().or_accumulate(&mut res) {
-                abs_value = -abs_value;
-            }
-
-            let zigzag = ZIGZAG[i] as usize;
-            block[zigzag] = abs_value * i32::from(if zigzag > 0 { acq } else { dcq });
-
-            has_coefficients = true;
-        }
-
-        decoder.check(res, has_coefficients)
+        self.partitions[p].read_coeffs(
+            probs,
+            complexity,
+            first,
+            [i32::from(dcq), i32::from(acq)],
+            block,
+        )
     }
 
+    /// Reads the coefficients of a macroblock into `blocks` (zero on entry) and the kind of
+    /// inverse transform each block needs into `kinds`.
     fn read_residual_data(
         &mut self,
         mb: &mut MacroBlock,
         mbx: usize,
         p: usize,
-    ) -> Result<[i32; 384], DecodingError> {
+        blocks: &mut [i32; 384],
+        kinds: &mut [u8; 24],
+    ) -> Result<(), DecodingError> {
         let sindex = mb.segmentid as usize;
-        let mut blocks = [0i32; 384];
         let mut plane = if mb.luma_mode == LumaMode::B {
             Plane::YCoeff0
         } else {
@@ -891,38 +830,43 @@ impl<R: Read> Vp8Decoder<R> {
             let acq = self.segment[sindex].y2ac;
             let n = self.read_coefficients(&mut block, p, plane, complexity as usize, dcq, acq)?;
 
-            self.left.complexity[0] = if n { 1 } else { 0 };
-            self.top[mbx].complexity[0] = if n { 1 } else { 0 };
+            self.left.complexity[0] = u8::from(n > 0);
+            self.top[mbx].complexity[0] = u8::from(n > 0);
 
             transform::iwht4x4(&mut block);
 
             for k in 0usize..16 {
-                blocks[16 * k] = block[k];
+                blocks[16 * k] = i32::from(block[k] as i16);
             }
 
             plane = Plane::YCoeff1;
         }
+        let first = usize::from(plane == Plane::YCoeff1);
+        let kind = |n: usize, dc: i32| {
+            if n > 1 {
+                transform::FULL
+            } else if dc != 0 {
+                transform::DC_ONLY
+            } else {
+                transform::NO_COEFFS
+            }
+        };
 
         for y in 0usize..4 {
             let mut left = self.left.complexity[y + 1];
             for x in 0usize..4 {
                 let i = x + y * 4;
-                let block = &mut blocks[i * 16..][..16];
-                let block: &mut [i32; 16] = block.try_into().unwrap();
+                let block: &mut [i32; 16] = (&mut blocks[i * 16..][..16]).try_into().unwrap();
 
                 let complexity = self.top[mbx].complexity[x + 1] + left;
                 let dcq = self.segment[sindex].ydc;
                 let acq = self.segment[sindex].yac;
 
                 let n = self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
+                kinds[i] = kind(n, block[0]);
 
-                if block[0] != 0 || n {
-                    mb.non_zero_dct = true;
-                    transform::idct4x4(block);
-                }
-
-                left = if n { 1 } else { 0 };
-                self.top[mbx].complexity[x + 1] = if n { 1 } else { 0 };
+                left = u8::from(n > first);
+                self.top[mbx].complexity[x + 1] = left;
             }
 
             self.left.complexity[y + 1] = left;
@@ -936,8 +880,7 @@ impl<R: Read> Vp8Decoder<R> {
 
                 for x in 0usize..2 {
                     let i = x + y * 2 + if j == 5 { 16 } else { 20 };
-                    let block = &mut blocks[i * 16..][..16];
-                    let block: &mut [i32; 16] = block.try_into().unwrap();
+                    let block: &mut [i32; 16] = (&mut blocks[i * 16..][..16]).try_into().unwrap();
 
                     let complexity = self.top[mbx].complexity[x + j] + left;
                     let dcq = self.segment[sindex].uvdc;
@@ -945,244 +888,45 @@ impl<R: Read> Vp8Decoder<R> {
 
                     let n =
                         self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
-                    if block[0] != 0 || n {
-                        mb.non_zero_dct = true;
-                        transform::idct4x4(block);
-                    }
+                    kinds[i] = kind(n, block[0]);
 
-                    left = if n { 1 } else { 0 };
-                    self.top[mbx].complexity[x + j] = if n { 1 } else { 0 };
+                    left = u8::from(n > 0);
+                    self.top[mbx].complexity[x + j] = left;
                 }
 
                 self.left.complexity[y + j] = left;
             }
         }
 
-        Ok(blocks)
+        mb.non_zero_dct = kinds.iter().any(|&k| k != transform::NO_COEFFS);
+        Ok(())
     }
 
     /// Does loop filtering on the macroblock
     fn loop_filter(&mut self, mbx: usize, mby: usize, mb: &MacroBlock) {
-        let luma_w = self.mbwidth as usize * 16;
-        let chroma_w = self.mbwidth as usize * 8;
+        let f = self.mb_filter(mb);
+        let mut planes = PlaneRefs {
+            y: &mut self.frame.ybuf,
+            u: &mut self.frame.ubuf,
+            v: &mut self.frame.vbuf,
+            y_base: self.y_base,
+            uv_base: self.uv_base,
+            luma_w: self.mbwidth as usize * 16,
+            chroma_w: self.mbwidth as usize * 8,
+            filter_type: self.frame.filter_type,
+        };
+        filter_macroblock(&mut planes, mbx, mby, f);
+    }
 
-        let (filter_level, interior_limit, hev_threshold) = self.calculate_filter_parameters(mb);
-
-        if filter_level > 0 {
-            let mbedge_limit = (filter_level + 2) * 2 + interior_limit;
-            let sub_bedge_limit = (filter_level * 2) + interior_limit;
-
-            // we skip subblock filtering if the coding mode isn't B_PRED and there's no DCT coefficient coded
-            let do_subblock_filtering =
-                mb.luma_mode == LumaMode::B || (!mb.coeffs_skipped && mb.non_zero_dct);
-
-            //filter across left of macroblock
-            if mbx > 0 {
-                //simple loop filtering
-                if self.frame.filter_type {
-                    for y in 0usize..16 {
-                        let y0 = mby * 16 + y;
-                        let x0 = mbx * 16;
-
-                        loop_filter::simple_segment_horizontal(
-                            mbedge_limit,
-                            &mut self.frame.ybuf[y0 * luma_w + x0 - 4..][..8],
-                        );
-                    }
-                } else {
-                    for y in 0usize..16 {
-                        let y0 = mby * 16 + y;
-                        let x0 = mbx * 16;
-
-                        loop_filter::macroblock_filter_horizontal(
-                            hev_threshold,
-                            interior_limit,
-                            mbedge_limit,
-                            &mut self.frame.ybuf[y0 * luma_w + x0 - 4..][..8],
-                        );
-                    }
-
-                    for y in 0usize..8 {
-                        let y0 = mby * 8 + y;
-                        let x0 = mbx * 8;
-
-                        loop_filter::macroblock_filter_horizontal(
-                            hev_threshold,
-                            interior_limit,
-                            mbedge_limit,
-                            &mut self.frame.ubuf[y0 * chroma_w + x0 - 4..][..8],
-                        );
-                        loop_filter::macroblock_filter_horizontal(
-                            hev_threshold,
-                            interior_limit,
-                            mbedge_limit,
-                            &mut self.frame.vbuf[y0 * chroma_w + x0 - 4..][..8],
-                        );
-                    }
-                }
-            }
-
-            //filter across vertical subblocks in macroblock
-            if do_subblock_filtering {
-                if self.frame.filter_type {
-                    for x in (4usize..16 - 1).step_by(4) {
-                        for y in 0..16 {
-                            let y0 = mby * 16 + y;
-                            let x0 = mbx * 16 + x;
-
-                            loop_filter::simple_segment_horizontal(
-                                sub_bedge_limit,
-                                &mut self.frame.ybuf[y0 * luma_w + x0 - 4..][..8],
-                            );
-                        }
-                    }
-                } else {
-                    for x in (4usize..16 - 3).step_by(4) {
-                        for y in 0..16 {
-                            let y0 = mby * 16 + y;
-                            let x0 = mbx * 16 + x;
-
-                            loop_filter::subblock_filter_horizontal(
-                                hev_threshold,
-                                interior_limit,
-                                sub_bedge_limit,
-                                &mut self.frame.ybuf[y0 * luma_w + x0 - 4..][..8],
-                            );
-                        }
-                    }
-
-                    for y in 0usize..8 {
-                        let y0 = mby * 8 + y;
-                        let x0 = mbx * 8 + 4;
-
-                        loop_filter::subblock_filter_horizontal(
-                            hev_threshold,
-                            interior_limit,
-                            sub_bedge_limit,
-                            &mut self.frame.ubuf[y0 * chroma_w + x0 - 4..][..8],
-                        );
-
-                        loop_filter::subblock_filter_horizontal(
-                            hev_threshold,
-                            interior_limit,
-                            sub_bedge_limit,
-                            &mut self.frame.vbuf[y0 * chroma_w + x0 - 4..][..8],
-                        );
-                    }
-                }
-            }
-
-            //filter across top of macroblock
-            if mby > 0 {
-                if self.frame.filter_type {
-                    for x in 0usize..16 {
-                        let y0 = mby * 16;
-                        let x0 = mbx * 16 + x;
-
-                        loop_filter::simple_segment_vertical(
-                            mbedge_limit,
-                            &mut self.frame.ybuf[..],
-                            y0 * luma_w + x0,
-                            luma_w,
-                        );
-                    }
-                } else {
-                    //if bottom macroblock, can only filter if there is 3 pixels below
-                    for x in 0usize..16 {
-                        let y0 = mby * 16;
-                        let x0 = mbx * 16 + x;
-
-                        loop_filter::macroblock_filter_vertical(
-                            hev_threshold,
-                            interior_limit,
-                            mbedge_limit,
-                            &mut self.frame.ybuf[..],
-                            y0 * luma_w + x0,
-                            luma_w,
-                        );
-                    }
-
-                    for x in 0usize..8 {
-                        let y0 = mby * 8;
-                        let x0 = mbx * 8 + x;
-
-                        loop_filter::macroblock_filter_vertical(
-                            hev_threshold,
-                            interior_limit,
-                            mbedge_limit,
-                            &mut self.frame.ubuf[..],
-                            y0 * chroma_w + x0,
-                            chroma_w,
-                        );
-                        loop_filter::macroblock_filter_vertical(
-                            hev_threshold,
-                            interior_limit,
-                            mbedge_limit,
-                            &mut self.frame.vbuf[..],
-                            y0 * chroma_w + x0,
-                            chroma_w,
-                        );
-                    }
-                }
-            }
-
-            //filter across horizontal subblock edges within the macroblock
-            if do_subblock_filtering {
-                if self.frame.filter_type {
-                    for y in (4usize..16 - 1).step_by(4) {
-                        for x in 0..16 {
-                            let y0 = mby * 16 + y;
-                            let x0 = mbx * 16 + x;
-
-                            loop_filter::simple_segment_vertical(
-                                sub_bedge_limit,
-                                &mut self.frame.ybuf[..],
-                                y0 * luma_w + x0,
-                                luma_w,
-                            );
-                        }
-                    }
-                } else {
-                    for y in (4usize..16 - 3).step_by(4) {
-                        for x in 0..16 {
-                            let y0 = mby * 16 + y;
-                            let x0 = mbx * 16 + x;
-
-                            loop_filter::subblock_filter_vertical(
-                                hev_threshold,
-                                interior_limit,
-                                sub_bedge_limit,
-                                &mut self.frame.ybuf[..],
-                                y0 * luma_w + x0,
-                                luma_w,
-                            );
-                        }
-                    }
-
-                    for x in 0..8 {
-                        let y0 = mby * 8 + 4;
-                        let x0 = mbx * 8 + x;
-
-                        loop_filter::subblock_filter_vertical(
-                            hev_threshold,
-                            interior_limit,
-                            sub_bedge_limit,
-                            &mut self.frame.ubuf[..],
-                            y0 * chroma_w + x0,
-                            chroma_w,
-                        );
-
-                        loop_filter::subblock_filter_vertical(
-                            hev_threshold,
-                            interior_limit,
-                            sub_bedge_limit,
-                            &mut self.frame.vbuf[..],
-                            y0 * chroma_w + x0,
-                            chroma_w,
-                        );
-                    }
-                }
-            }
+    fn mb_filter(&self, mb: &MacroBlock) -> MbFilter {
+        let (level, interior, hev) = self.calculate_filter_parameters(mb);
+        // we skip subblock filtering if the coding mode isn't B_PRED and there's no DCT coefficient coded
+        let subblocks = mb.luma_mode == LumaMode::B || (!mb.coeffs_skipped && mb.non_zero_dct);
+        MbFilter {
+            level,
+            interior,
+            hev,
+            subblocks,
         }
     }
 
@@ -1250,72 +994,245 @@ impl<R: Read> Vp8Decoder<R> {
 
     fn decode_frame_(mut self) -> Result<Frame, DecodingError> {
         self.read_frame_header()?;
-
+        let mut row = Vec::with_capacity(usize::from(self.mbwidth));
         for mby in 0..self.mbheight as usize {
-            let p = mby % self.num_partitions as usize;
-            self.left = PreviousMacroBlock::default();
-
-            for mbx in 0..self.mbwidth as usize {
-                let mut mb = self.read_macroblock_header(mbx)?;
-                let blocks = if !mb.coeffs_skipped {
-                    self.read_residual_data(&mut mb, mbx, p)?
-                } else {
-                    if mb.luma_mode != LumaMode::B {
-                        self.left.complexity[0] = 0;
-                        self.top[mbx].complexity[0] = 0;
-                    }
-
-                    for i in 1usize..9 {
-                        self.left.complexity[i] = 0;
-                        self.top[mbx].complexity[i] = 0;
-                    }
-
-                    [0i32; 384]
-                };
-
-                self.intra_predict_luma(mbx, mby, &mb, &blocks);
-                self.intra_predict_chroma(mbx, mby, &mb, &blocks);
-
-                self.macroblocks.push(mb);
-            }
-
-            self.left_border_y = vec![129u8; 1 + 16];
-            self.left_border_u = vec![129u8; 1 + 8];
-            self.left_border_v = vec![129u8; 1 + 8];
+            self.decode_mb_row(mby, &mut row)?;
+            self.macroblocks.extend_from_slice(&row);
         }
-
-        //do loop filtering
         for mby in 0..self.mbheight as usize {
             for mbx in 0..self.mbwidth as usize {
                 let mb = self.macroblocks[mby * self.mbwidth as usize + mbx];
                 self.loop_filter(mbx, mby, &mb);
             }
         }
-
         Ok(self.frame)
+    }
+
+    /// Reconstructs macroblock row `mby` without loop filtering, its macroblocks into `row`.
+    fn decode_mb_row(
+        &mut self,
+        mby: usize,
+        row: &mut Vec<MacroBlock>,
+    ) -> Result<(), DecodingError> {
+        let p = mby % self.num_partitions as usize;
+        self.left = PreviousMacroBlock::default();
+        row.clear();
+        let mut blocks = [0i32; 384];
+        for mbx in 0..self.mbwidth as usize {
+            let mut mb = self.read_macroblock_header(mbx)?;
+            let mut kinds = [transform::NO_COEFFS; 24];
+            if !mb.coeffs_skipped {
+                self.read_residual_data(&mut mb, mbx, p, &mut blocks, &mut kinds)?;
+            } else {
+                if mb.luma_mode != LumaMode::B {
+                    self.left.complexity[0] = 0;
+                    self.top[mbx].complexity[0] = 0;
+                }
+
+                for i in 1usize..9 {
+                    self.left.complexity[i] = 0;
+                    self.top[mbx].complexity[i] = 0;
+                }
+            }
+
+            self.intra_predict_luma(mbx, mby, &mb, &blocks, &kinds);
+            self.intra_predict_chroma(mbx, mby, &mb, &blocks, &kinds);
+            for (block, &kind) in blocks.chunks_exact_mut(16).zip(&kinds) {
+                if kind != transform::NO_COEFFS {
+                    block.fill(0);
+                }
+            }
+            row.push(mb);
+        }
+        Ok(())
     }
 }
 
-// set border
-fn set_chroma_border(
-    left_border: &mut [u8],
-    top_border: &mut [u8],
-    chroma_block: &[u8],
-    mbx: usize,
-) {
-    let stride = 1usize + 8;
-    // top left is top right of previous chroma block
-    left_border[0] = chroma_block[8];
+/// Decodes a frame a macroblock row at a time into bands of finished rows, top to bottom, as
+/// RGB (`BPP` 3) or RGBA (`BPP` 4, alpha 255). Holds about 23 rows of YUV and RGB instead of
+/// the whole frame.
+pub(crate) struct BandDecoder<R, const BPP: usize> {
+    dec: Vp8Decoder<R>,
+    upsampling: UpsamplingMethod,
+    row: Vec<MacroBlock>,
+    mby: usize,
+    emitted: usize,
+    rgb: Vec<u8>,
+    u_full: Vec<u8>,
+    v_full: Vec<u8>,
+}
 
-    // left border
-    for (i, left) in left_border[1..][..8].iter_mut().enumerate() {
-        *left = chroma_block[(i + 1) * stride + 8];
+impl<R: Read, const BPP: usize> BandDecoder<R, BPP> {
+    /// Reads the frame header.
+    pub(crate) fn new(r: R, upsampling: UpsamplingMethod) -> Result<Self, DecodingError> {
+        let mut dec = Vp8Decoder::new(r);
+        dec.band_rows = true;
+        dec.read_frame_header()?;
+        let width = usize::from(dec.frame.width);
+        let mut rgb = vec![0u8; (BAND_KEEP_Y + 16) * width * BPP];
+        if BPP == 4 {
+            for px in rgb.chunks_exact_mut(4) {
+                px[3] = 255;
+            }
+        }
+        Ok(Self {
+            row: Vec::with_capacity(usize::from(dec.mbwidth)),
+            dec,
+            upsampling,
+            mby: 0,
+            emitted: 0,
+            rgb,
+            u_full: vec![0; width],
+            v_full: vec![0; width],
+        })
     }
 
-    for (top, &w) in top_border[mbx * 8..][..8]
-        .iter_mut()
-        .zip(&chroma_block[8 * stride + 1..][..8])
-    {
-        *top = w;
+    pub(crate) fn dimensions(&self) -> (u16, u16) {
+        (self.dec.frame.width, self.dec.frame.height)
+    }
+
+    /// The most rows a band has.
+    pub(crate) fn max_band_rows(&self) -> usize {
+        (BAND_KEEP_Y + 16).min(usize::from(self.dec.frame.height))
+    }
+
+    /// Decodes macroblock rows until a band of rows is final and returns its first row and
+    /// pixels, or `None` after the last band.
+    pub(crate) fn next_band(&mut self) -> Result<Option<(u32, &mut [u8])>, DecodingError> {
+        let dec = &mut self.dec;
+        let mbheight = usize::from(dec.mbheight);
+        let width = usize::from(dec.frame.width);
+        let height = usize::from(dec.frame.height);
+        let luma_w = usize::from(dec.mbwidth) * 16;
+        let chroma_w = luma_w / 2;
+        let chroma_width = width.div_ceil(2);
+        let chroma_height = height.div_ceil(2);
+        while self.mby < mbheight {
+            let mby = self.mby;
+            self.mby += 1;
+            if mby > 0 {
+                dec.frame.ybuf.copy_within(16 * luma_w.., 0);
+                dec.frame.ubuf.copy_within(8 * chroma_w.., 0);
+                dec.frame.vbuf.copy_within(8 * chroma_w.., 0);
+            }
+            dec.y_base = (mby * 16).wrapping_sub(BAND_KEEP_Y);
+            dec.uv_base = (mby * 8).wrapping_sub(BAND_KEEP_UV);
+            dec.decode_mb_row(mby, &mut self.row)?;
+            for (mbx, mb) in self.row.iter().enumerate() {
+                dec.loop_filter(mbx, mby, mb);
+            }
+            let end = if mby + 1 == mbheight {
+                height
+            } else {
+                (mby * 16 + 16 - BAND_KEEP_Y).min(height)
+            };
+            if end <= self.emitted {
+                continue;
+            }
+            let (y_base, uv_base) = (dec.y_base, dec.uv_base);
+            let (ybuf, ubuf, vbuf) = (&dec.frame.ybuf, &dec.frame.ubuf, &dec.frame.vbuf);
+            let y_row = |y: usize| &ybuf[y.wrapping_sub(y_base) * luma_w..][..width];
+            let u_row = |c: usize| &ubuf[c.wrapping_sub(uv_base) * chroma_w..][..chroma_width];
+            let v_row = |c: usize| &vbuf[c.wrapping_sub(uv_base) * chroma_w..][..chroma_width];
+            let rgb = &mut self.rgb[..(end - self.emitted) * width * BPP];
+            for (y, out) in (self.emitted..end).zip(rgb.chunks_exact_mut(width * BPP)) {
+                let (near, far) = match self.upsampling {
+                    UpsamplingMethod::Simple => {
+                        yuv::fill_rgba_row_simple::<BPP>(y_row(y), u_row(y / 2), v_row(y / 2), out);
+                        continue;
+                    }
+                    UpsamplingMethod::Bilinear => {
+                        if y == 0 {
+                            (0, 0)
+                        } else if y + 1 == height && height % 2 == 0 {
+                            (chroma_height - 1, chroma_height - 1)
+                        } else {
+                            let k = y.div_ceil(2);
+                            if y % 2 == 1 {
+                                (k - 1, k)
+                            } else {
+                                (k, k - 1)
+                            }
+                        }
+                    }
+                };
+                yuv::upsample_chroma_row(u_row(near), u_row(far), &mut self.u_full);
+                yuv::upsample_chroma_row(v_row(near), v_row(far), &mut self.v_full);
+                yuv::fill_row_yuv::<BPP>(out, y_row(y), &self.u_full, &self.v_full);
+            }
+            let first = self.emitted as u32;
+            self.emitted = end;
+            return Ok(Some((first, rgb)));
+        }
+        Ok(None)
+    }
+}
+
+/// Rows of the previous macroblock row a band keeps: the luma rows the next row's loop
+/// filter changes plus those whose fancy upsampling needs the next chroma rows, and the
+/// chroma rows the filter reads.
+const BAND_KEEP_Y: usize = 7;
+const BAND_KEEP_UV: usize = 4;
+
+/// Loop filter parameters of one macroblock.
+#[derive(Clone, Copy)]
+struct MbFilter {
+    level: u8,
+    interior: u8,
+    hev: u8,
+    subblocks: bool,
+}
+
+/// The planes a macroblock row is filtered in: rows from `y_base` / `uv_base` on.
+struct PlaneRefs<'a> {
+    y: &'a mut [u8],
+    u: &'a mut [u8],
+    v: &'a mut [u8],
+    y_base: usize,
+    uv_base: usize,
+    luma_w: usize,
+    chroma_w: usize,
+    filter_type: bool,
+}
+
+fn filter_macroblock(p: &mut PlaneRefs, mbx: usize, mby: usize, f: MbFilter) {
+    if f.level == 0 {
+        return;
+    }
+    let limit = 2 * f.level + f.interior;
+    let (ilevel, hev) = (f.interior, f.hev);
+    let (lw, cw) = (p.luma_w, p.chroma_w);
+    let y = (mby * 16).wrapping_sub(p.y_base) * lw + mbx * 16;
+    if p.filter_type {
+        if mbx > 0 {
+            loop_filter::simple_h16(p.y, y, lw, limit + 4);
+        }
+        if f.subblocks {
+            loop_filter::simple_h16i(p.y, y, lw, limit);
+        }
+        if mby > 0 {
+            loop_filter::simple_v16(p.y, y, lw, limit + 4);
+        }
+        if f.subblocks {
+            loop_filter::simple_v16i(p.y, y, lw, limit);
+        }
+    } else {
+        let uv = (mby * 8).wrapping_sub(p.uv_base) * cw + mbx * 8;
+        if mbx > 0 {
+            loop_filter::h16(p.y, y, lw, limit + 4, ilevel, hev);
+            loop_filter::h8(p.u, p.v, uv, cw, limit + 4, ilevel, hev);
+        }
+        if f.subblocks {
+            loop_filter::h16i(p.y, y, lw, limit, ilevel, hev);
+            loop_filter::h8i(p.u, p.v, uv, cw, limit, ilevel, hev);
+        }
+        if mby > 0 {
+            loop_filter::v16(p.y, y, lw, limit + 4, ilevel, hev);
+            loop_filter::v8(p.u, p.v, uv, cw, limit + 4, ilevel, hev);
+        }
+        if f.subblocks {
+            loop_filter::v16i(p.y, y, lw, limit, ilevel, hev);
+            loop_filter::v8i(p.u, p.v, uv, cw, limit, ilevel, hev);
+        }
     }
 }

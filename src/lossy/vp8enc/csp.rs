@@ -162,19 +162,14 @@ impl<'a> Source<'a> {
             let line = &mut self.rgb[(row - y0) * stride..][..stride];
             (self.read_row)(row, line);
             if self.step == 4 && row == self.alpha_rows {
-                if !self.has_alpha && line.chunks_exact(4).any(|p| p[3] != 0xff) {
+                if !self.has_alpha && !opaque(line) {
                     self.has_alpha = true;
                     if self.keep_alpha {
                         self.alpha = Some(vec![0xff; self.width * self.height]);
                     }
                 }
                 if let Some(alpha) = self.alpha.as_mut() {
-                    for (a, p) in alpha[row * self.width..][..self.width]
-                        .iter_mut()
-                        .zip(line.chunks_exact(4))
-                    {
-                        *a = p[3];
-                    }
+                    alpha_of(line, &mut alpha[row * self.width..][..self.width]);
                 }
                 self.alpha_rows += 1;
             }
@@ -203,8 +198,7 @@ impl<'a> Source<'a> {
                 }
             }
             let rows_have_alpha = step == 4
-                && (0..if two { 2 } else { 1 })
-                    .any(|dy| (0..width).any(|i| src[dy * stride + i * 4 + 3] != 0xff));
+                && (0..if two { 2 } else { 1 }).any(|dy| !opaque(&src[dy * stride..][..stride]));
             if rows_have_alpha {
                 accumulate_rgba(gt, src, rgb_stride, width, &mut self.tmp);
             } else {
@@ -225,10 +219,11 @@ impl<'a> Source<'a> {
         let width = self.width;
         let strip_row = band - y0 + 1;
         let rows = &self.rgb[(band - y0) * width * 4..][..height * width * 4];
-        if rows.chunks_exact(4).all(|p| p[3] == 0xff) {
+        if opaque(rows) {
             return;
         }
-        let alpha: Vec<u8> = rows.chunks_exact(4).map(|p| p[3]).collect();
+        let mut alpha = vec![0u8; rows.len() / 4];
+        alpha_of(rows, &mut alpha);
         let (ys, uvs) = (self.y_stride, self.uv_stride);
         let luma = &mut self.y[strip_row * ys..];
         let mut x = 0;
@@ -273,6 +268,22 @@ impl<'a> Source<'a> {
         if x < width {
             smoothen_block(&alpha[x..], width, &mut luma[x..], ys, width - x, height);
         }
+    }
+}
+
+/// Whether every pixel of the RGBA `rows` is opaque. Whole words rather than every fourth
+/// byte, which vectorizes.
+fn opaque(rows: &[u8]) -> bool {
+    let all = rows.chunks_exact(4).fold(u32::MAX, |acc, p| {
+        acc & u32::from_le_bytes(p.try_into().unwrap())
+    });
+    all >> 24 == 0xff
+}
+
+/// The alpha bytes of the RGBA `rows`.
+fn alpha_of(rows: &[u8], alpha: &mut [u8]) {
+    for (a, p) in alpha.iter_mut().zip(rows.chunks_exact(4)) {
+        *a = (u32::from_le_bytes(p.try_into().unwrap()) >> 24) as u8;
     }
 }
 

@@ -718,6 +718,282 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lossy_decode_matches_libwebp() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        for (width, height) in [(83, 61), (301, 203), (17, 15), (1, 1), (40, 130)] {
+            let pattern = test_pattern(width, height, 3);
+            let noise: Vec<u8> = (0..width * height * 3).map(|_| rng.gen()).collect();
+            for (img, quality) in [
+                (&pattern, 10.0),
+                (&pattern, 60.0),
+                (&pattern, 95.0),
+                (&noise, 100.0),
+                (&noise, 40.0),
+            ] {
+                for (filter_type, sharpness, strength, segments, partitions) in [
+                    (1, 0, 60, 4, 0),
+                    (0, 0, 60, 4, 3),
+                    (1, 7, 100, 1, 2),
+                    (0, 3, 30, 2, 1),
+                    (1, 2, 0, 3, 0),
+                ] {
+                    let data =
+                        libwebp_encode_with(img, width, height, false, quality, 4, false, |c| {
+                            c.filter_type = filter_type;
+                            c.filter_sharpness = sharpness;
+                            c.filter_strength = strength;
+                            c.segments = segments;
+                            c.partitions = partitions;
+                        });
+                    let lib = libwebp_decode(&data);
+                    let what = format!("{width}x{height} q{quality} filter {filter_type}/{sharpness}/{strength} seg {segments} part {partitions}");
+                    assert!(decode_whole(&data) == lib, "{what}");
+                    let mut decoder = crate::WebPDecoder::new(std::io::Cursor::new(&data)).unwrap();
+                    assert!(
+                        decode_bands(decoder.band_reader().unwrap()) == lib,
+                        "bands {what}"
+                    );
+                }
+            }
+        }
+        for file in [
+            "gallery1/1",
+            "gallery1/2",
+            "gallery1/3",
+            "gallery1/4",
+            "gallery1/5",
+            "gallery2/1_webp_a",
+            "gallery2/2_webp_a",
+            "gallery2/3_webp_a",
+            "gallery2/4_webp_a",
+            "gallery2/5_webp_a",
+        ] {
+            let data = std::fs::read(format!("tests/images/{file}.webp")).unwrap();
+            assert!(decode_whole(&data) == libwebp_decode(&data), "{file}");
+        }
+    }
+
+    #[test]
+    fn read_image_rows_matches_read_image() {
+        for (width, height) in [(1, 1), (17, 9), (83, 61), (33, 47), (40, 130)] {
+            for (lossy, rgba) in [(true, false), (true, true), (false, true), (false, false)] {
+                let img = test_pattern(width, height, if rgba { 4 } else { 3 });
+                let mut params = EncoderParams::default();
+                params.use_lossy = lossy;
+                params.lossy_quality = 75;
+                let mut data = Vec::new();
+                let mut encoder = WebPEncoder::new(&mut data);
+                encoder.set_params(params);
+                let color = if rgba {
+                    crate::ColorType::Rgba8
+                } else {
+                    crate::ColorType::Rgb8
+                };
+                encoder.encode(&img, width, height, color).unwrap();
+                for (simple, upsampling) in [
+                    crate::UpsamplingMethod::Bilinear,
+                    crate::UpsamplingMethod::Simple,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let options = || crate::WebPDecodeOptions {
+                        lossy_upsampling: upsampling,
+                    };
+                    let mut decoder = crate::WebPDecoder::new_with_options(
+                        std::io::Cursor::new(&data),
+                        options(),
+                    )
+                    .unwrap();
+                    let mut whole = vec![0; decoder.output_buffer_size().unwrap()];
+                    decoder.read_image(&mut whole).unwrap();
+                    let mut decoder = crate::WebPDecoder::new_with_options(
+                        std::io::Cursor::new(&data),
+                        options(),
+                    )
+                    .unwrap();
+                    let mut rows = Vec::new();
+                    decoder
+                        .read_image_rows(|y, band| {
+                            assert_eq!(y as usize * whole.len() / height as usize, rows.len());
+                            rows.extend_from_slice(band);
+                        })
+                        .unwrap();
+                    assert!(
+                        rows == whole,
+                        "{width}x{height} lossy {lossy} rgba {rgba} simple {simple}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn encode_test_image(width: u32, height: u32, lossy: bool, rgba: bool) -> Vec<u8> {
+        let img = test_pattern(width, height, if rgba { 4 } else { 3 });
+        let params = EncoderParams {
+            use_lossy: lossy,
+            lossy_quality: 75,
+            ..Default::default()
+        };
+        let mut data = Vec::new();
+        let mut encoder = WebPEncoder::new(&mut data);
+        encoder.set_params(params);
+        let color = if rgba {
+            crate::ColorType::Rgba8
+        } else {
+            crate::ColorType::Rgb8
+        };
+        encoder.encode(&img, width, height, color).unwrap();
+        data
+    }
+
+    fn decode_whole(data: &[u8]) -> Vec<u8> {
+        let mut decoder = crate::WebPDecoder::new(std::io::Cursor::new(data)).unwrap();
+        let mut whole = vec![0; decoder.output_buffer_size().unwrap()];
+        decoder.read_image(&mut whole).unwrap();
+        whole
+    }
+
+    fn decode_bands<R: std::io::BufRead>(mut bands: crate::BandReader<'_, R>) -> Vec<u8> {
+        let (width, height) = bands.dimensions();
+        let stride = width as usize * bands.bytes_per_pixel();
+        let max_rows = bands.max_band_rows() as usize;
+        let mut rows = Vec::new();
+        while let Some((y, band)) = bands.next_band().unwrap() {
+            assert_eq!(y as usize * stride, rows.len());
+            assert_eq!(band.len() % stride, 0);
+            assert!(!band.is_empty() && band.len() / stride <= max_rows);
+            rows.extend_from_slice(band);
+        }
+        assert_eq!(rows.len(), stride * height as usize);
+        assert!(bands.next_band().unwrap().is_none());
+        rows
+    }
+
+    #[test]
+    fn band_reader_matches_read_image() {
+        let sizes = [
+            (1, 1),
+            (5, 3),
+            (16, 16),
+            (17, 15),
+            (31, 33),
+            (9, 48),
+            (13, 49),
+            (7, 63),
+            (64, 64),
+            (3, 65),
+            (45, 97),
+        ];
+        for (width, height) in sizes {
+            for (lossy, rgba) in [(true, false), (true, true), (false, true), (false, false)] {
+                let data = encode_test_image(width, height, lossy, rgba);
+                let mut decoder = crate::WebPDecoder::new(std::io::Cursor::new(&data)).unwrap();
+                let rows = decode_bands(decoder.band_reader().unwrap());
+                assert!(
+                    rows == decode_whole(&data),
+                    "{width}x{height} lossy {lossy} rgba {rgba}"
+                );
+            }
+        }
+        for file in ["random_lossy", "random_lossless"] {
+            let data = std::fs::read(format!("tests/images/animated/{file}.webp")).unwrap();
+            let mut decoder = crate::WebPDecoder::new(std::io::Cursor::new(&data)).unwrap();
+            let rows = decode_bands(decoder.band_reader().unwrap());
+            assert!(rows == decode_whole(&data), "{file}");
+        }
+    }
+
+    /// The bytes written so far and whether that is all, with a condvar signalling more.
+    type PipeState = std::sync::Arc<(std::sync::Mutex<(Vec<u8>, bool)>, std::sync::Condvar)>;
+
+    /// A reader over bytes another thread is still appending, blocking until they arrive.
+    struct Pipe {
+        shared: PipeState,
+        pos: u64,
+    }
+
+    impl std::io::Read for Pipe {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let (lock, ready) = &*self.shared;
+            let mut state = lock.lock().unwrap();
+            while state.0.len() as u64 <= self.pos && !state.1 {
+                state = ready.wait(state).unwrap();
+            }
+            let available = &state.0[(self.pos as usize).min(state.0.len())..];
+            let n = available.len().min(buf.len());
+            buf[..n].copy_from_slice(&available[..n]);
+            self.pos += n as u64;
+            Ok(n)
+        }
+    }
+
+    impl std::io::Seek for Pipe {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.pos = match pos {
+                std::io::SeekFrom::Start(p) => p,
+                std::io::SeekFrom::Current(d) => self.pos.checked_add_signed(d).unwrap(),
+                std::io::SeekFrom::End(d) => {
+                    let (lock, ready) = &*self.shared;
+                    let state = ready.wait_while(lock.lock().unwrap(), |s| !s.1).unwrap();
+                    (state.0.len() as u64).checked_add_signed(d).unwrap()
+                }
+            };
+            Ok(self.pos)
+        }
+    }
+
+    #[test]
+    fn band_reader_runs_on_consumer_threads() {
+        fn assert_send<T: Send>() {}
+        assert_send::<crate::BandReader<'static, std::io::BufReader<Pipe>>>();
+        for (lossy, rgba) in [(true, false), (true, true), (false, true)] {
+            let data = encode_test_image(301, 203, lossy, rgba);
+            let shared: PipeState = Default::default();
+            let (band_tx, band_rx) = std::sync::mpsc::sync_channel::<(u32, Vec<u8>)>(2);
+            let rows = std::thread::scope(|scope| {
+                let feed = shared.clone();
+                let input = &data;
+                scope.spawn(move || {
+                    for chunk in input.chunks(1009) {
+                        std::thread::yield_now();
+                        let (lock, ready) = &*feed;
+                        lock.lock().unwrap().0.extend_from_slice(chunk);
+                        ready.notify_all();
+                    }
+                    let (lock, ready) = &*feed;
+                    lock.lock().unwrap().1 = true;
+                    ready.notify_all();
+                });
+                let pipe = std::io::BufReader::new(Pipe {
+                    shared: shared.clone(),
+                    pos: 0,
+                });
+                let mut decoder =
+                    std::thread::spawn(move || crate::WebPDecoder::new(pipe).unwrap())
+                        .join()
+                        .unwrap();
+                scope.spawn(move || {
+                    let mut bands = decoder.band_reader().unwrap();
+                    while let Some((y, band)) = bands.next_band().unwrap() {
+                        band_tx.send((y, band.to_vec())).unwrap();
+                    }
+                });
+                let mut rows = Vec::new();
+                let mut count = 0;
+                for (y, band) in band_rx {
+                    assert_eq!(y as usize * 301 * if rgba { 4 } else { 3 }, rows.len());
+                    rows.extend_from_slice(&band);
+                    count += 1;
+                }
+                assert!(!lossy || count > 1);
+                rows
+            });
+            assert!(rows == decode_whole(&data), "lossy {lossy} rgba {rgba}");
+        }
+    }
+
     fn roundtrip_libwebp_params(params: EncoderParams) {
         println!("Testing {params:?}");
 

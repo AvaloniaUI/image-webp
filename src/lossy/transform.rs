@@ -50,6 +50,55 @@ pub(crate) fn idct4x4(block: &mut [i32]) {
     }
 }
 
+/// A block without coefficients to add.
+pub(crate) const NO_COEFFS: u8 = 0;
+/// A block with only a DC coefficient (libwebp's `TransformDC`).
+pub(crate) const DC_ONLY: u8 = 1;
+/// A block that needs the full inverse transform.
+pub(crate) const FULL: u8 = 2;
+
+/// Adds the inverse transform of `block` (16 coefficients), of kind [`NO_COEFFS`],
+/// [`DC_ONLY`] or [`FULL`], to the 4x4 pixels at `pos` of `dst`.
+#[inline]
+pub(crate) fn add_coeffs(dst: &mut [u8], block: &[i32], kind: u8, pos: usize, stride: usize) {
+    match kind {
+        NO_COEFFS => {}
+        DC_ONLY => {
+            let dc = (block[0] + 4) >> 3;
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            super::simd::add_dc(dc, dst, pos, stride);
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            add_dc_portable(dc, dst, pos, stride);
+        }
+        _ => {
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            super::simd::transform_add(block, dst, pos, stride);
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            transform_add_portable(block, dst, pos, stride);
+        }
+    }
+}
+
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+fn add_dc_portable(dc: i32, dst: &mut [u8], pos: usize, stride: usize) {
+    for y in 0..4 {
+        for p in &mut dst[pos + y * stride..][..4] {
+            *p = (i32::from(*p) + dc).clamp(0, 255) as u8;
+        }
+    }
+}
+
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+pub(crate) fn transform_add_portable(block: &[i32], dst: &mut [u8], pos: usize, stride: usize) {
+    let mut b: [i32; 16] = block[..16].try_into().unwrap();
+    idct4x4(&mut b);
+    for (y, row) in b.chunks_exact(4).enumerate() {
+        for (p, &a) in dst[pos + y * stride..][..4].iter_mut().zip(row) {
+            *p = (a + i32::from(*p)).clamp(0, 255) as u8;
+        }
+    }
+}
+
 // 14.3 inverse walsh-hadamard transform, used in decoding
 pub(crate) fn iwht4x4(block: &mut [i32]) {
     // Perform one length check up front to avoid subsequent bounds checks in this function
@@ -138,5 +187,26 @@ mod tests {
         idct4x4(&mut inverse_dct_block);
 
         assert_eq!(BLOCK, inverse_dct_block);
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn simd_transform_matches_portable() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+        for round in 0..20000 {
+            let range = [8, 100, 1000][round % 3];
+            let block: [i32; 16] = core::array::from_fn(|_| rng.gen_range(-range..=range));
+            let stride = 9;
+            let dst: Vec<u8> = (0..4 * stride).map(|_| rng.gen()).collect();
+            let (mut a, mut b) = (dst.clone(), dst);
+            transform_add_portable(&block, &mut a, 1, stride);
+            crate::lossy::simd::transform_add(&block, &mut b, 1, stride);
+            assert_eq!(a, b, "{block:?}");
+            let dc = (block[0] * 4 + 4) >> 3;
+            add_dc_portable(dc, &mut a, 1, stride);
+            crate::lossy::simd::add_dc(dc, &mut b, 1, stride);
+            assert_eq!(a, b, "dc {dc}");
+        }
     }
 }
