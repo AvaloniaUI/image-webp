@@ -2478,10 +2478,14 @@ fn trellis_quantize_block(
     nz != 0
 }
 
+/// The pieces of a `VP8 ` payload, whether some pixel is not opaque and the alpha plane if
+/// it was kept.
+pub(crate) type EncodedFrame = (Vec<Vec<u8>>, (bool, Option<Vec<u8>>));
+
 /// Encodes `src` as a VP8 bitstream (the payload of a `VP8 ` chunk).
 /// Encodes `src` as a VP8 bitstream (the payload of a `VP8 ` chunk), in pieces to write one
 /// after the other.
-pub(crate) fn encode(src: Source, config: Config) -> (Vec<Vec<u8>>, Option<Vec<u8>>) {
+pub(crate) fn encode(src: Source, config: Config) -> EncodedFrame {
     let (width, height) = (src.width, src.height);
     let mut enc = Encoder::new(config, src);
     enc.analyze();
@@ -2510,22 +2514,24 @@ pub(crate) fn encode(src: Source, config: Config) -> (Vec<Vec<u8>>, Option<Vec<u
 
 /// Encodes rows of `color` pixels as the payload of a `VP8 ` chunk, in pieces, like libwebp at
 /// `quality` and `method` with the default preset. `read_row(y, row)` fills `row`; rows are
-/// read top to bottom once per pass. Also returns the alpha plane when some pixel is not opaque.
+/// read top to bottom once per pass. Also returns whether some pixel is not opaque, and then
+/// the alpha plane if `keep_alpha`.
 pub(crate) fn encode_frame_lossy(
     width: u32,
     height: u32,
     color: crate::ColorType,
     quality: u8,
     method: u8,
+    keep_alpha: bool,
     mut read_row: impl FnMut(u32, &mut [u8]),
-) -> Result<(Vec<Vec<u8>>, Option<Vec<u8>>), crate::EncodingError> {
+) -> Result<EncodedFrame, crate::EncodingError> {
     use crate::ColorType;
     if width == 0 || width > 16383 || height == 0 || height > 16383 {
         return Err(crate::EncodingError::InvalidDimensions);
     }
     let (w, h) = (width as usize, height as usize);
     let config = Config::new(f32::from(quality.min(100)), i32::from(method.min(6)));
-    let src = match color {
+    let mut src = match color {
         ColorType::Rgb8 => Source::new(w, h, 3, move |y, row| read_row(y as u32, row)),
         ColorType::Rgba8 => Source::new(w, h, 4, move |y, row| read_row(y as u32, row)),
         ColorType::L8 => {
@@ -2547,5 +2553,6 @@ pub(crate) fn encode_frame_lossy(
             })
         }
     };
+    src.keep_alpha = keep_alpha;
     Ok(encode(src, config))
 }

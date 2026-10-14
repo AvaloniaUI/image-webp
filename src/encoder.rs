@@ -176,31 +176,72 @@ impl<W: Write> WebPEncoder<W> {
             }
             return self.encode(&data, width, height, color);
         }
-        let (parts, alpha) = encode_frame_lossy(
+        let params = self.params.clone();
+        self.encode_lossy(width, height, color, read_row, true, |alpha| {
+            alpha.map(|alpha| alpha_chunk_payload(&alpha, width, height, &params))
+        })
+    }
+
+    /// Like [`encode_rows`](Self::encode_rows), but a lossy image with alpha gets its `ALPH`
+    /// chunk from `alpha_chunk()` instead of encoding the alpha plane: the caller encodes the
+    /// plane with [`encode_alpha_chunk`] and the same params, for example on a thread of its own
+    /// while this encodes the `VP8 ` data, and `alpha_chunk` returns it (or joins that thread).
+    /// It is called once, after the `VP8 ` data is encoded, unless encoding is lossless.
+    ///
+    /// The rows still have to carry their alpha (`Rgba8` or `La8`): the encoder flattens fully
+    /// transparent areas before encoding them, as libwebp does, and writes no `ALPH` chunk when
+    /// every pixel is opaque.
+    pub fn encode_rows_with_alpha_chunk(
+        self,
+        width: u32,
+        height: u32,
+        color: ColorType,
+        read_row: impl FnMut(u32, &mut [u8]),
+        alpha_chunk: impl FnOnce() -> Option<Vec<u8>>,
+    ) -> Result<(), EncodingError> {
+        if self.params.use_lossy {
+            self.encode_lossy(width, height, color, read_row, false, |_| alpha_chunk())
+        } else {
+            self.encode_rows(width, height, color, read_row)
+        }
+    }
+
+    fn encode_lossy(
+        self,
+        width: u32,
+        height: u32,
+        color: ColorType,
+        read_row: impl FnMut(u32, &mut [u8]),
+        keep_alpha: bool,
+        alpha_chunk: impl FnOnce(Option<Vec<u8>>) -> Option<Vec<u8>>,
+    ) -> Result<(), EncodingError> {
+        let (parts, (has_alpha, alpha_plane)) = encode_frame_lossy(
             width,
             height,
             color,
             self.params.lossy_quality,
             self.params.lossy_method,
+            keep_alpha,
             read_row,
         )?;
-        self.write_container(b"VP8 ", parts, alpha, false, width, height)
+        let alpha_chunk = alpha_chunk(alpha_plane).filter(|_| has_alpha);
+        self.write_container(b"VP8 ", parts, alpha_chunk, false, width, height)
     }
 
-    /// Writes the RIFF container around a frame chunk of `frame_parts`, with the `ALPH` chunk
-    /// of a lossy frame's `alpha_plane`.
+    /// Writes the RIFF container around a frame chunk of `frame_parts`, with a lossy frame's
+    /// `ALPH` chunk.
     fn write_container(
         mut self,
         frame_chunk: &[u8; 4],
         frame_parts: Vec<Vec<u8>>,
-        alpha_plane: Option<Vec<u8>>,
+        alpha_chunk: Option<Vec<u8>>,
         lossless_with_alpha: bool,
         width: u32,
         height: u32,
     ) -> Result<(), EncodingError> {
         let frame: Vec<&[u8]> = frame_parts.iter().map(Vec::as_slice).collect();
         let frame_len: usize = frame.iter().map(|p| p.len()).sum();
-        let lossy_with_alpha = alpha_plane.is_some();
+        let lossy_with_alpha = alpha_chunk.is_some();
 
         // If the image has no metadata and isn't lossy with alpha,
         // it can be encoded with the "simple" WebP container format.
@@ -227,15 +268,9 @@ impl<W: Write> WebPEncoder<W> {
                 total_bytes += chunk_size(self.xmp_metadata.len());
             }
 
-            let alpha_chunk_data = if let Some(alpha) = &alpha_plane {
-                let alpha_chunk =
-                    vp8l::encode_alpha(alpha, width, height, self.params.lossy_method);
-
+            if let Some(alpha_chunk) = &alpha_chunk {
                 total_bytes += chunk_size(alpha_chunk.len());
-                Some(alpha_chunk)
-            } else {
-                None
-            };
+            }
 
             let mut flags = 0;
             if !self.xmp_metadata.is_empty() {
@@ -266,8 +301,8 @@ impl<W: Write> WebPEncoder<W> {
                 write_chunk(&mut self.writer, b"ICCP", &self.icc_profile)?;
             }
 
-            if let Some(alpha_chunk) = alpha_chunk_data {
-                write_chunk(&mut self.writer, b"ALPH", &alpha_chunk)?;
+            if let Some(alpha_chunk) = &alpha_chunk {
+                write_chunk(&mut self.writer, b"ALPH", alpha_chunk)?;
             }
 
             write_chunk_parts(&mut self.writer, frame_chunk, &frame)?;
@@ -282,6 +317,35 @@ impl<W: Write> WebPEncoder<W> {
         }
 
         Ok(())
+    }
+}
+
+/// Encodes a `width` x `height` alpha plane, one byte per pixel, as the payload of the `ALPH`
+/// chunk of a lossy image the way [`WebPEncoder`] does with `params` (`lossy_method` and
+/// `alpha_compression`), for [`WebPEncoder::encode_rows_with_alpha_chunk`]. Returns `None`
+/// when every pixel is opaque, as such an image has no `ALPH` chunk.
+///
+/// # Panics
+///
+/// Panics if `alpha` does not have `width * height` bytes.
+pub fn encode_alpha_chunk(
+    alpha: &[u8],
+    width: u32,
+    height: u32,
+    params: &EncoderParams,
+) -> Option<Vec<u8>> {
+    assert_eq!(alpha.len(), width as usize * height as usize);
+    if alpha.iter().all(|&a| a == 0xff) {
+        return None;
+    }
+    Some(alpha_chunk_payload(alpha, width, height, params))
+}
+
+fn alpha_chunk_payload(alpha: &[u8], width: u32, height: u32, params: &EncoderParams) -> Vec<u8> {
+    if params.alpha_compression {
+        vp8l::encode_alpha(alpha, width, height, params.lossy_method)
+    } else {
+        vp8l::encode_alpha_raw(alpha)
     }
 }
 
@@ -371,7 +435,6 @@ mod tests {
         out
     }
 
-    #[allow(unsafe_code)]
     fn libwebp_encode(
         data: &[u8],
         width: u32,
@@ -380,6 +443,20 @@ mod tests {
         quality: f32,
         method: i32,
         lossless: bool,
+    ) -> Vec<u8> {
+        libwebp_encode_with(data, width, height, rgba, quality, method, lossless, |_| {})
+    }
+
+    #[allow(unsafe_code, clippy::too_many_arguments)]
+    fn libwebp_encode_with(
+        data: &[u8],
+        width: u32,
+        height: u32,
+        rgba: bool,
+        quality: f32,
+        method: i32,
+        lossless: bool,
+        tweak: impl FnOnce(&mut libwebp_sys::WebPConfig),
     ) -> Vec<u8> {
         use libwebp_sys as sys;
         unsafe {
@@ -396,6 +473,7 @@ mod tests {
             );
             config.method = method;
             config.lossless = i32::from(lossless);
+            tweak(&mut config);
             let mut pic = std::mem::zeroed::<sys::WebPPicture>();
             assert_ne!(
                 sys::WebPPictureInitInternal(&mut pic, sys::WEBP_ENCODER_ABI_VERSION as i32),
@@ -484,6 +562,96 @@ mod tests {
                         false,
                     );
                     assert_eq!(ours, lib, "rgba {rgba} method {method} quality {quality}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uncompressed_alpha_matches_libwebp() {
+        let (width, height) = (83, 61);
+        let img = test_pattern(width, height, 4);
+        for method in [0u8, 4, 6] {
+            let mut params = EncoderParams::default();
+            params.use_lossy = true;
+            params.lossy_quality = 75;
+            params.lossy_method = method;
+            params.alpha_compression = false;
+            let mut ours = Vec::new();
+            let mut encoder = WebPEncoder::new(&mut ours);
+            encoder.set_params(params);
+            encoder
+                .encode(&img, width, height, crate::ColorType::Rgba8)
+                .unwrap();
+            let lib = libwebp_encode_with(
+                &img,
+                width,
+                height,
+                true,
+                75.0,
+                i32::from(method),
+                false,
+                |c| {
+                    c.alpha_compression = 0;
+                },
+            );
+            assert_eq!(ours, lib, "method {method}");
+        }
+    }
+
+    #[test]
+    fn precomputed_alpha_chunk_matches_encode() {
+        for (width, height, opaque) in [(88, 61, false), (83, 61, false), (40, 33, true)] {
+            let mut img = test_pattern(width, height, 4);
+            if opaque {
+                img.chunks_exact_mut(4).for_each(|p| p[3] = 255);
+            }
+            let alpha: Vec<u8> = img.chunks_exact(4).map(|p| p[3]).collect();
+            for method in 0..=6u8 {
+                for alpha_compression in [true, false] {
+                    let params = EncoderParams {
+                        use_lossy: true,
+                        lossy_method: method,
+                        alpha_compression,
+                        ..Default::default()
+                    };
+                    let mut whole = Vec::new();
+                    let mut encoder = WebPEncoder::new(&mut whole);
+                    encoder.set_params(params.clone());
+                    encoder
+                        .encode(&img, width, height, crate::ColorType::Rgba8)
+                        .unwrap();
+                    let mut split = Vec::new();
+                    let mut encoder = WebPEncoder::new(&mut split);
+                    encoder.set_params(params.clone());
+                    let stride = width as usize * 4;
+                    std::thread::scope(|scope| {
+                        let alpha_job = scope
+                            .spawn(|| super::encode_alpha_chunk(&alpha, width, height, &params));
+                        let read_row = |y: u32, row: &mut [u8]| {
+                            row.copy_from_slice(&img[y as usize * stride..][..stride])
+                        };
+                        encoder
+                            .encode_rows_with_alpha_chunk(
+                                width,
+                                height,
+                                crate::ColorType::Rgba8,
+                                read_row,
+                                || {
+                                    let chunk = alpha_job.join().unwrap();
+                                    assert_eq!(chunk.is_none(), opaque);
+                                    chunk
+                                },
+                            )
+                            .unwrap();
+                    });
+                    assert!(
+                        split == whole,
+                        "{width}x{height} method {method} alpha_compression {alpha_compression}"
+                    );
+                    if method == 4 && alpha_compression {
+                        assert!(split == libwebp_encode(&img, width, height, true, 95.0, 4, false));
+                    }
                 }
             }
         }

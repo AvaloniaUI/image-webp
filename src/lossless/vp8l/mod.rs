@@ -25,7 +25,7 @@ mod sse2;
 use sse2 as simd;
 mod tables;
 
-pub(crate) use alpha::encode_alpha;
+pub(crate) use alpha::{encode_alpha, encode_alpha_raw};
 
 use backward_refs::{
     get_backward_references, BackwardRefs, HashChain, PixOrCopyMode, RefsSet, LZ77_BOX, LZ77_RLE,

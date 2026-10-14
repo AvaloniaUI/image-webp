@@ -26,6 +26,9 @@ pub struct EncoderParams {
     /// Keep the RGB values of fully transparent pixels in lossless encoding, as libwebp's
     /// `exact`. Off by default, which lets them become black for better compression.
     pub lossless_exact: bool,
+    /// Compress the alpha plane of lossy images, as libwebp's `alpha_compression`. When off,
+    /// the `ALPH` chunk holds the plane uncompressed, which is faster and bigger. Defaults to on.
+    pub alpha_compression: bool,
 }
 
 impl Default for EncoderParams {
@@ -38,6 +41,7 @@ impl Default for EncoderParams {
             lossless_quality: 75,
             lossless_method: 4,
             lossless_exact: false,
+            alpha_compression: true,
         }
     }
 }

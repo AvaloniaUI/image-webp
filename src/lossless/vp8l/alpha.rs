@@ -144,6 +144,15 @@ fn encode_alpha_internal(
     out
 }
 
+/// The `ALPH` payload of an uncompressed alpha plane, as libwebp writes it with
+/// `alpha_compression = 0`: no filter, no preprocessing.
+pub(crate) fn encode_alpha_raw(alpha: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + alpha.len());
+    out.push(0);
+    out.extend_from_slice(alpha);
+    out
+}
+
 /// The `ALPH` payload of a `width` x `height` alpha plane, as libwebp's lossy encoder
 /// writes it at `method`.
 pub(crate) fn encode_alpha(alpha: &[u8], width: u32, height: u32, method: u8) -> Vec<u8> {

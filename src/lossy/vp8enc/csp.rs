@@ -84,8 +84,10 @@ pub(crate) struct Source<'a> {
     tmp: Vec<[u16; 4]>,
     /// The packed rows of the current strip.
     rgb: Vec<u8>,
-    /// The alpha plane, once a pixel that is not opaque has been read.
+    /// The alpha plane, once a pixel that is not opaque has been read and if `keep_alpha`.
     alpha: Option<Vec<u8>>,
+    pub(crate) keep_alpha: bool,
+    has_alpha: bool,
     /// Rows whose alpha has been looked at.
     alpha_rows: usize,
 }
@@ -114,14 +116,17 @@ impl<'a> Source<'a> {
             tmp: vec![[0; 4]; uv_width],
             rgb: vec![0; width * step * 16],
             alpha: None,
+            keep_alpha: true,
+            has_alpha: false,
             alpha_rows: 0,
         }
     }
 
-    /// The alpha plane, when some pixel is not opaque. Valid once every row has been read.
-    pub(crate) fn take_alpha(&mut self) -> Option<Vec<u8>> {
+    /// Whether some pixel is not opaque, and then the alpha plane if `keep_alpha`. Valid once
+    /// every row has been read.
+    pub(crate) fn take_alpha(&mut self) -> (bool, Option<Vec<u8>>) {
         debug_assert_eq!(self.alpha_rows, self.height);
-        self.alpha.take()
+        (self.has_alpha, self.alpha.take())
     }
 
     /// Makes macroblock row `mb_y` (and the row above it) available in `y`, `u` and `v`.
@@ -157,8 +162,11 @@ impl<'a> Source<'a> {
             let line = &mut self.rgb[(row - y0) * stride..][..stride];
             (self.read_row)(row, line);
             if self.step == 4 && row == self.alpha_rows {
-                if self.alpha.is_none() && line.chunks_exact(4).any(|p| p[3] != 0xff) {
-                    self.alpha = Some(vec![0xff; self.width * self.height]);
+                if !self.has_alpha && line.chunks_exact(4).any(|p| p[3] != 0xff) {
+                    self.has_alpha = true;
+                    if self.keep_alpha {
+                        self.alpha = Some(vec![0xff; self.width * self.height]);
+                    }
                 }
                 if let Some(alpha) = self.alpha.as_mut() {
                     for (a, p) in alpha[row * self.width..][..self.width]

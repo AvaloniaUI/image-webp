@@ -10,7 +10,7 @@
 extern crate test;
 
 pub use decoder::{DecodingError, LoopCount, UpsamplingMethod, WebPDecodeOptions, WebPDecoder};
-pub use encoder::{ColorType, EncodingError, WebPEncoder};
+pub use encoder::{encode_alpha_chunk, ColorType, EncodingError, WebPEncoder};
 pub use lossless::EncoderParams;
 
 mod alpha_blending;
