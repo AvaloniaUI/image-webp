@@ -1,9 +1,8 @@
 //! Lossy (VP8) encoder ported from libwebp 1.6.0, producing the same bitstream as
 //! `WebPEncode` with the default preset for any `method`.
 //!
-//! libwebp: Copyright 2010 Google Inc. All Rights Reserved.
-//! Redistribution and use in source and binary forms, with or without modification, are
-//! permitted under the terms of the BSD 3-Clause license that ships with libwebp.
+//! libwebp: Copyright 2010 Google Inc. All Rights Reserved. Distributed under libwebp's
+//! BSD 3-Clause license and patent grant, reproduced in LICENSE-LIBWEBP.
 
 mod bit_writer;
 mod cost;

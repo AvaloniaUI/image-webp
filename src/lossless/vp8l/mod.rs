@@ -2,9 +2,8 @@
 //! `WebPEncode` with `lossless = 1` for any `method` and `quality` (near-lossless off),
 //! and the same `ALPH` chunk as its lossy encoder.
 //!
-//! libwebp: Copyright 2012 Google Inc. All Rights Reserved.
-//! Redistribution and use in source and binary forms, with or without modification, are
-//! permitted under the terms of the BSD 3-Clause license that ships with libwebp.
+//! libwebp: Copyright 2012 Google Inc. All Rights Reserved. Distributed under libwebp's
+//! BSD 3-Clause license and patent grant, reproduced in LICENSE-LIBWEBP.
 
 mod alpha;
 mod backward_refs;

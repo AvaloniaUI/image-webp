@@ -1,3 +1,6 @@
+// The coefficient reading follows libwebp's GetCoeffsFast and VP8GetBit: Copyright Google Inc.,
+// BSD 3-Clause, see LICENSE-LIBWEBP.
+
 use crate::decoder::DecodingError;
 
 use super::common::{PROB_DCT_CAT, ZIGZAG};

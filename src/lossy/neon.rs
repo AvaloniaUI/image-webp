@@ -2,6 +2,8 @@
 //! `dsp/upsampling_neon.c` and the SSE2 kernels, bit-exact with the portable ones. NEON is
 //! part of aarch64, so no runtime detection is needed. Each wrapper checks the bounds its
 //! loads and stores rely on; `p` is the offset of the first pixel past the edge.
+//!
+//! libwebp: Copyright Google Inc., BSD 3-Clause, see LICENSE-LIBWEBP.
 #![allow(unsafe_code)]
 
 use core::arch::aarch64::*;

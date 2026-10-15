@@ -1,6 +1,8 @@
 //! SSE2 decoder kernels ported from libwebp's `dsp/dec_sse2.c`, bit-exact with the portable
 //! ones. SSE2 is part of x86_64, so no runtime detection is needed. Each wrapper checks the
 //! bounds its loads and stores rely on; `p` is the offset of the first pixel past the edge.
+//!
+//! libwebp: Copyright Google Inc., BSD 3-Clause, see LICENSE-LIBWEBP.
 #![allow(unsafe_code)]
 
 use core::arch::x86_64::*;

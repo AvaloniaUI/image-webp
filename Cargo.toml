@@ -2,7 +2,7 @@
 name = "image-webp"
 version = "0.2.4"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "(MIT OR Apache-2.0) AND BSD-3-Clause"
 rust-version = "1.80.1"
 
 description = "WebP encoding and decoding in pure Rust"
@@ -10,7 +10,7 @@ homepage = "https://github.com/image-rs/image-webp"
 repository = "https://github.com/image-rs/image-webp"
 categories = ["multimedia::images", "multimedia::encoding", "encoding"]
 
-include = ["/src", "LICENSE-APACHE", "LICENSE-MIT", "README.md"]
+include = ["/src", "LICENSE-APACHE", "LICENSE-LIBWEBP", "LICENSE-MIT", "README.md"]
 
 [dependencies]
 byteorder-lite = "0.1.0"
