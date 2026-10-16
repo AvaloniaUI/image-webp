@@ -526,8 +526,8 @@ impl<R: BufRead + Seek + Send> WebPDecoder<R> {
     /// time [`BandReader::next_band`] is called. For animated images this is the first frame.
     ///
     /// A lossy image is decoded one macroblock row (16 rows) at a time, so only a band of rows
-    /// and the alpha plane are held instead of the whole image; lossless images are decoded
-    /// whole when the reader is created, and animations into the output layout.
+    /// and the alpha plane are held instead of the whole image; a lossless image holds the
+    /// pixels a backward reference can reach; animations are decoded into the output layout.
     pub fn band_reader(&mut self) -> Result<BandReader<'_>, DecodingError> {
         let (width, height) = self.dimensions();
         let bpp = if self.has_alpha() { 4 } else { 3 };

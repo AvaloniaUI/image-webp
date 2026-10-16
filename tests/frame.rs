@@ -116,7 +116,20 @@ fn encode(w: usize, h: usize, rgba: &[u8], q: Option<f32>) -> Vec<u8> {
 fn encode_partitions(w: usize, h: usize, rgba: &[u8], q: f32, partitions: i32) -> Vec<u8> {
     let mut config = webp::WebPConfig::new_with_preset(webp::WebPPreset::WEBP_PRESET_DEFAULT, q).unwrap();
     config.partitions = partitions;
+    encode_config(&config, w, h, rgba)
+}
+
+/// Lossless at `quality` and `method`: past quality 75 libwebp's references reach a million pixels back.
+fn encode_lossless(w: usize, h: usize, rgba: &[u8], quality: f32, method: i32) -> Vec<u8> {
+    let mut config = webp::WebPConfig::new_with_preset(webp::WebPPreset::WEBP_PRESET_DEFAULT, quality).unwrap();
+    config.lossless = 1;
+    config.method = method;
+    encode_config(&config, w, h, rgba)
+}
+
+fn encode_config(config: &webp::WebPConfig, w: usize, h: usize, rgba: &[u8]) -> Vec<u8> {
     let mut picture = webp::WebPPicture::new().unwrap();
+    picture.use_argb = config.lossless;
     picture.width = w as i32;
     picture.height = h as i32;
     let mut writer = unsafe { std::mem::zeroed::<webp::WebPMemoryWriter>() };
@@ -125,7 +138,7 @@ fn encode_partitions(w: usize, h: usize, rgba: &[u8], q: f32, partitions: i32) -
         assert!(webp::WebPPictureImportRGBA(&mut picture, rgba.as_ptr(), (w * 4) as i32) != 0);
         picture.writer = Some(webp::WebPMemoryWrite);
         picture.custom_ptr = &mut writer as *mut _ as *mut std::ffi::c_void;
-        assert!(webp::WebPEncode(&config, &mut picture) != 0);
+        assert!(webp::WebPEncode(config, &mut picture) != 0);
         let v = std::slice::from_raw_parts(writer.mem, writer.size).to_vec();
         webp::WebPMemoryWriterClear(&mut writer);
         webp::WebPPictureFree(&mut picture);
@@ -145,6 +158,8 @@ fn picture(rng: &mut StdRng, w: usize, h: usize, alpha: u8) -> Vec<u8> {
                 _ => if (x / 7 + y / 5) % 3 == 0 { 0 } else { 200 },
             };
             match alpha {
+                // Rows repeating a million pixels apart, past the window a reference reaches.
+                5 => [(x * 3) as u8, (y % 450) as u8, (x ^ (y % 450)) as u8, 255],
                 3 | 4 => {
                     let k = ((x / 3 + y / 2 + n as usize % 2) % if alpha == 3 { 4 } else { 40 }) as u8;
                     [k * 60, k * 13, 255 - k * 5, if k % 3 == 0 { 128 } else { 255 }]
@@ -153,6 +168,31 @@ fn picture(rng: &mut StdRng, w: usize, h: usize, alpha: u8) -> Vec<u8> {
             }
         })
         .collect()
+}
+
+/// A smooth picture with bursts of four noise pixels, the second half's copied from bursts half
+/// a million to a million pixels back: the burst's length code and the distance code are rare
+/// and long, and the distance's 18 extra bits follow them, past one fill of the reader's window.
+fn noise_bursts(rng: &mut StdRng, w: usize, h: usize, noise: u8) -> Vec<u8> {
+    let mut p: Vec<u8> = (0..w * h)
+        .flat_map(|i| [(i % w / 8) as u8 + rng.gen_range(0..noise), (i / w / 8) as u8 + rng.gen_range(0..noise), rng.gen_range(0..noise), 255])
+        .collect();
+    let mut bursts: Vec<usize> = Vec::new();
+    let mut at = rng.gen_range(0..300);
+    while at + 4 <= w * h {
+        let from = bursts.iter().filter(|&&s| at - s >= (1 << 19) + 1000 && at - s < (1 << 20) - 1000).count();
+        if from > 0 && rng.gen_bool(0.7) {
+            let s = *bursts.iter().filter(|&&s| at - s >= (1 << 19) + 1000 && at - s < (1 << 20) - 1000).nth(rng.gen_range(0..from)).unwrap();
+            p.copy_within(s * 4..(s + 4) * 4, at * 4);
+        } else {
+            for b in &mut p[at * 4..(at + 4) * 4] {
+                *b = rng.gen::<u8>() | 1;
+            }
+            bursts.push(at);
+        }
+        at += rng.gen_range(100..500);
+    }
+    p
 }
 
 fn inputs() -> Vec<(String, Vec<u8>)> {
@@ -177,6 +217,10 @@ fn inputs() -> Vec<(String, Vec<u8>)> {
             }
         }
     }
+    let p = picture(&mut rng, 2100, 1100, 5);
+    v.push(("gen 2100x1100 tiled lossless".into(), encode(2100, 1100, &p, None)));
+    let p = noise_bursts(&mut rng, 1600, 1200, 1);
+    v.push(("gen 1600x1200 noise bursts lossless q100 m4".into(), encode_lossless(1600, 1200, &p, 100.0, 4)));
     // Partitions past a 64 KiB window, refilled while decoding.
     for (w, h, alpha) in [(1500, 1100, 0), (700, 900, 1)] {
         let p = picture(&mut rng, w, h, alpha);

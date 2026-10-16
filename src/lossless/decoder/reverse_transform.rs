@@ -1,6 +1,5 @@
 use std::ops::Range;
 
-use crate::decoder::DecodingError;
 
 use super::subsample_size;
 
@@ -21,35 +20,41 @@ pub(crate) enum TransformType {
     },
 }
 
+/// Undoes the prediction of `rows` rows from row `y0` on in `image_data`, which holds the row
+/// above them first (unread for `y0 == 0`).
 pub(crate) fn apply_predictor_transform(
     image_data: &mut [u8],
     width: u16,
-    height: u16,
+    y0: usize,
+    rows: usize,
     size_bits: u8,
     predictor_data: &[u8],
-) -> Result<(), DecodingError> {
+) {
     let block_xsize = usize::from(subsample_size(width, size_bits));
     let width = usize::from(width);
-    let height = usize::from(height);
 
     // Handle top and left borders specially. This involves ignoring mode and using specific
     // predictors for each.
-    image_data[3] = image_data[3].wrapping_add(255);
-    apply_predictor_transform_1(image_data, 4..width * 4, width);
-    for y in 1..height {
-        for i in 0..4 {
-            image_data[y * width * 4 + i] =
-                image_data[y * width * 4 + i].wrapping_add(image_data[(y - 1) * width * 4 + i]);
-        }
+    if y0 == 0 {
+        let row = &mut image_data[width * 4..];
+        row[3] = row[3].wrapping_add(255);
+        apply_predictor_transform_1(row, 4..width * 4, width);
     }
-
-    for y in 1..height {
+    for r in 1..=rows {
+        let y = y0 + r - 1;
+        if y == 0 {
+            continue;
+        }
+        for i in 0..4 {
+            image_data[r * width * 4 + i] =
+                image_data[r * width * 4 + i].wrapping_add(image_data[(r - 1) * width * 4 + i]);
+        }
         for block_x in 0..block_xsize {
             let block_index = (y >> size_bits) * block_xsize + block_x;
             // libwebp uses the low four bits; modes 14 and 15 predict as mode 0.
             let predictor = predictor_data[block_index * 4 + 1] & 0xf;
-            let start_index = (y * width + (block_x << size_bits).max(1)) * 4;
-            let end_index = (y * width + ((block_x + 1) << size_bits).min(width)) * 4;
+            let start_index = (r * width + (block_x << size_bits).max(1)) * 4;
+            let end_index = (r * width + ((block_x + 1) << size_bits).min(width)) * 4;
 
             match predictor {
                 0 => apply_predictor_transform_0(image_data, start_index..end_index, width),
@@ -70,8 +75,6 @@ pub(crate) fn apply_predictor_transform(
             }
         }
     }
-
-    Ok(())
 }
 pub fn apply_predictor_transform_0(image_data: &mut [u8], range: Range<usize>, _width: usize) {
     assert!(range.end <= image_data.len());
@@ -354,13 +357,14 @@ pub fn apply_predictor_transform_13(image_data: &mut [u8], range: Range<usize>, 
 pub(crate) fn apply_color_transform(
     image_data: &mut [u8],
     width: u16,
+    y0: usize,
     size_bits: u8,
     transform_data: &[u8],
 ) {
     let block_xsize = usize::from(subsample_size(width, size_bits));
     let width = usize::from(width);
 
-    for (y, row) in image_data.chunks_exact_mut(width * 4).enumerate() {
+    for (y, row) in (y0..).zip(image_data.chunks_exact_mut(width * 4)) {
         let row_transform_data_start = (y >> size_bits) * block_xsize * 4;
         // the length of block_tf_data should be `block_xsize * 4`, so we could slice it with [..block_xsize * 4]
         // but there is no point - `.zip()` runs until either of the iterators is consumed,
@@ -699,6 +703,7 @@ mod benches {
             super::apply_color_transform(
                 black_box(&mut data),
                 black_box(width as u16),
+                0,
                 black_box(size_bits),
                 black_box(&transform_data),
             );

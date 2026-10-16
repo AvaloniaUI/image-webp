@@ -1,7 +1,7 @@
 mod decoder;
 pub(crate) mod vp8l;
 
-pub(crate) use decoder::LosslessDecoder;
+pub(crate) use decoder::{LosslessBands, LosslessDecoder};
 
 /// Allows fine-tuning some encoder parameters.
 ///

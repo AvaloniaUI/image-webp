@@ -3,12 +3,12 @@
 //! and the frames a demuxer hands out.
 
 use std::collections::VecDeque;
-use std::io::{BufRead, Cursor, Read, Seek, SeekFrom};
+use std::io::{BufRead, Cursor, Read, Seek, SeekFrom, Take};
 
 use crate::decoder::DecodingError;
 use crate::extended::{read_alpha_chunk, unfilter_alpha_row, AlphaChunk};
 use crate::headers::Headers;
-use crate::lossless::LosslessDecoder;
+use crate::lossless::{LosslessBands, LosslessDecoder};
 use crate::lossy::{BandDecoder, Channel};
 use crate::rescaler::{self, Rescaler};
 use crate::UpsamplingMethod;
@@ -28,15 +28,16 @@ enum Source<'a> {
     Rgb(BandDecoder<'a, 3>),
     Rgba(BandDecoder<'a, 4>, Option<AlphaChunk>),
     Scaled(Box<ScaledLossy<'a>>),
-    Buffered { pixels: Vec<u8>, next_row: usize },
-    /// A whole RGBA picture handed out as RGB a band at a time.
-    Rgb32 { rgba: Vec<u8>, band: Vec<u8>, next_row: usize },
+    /// RGBA bands handed out as they are, or as RGB through `band`.
+    Lossless { bands: Lossless<'a>, band: Vec<u8> },
+    ScaledLossless(Box<ScaledLossless<'a>>),
 }
+
+type Lossless<'a> = LosslessBands<Take<Box<dyn BufRead + Send + 'a>>>;
 
 impl<'a> FrameDecoder<'a> {
     /// Starts decoding the bitstream `headers` found in `data`, which runs to the end of
     /// `data` as libwebp reads it, to RGBA (`alpha`) or RGB, scaled to `scaled` where given.
-    /// A lossless bitstream is decoded whole here, as libwebp holds it whole too.
     pub fn new(
         data: &'a [u8],
         headers: &Headers,
@@ -89,13 +90,12 @@ impl<'a> FrameDecoder<'a> {
         let bitstream = start + headers.image.start as u64;
         let end = start + len;
         let source = if headers.is_lossless {
-            let mut rgba = vec![0; width as usize * height as usize * 4];
             r.seek(SeekFrom::Start(bitstream))?;
-            LosslessDecoder::new(r.take(end - bitstream)).decode_frame(width, height, &mut rgba)?;
+            let r: Box<dyn BufRead + Send + 'a> = Box::new(r);
+            let bands = LosslessDecoder::new(r.take(end - bitstream)).frame(width, height)?;
             match scaled {
-                Some(size) => Source::Buffered { pixels: scale_argb(&rgba, (width, height), size, bpp), next_row: 0 },
-                None if alpha => Source::Buffered { pixels: rgba, next_row: 0 },
-                None => Source::Rgb32 { rgba, band: Vec::new(), next_row: 0 },
+                Some(size) => Source::ScaledLossless(Box::new(ScaledLossless::new(bands, (width, height), size, bpp))),
+                None => Source::Lossless { bands, band: Vec::new() },
             }
         } else {
             let alpha_chunk = match &headers.alpha {
@@ -171,27 +171,18 @@ impl<'a> FrameDecoder<'a> {
                 Ok(Some((y0, rows)))
             }
             Source::Scaled(s) => s.next_band(),
-            Source::Buffered { pixels, next_row } => {
-                let stride = w * self.bpp;
-                let y = *next_row;
-                if y >= self.height as usize {
+            Source::Lossless { bands, band } => {
+                let Some((y, rows)) = bands.next_band()? else {
                     return Ok(None);
+                };
+                if self.bpp == 4 {
+                    return Ok(Some((u32::from(y), rows)));
                 }
-                let rows = BUFFERED_BAND_ROWS.min(self.height as usize - y);
-                *next_row += rows;
-                Ok(Some((y as u32, &pixels[y * stride..(y + rows) * stride])))
-            }
-            Source::Rgb32 { rgba, band, next_row } => {
-                let y = *next_row;
-                if y >= self.height as usize {
-                    return Ok(None);
-                }
-                let rows = BUFFERED_BAND_ROWS.min(self.height as usize - y);
-                *next_row += rows;
                 band.clear();
-                band.extend(rgba[y * w * 4..(y + rows) * w * 4].chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
-                Ok(Some((y as u32, band)))
+                band.extend(rows.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
+                Ok(Some((u32::from(y), band)))
             }
+            Source::ScaledLossless(s) => s.next_band(),
         }
     }
 
@@ -247,34 +238,73 @@ fn premultiply(row: &mut [u8], inverse: bool) {
     }
 }
 
-/// A whole lossless picture scaled as libwebp's VP8L decoder scales it: premultiplied, scaled
-/// in four channels, unpremultiplied.
-fn scale_argb(rgba: &[u8], (w, h): (u32, u32), (ow, oh): (u32, u32), bpp: usize) -> Vec<u8> {
-    let mut r = Rescaler::new(w as usize, h as usize, ow as usize, oh as usize, 4);
-    let mut out = vec![0; ow as usize * oh as usize * bpp];
-    let mut src_row = vec![0; w as usize * 4];
-    let mut dst_row = vec![0; ow as usize * 4];
-    let mut rows = rgba.chunks_exact(w as usize * 4);
-    let mut y = 0;
-    let mut out_rows = out.chunks_exact_mut(ow as usize * bpp);
-    while y < oh {
-        if r.has_pending_output() {
-            r.export(&mut dst_row);
-            premultiply(&mut dst_row, true);
-            let out = out_rows.next().unwrap();
-            match bpp {
-                4 => out.copy_from_slice(&dst_row),
-                _ => out.chunks_exact_mut(3).zip(dst_row.chunks_exact(4)).for_each(|(o, p)| o.copy_from_slice(&p[..3])),
-            }
-            y += 1;
-        } else {
-            let Some(row) = rows.next() else { break };
-            src_row.copy_from_slice(row);
-            premultiply(&mut src_row, false);
-            r.import(&src_row);
+/// A lossless picture scaled as libwebp's VP8L decoder scales it: each row premultiplied,
+/// scaled in four channels, unpremultiplied, a band of decoded rows at a time.
+struct ScaledLossless<'a> {
+    bands: Lossless<'a>,
+    rescaler: Rescaler,
+    src_row: Vec<u8>,
+    dst_row: Vec<u8>,
+    out: Vec<u8>,
+    handed: usize,
+    bpp: usize,
+    next_row: u32,
+    done: bool,
+}
+
+impl<'a> ScaledLossless<'a> {
+    fn new(bands: Lossless<'a>, (w, h): (u32, u32), (ow, oh): (u32, u32), bpp: usize) -> Self {
+        Self {
+            bands,
+            rescaler: Rescaler::new(w as usize, h as usize, ow as usize, oh as usize, 4),
+            src_row: vec![0; w as usize * 4],
+            dst_row: vec![0; ow as usize * 4],
+            out: Vec::new(),
+            handed: 0,
+            bpp,
+            next_row: 0,
+            done: false,
         }
     }
-    out
+
+    fn export(rescaler: &mut Rescaler, dst_row: &mut [u8], out: &mut Vec<u8>, bpp: usize) {
+        while rescaler.has_pending_output() {
+            rescaler.export(dst_row);
+            premultiply(dst_row, true);
+            match bpp {
+                4 => out.extend_from_slice(dst_row),
+                _ => out.extend(dst_row.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]])),
+            }
+        }
+    }
+
+    fn next_band(&mut self) -> Result<Option<(u32, &[u8])>, DecodingError> {
+        let stride = self.rescaler.dst_row_len() / 4 * self.bpp;
+        self.out.drain(..self.handed * stride);
+        while self.out.len() < BUFFERED_BAND_ROWS * stride && !self.done {
+            let (rescaler, dst_row, out) = (&mut self.rescaler, &mut self.dst_row, &mut self.out);
+            Self::export(rescaler, dst_row, out, self.bpp);
+            match self.bands.next_band()? {
+                None => self.done = true,
+                Some((_, rows)) => {
+                    for row in rows.chunks_exact(self.src_row.len()) {
+                        Self::export(rescaler, dst_row, out, self.bpp);
+                        self.src_row.copy_from_slice(row);
+                        premultiply(&mut self.src_row, false);
+                        rescaler.import(&self.src_row);
+                    }
+                }
+            }
+        }
+        Self::export(&mut self.rescaler, &mut self.dst_row, &mut self.out, self.bpp);
+        self.handed = (self.out.len() / stride).min(BUFFERED_BAND_ROWS);
+        if self.handed == 0 {
+            return Ok(None);
+        }
+        let first = self.next_row;
+        self.next_row += self.handed as u32;
+        Ok(Some((first, &self.out[..self.handed * stride])))
+    }
 }
 
 /// A lossy bitstream scaled as libwebp's RGB rescaling does it: luma, both chroma planes and

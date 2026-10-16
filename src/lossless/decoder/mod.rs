@@ -5,7 +5,7 @@
 mod huffman;
 mod reverse_transform;
 
-use std::io::{self, BufRead, Read};
+use std::io::{self, BufRead};
 use std::mem;
 
 use super::{CODE_LENGTH_CODES, CODE_LENGTH_CODE_ORDER, DISTANCE_MAP};
@@ -59,9 +59,9 @@ impl<R: BufRead> LosslessDecoder<R> {
         }
     }
 
-    /// Decodes a frame of `width`×`height` RGBA pixels into `buf`, failing where the VP8L
-    /// header gives another size.
-    pub(crate) fn decode_frame(&mut self, width: u32, height: u32, buf: &mut [u8]) -> Result<(), DecodingError> {
+    /// Reads the VP8L header of a `width`×`height` frame, failing where it gives another size,
+    /// and its transforms and codes; the RGBA pixels follow a band at a time.
+    pub(crate) fn frame(mut self, width: u32, height: u32) -> Result<LosslessBands<R>, DecodingError> {
         let signature = self.bit_reader.read_bits::<u8>(8)?;
         if signature != 0x2f {
             return Err(DecodingError::LosslessSignatureInvalid(signature));
@@ -79,34 +79,32 @@ impl<R: BufRead> LosslessDecoder<R> {
             return Err(DecodingError::VersionNumberInvalid(version_num));
         }
 
-        let transformed_width = self.read_transforms()?;
-        let transformed_size = usize::from(transformed_width) * usize::from(self.height) * 4;
-        self.decode_image_stream(transformed_width, self.height, true, &mut buf[..transformed_size])?;
-        self.apply_transforms(transformed_width, buf)
+        let xsize = self.read_transforms()?;
+        let color_cache = self.read_color_cache()?.map(ColorCache::new);
+        let huffman_info = self.read_huffman_codes(true, xsize, self.height, color_cache)?;
+        Ok(LosslessBands::new(self, xsize, huffman_info))
     }
 
     /// Decodes the headerless stream of an ALPH chunk: the green channel of a `width`×`height`
     /// image, a byte per pixel. A stream of palette indices only is decoded a byte at a time,
     /// as libwebp's `DecodeAlphaData` does it, and allowed to end inside its last code.
-    pub(crate) fn decode_alpha(&mut self, width: u16, height: u16) -> Result<Vec<u8>, DecodingError> {
+    pub(crate) fn decode_alpha(mut self, width: u16, height: u16) -> Result<Vec<u8>, DecodingError> {
         self.width = width;
         self.height = height;
         let xsize = self.read_transforms()?;
-        let color_cache = self.read_color_cache()?.map(|bits| ColorCache {
-            color_cache_bits: bits,
-            color_cache: vec![[0; 4]; 1 << bits],
-        });
+        let color_cache = self.read_color_cache()?.map(ColorCache::new);
         let huffman_info = self.read_huffman_codes(true, xsize, height, color_cache)?;
         let pixels = usize::from(width) * usize::from(height);
         let indices_only = self.transform_order == [3]
             && huffman_info.color_cache.is_none()
             && huffman_info.huffman_code_groups.iter().all(|g| g[RED].is_single_node() && g[BLUE].is_single_node() && g[ALPHA].is_single_node());
         if !indices_only {
-            let mut argb = vec![0; pixels * 4];
-            let transformed_size = usize::from(xsize) * usize::from(height) * 4;
-            self.decode_image_data(xsize, height, huffman_info, &mut argb[..transformed_size])?;
-            self.apply_transforms(xsize, &mut argb)?;
-            return Ok(argb.chunks_exact(4).map(|p| p[1]).collect());
+            let mut bands = LosslessBands::new(self, xsize, huffman_info);
+            let mut plane = Vec::with_capacity(pixels);
+            while let Some((_, rows)) = bands.next_band()? {
+                plane.extend(rows.chunks_exact(4).map(|p| p[1]));
+            }
+            return Ok(plane);
         }
         let mut plane = vec![0; pixels];
         self.decode_alpha_8b(xsize, height, &huffman_info, &mut plane)?;
@@ -136,76 +134,15 @@ impl<R: BufRead> LosslessDecoder<R> {
         Ok(plane)
     }
 
-    fn apply_transforms(&self, transformed_width: u16, buf: &mut [u8]) -> Result<(), DecodingError> {
-        let mut image_size = usize::from(transformed_width) * usize::from(self.height) * 4;
-        let mut width = transformed_width;
-        for &trans_index in self.transform_order.iter().rev() {
-            let transform = self.transforms[usize::from(trans_index)].as_ref().unwrap();
-            match transform {
-                TransformType::PredictorTransform {
-                    size_bits,
-                    predictor_data,
-                } => apply_predictor_transform(
-                    &mut buf[..image_size],
-                    width,
-                    self.height,
-                    *size_bits,
-                    predictor_data,
-                )?,
-                TransformType::ColorTransform {
-                    size_bits,
-                    transform_data,
-                } => {
-                    apply_color_transform(
-                        &mut buf[..image_size],
-                        width,
-                        *size_bits,
-                        transform_data,
-                    );
-                }
-                TransformType::SubtractGreen => {
-                    apply_subtract_green_transform(&mut buf[..image_size]);
-                }
-                TransformType::ColorIndexingTransform {
-                    table_size,
-                    table_data,
-                } => {
-                    width = self.width;
-                    image_size = usize::from(width) * usize::from(self.height) * 4;
-                    apply_color_indexing_transform(
-                        buf,
-                        width,
-                        self.height,
-                        *table_size,
-                        table_data,
-                    );
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Reads Image data from the bitstream
-    ///
-    /// Can be in any of the 5 roles described in the Specification. ARGB Image role has different
-    /// behaviour to the other 4. xsize and ysize describe the size of the blocks where each block
-    /// has its own entropy code
-    fn decode_image_stream(
-        &mut self,
-        xsize: u16,
-        ysize: u16,
-        is_argb_img: bool,
-        data: &mut [u8],
-    ) -> Result<(), DecodingError> {
-        let color_cache_bits = self.read_color_cache()?;
-        let color_cache = color_cache_bits.map(|bits| ColorCache {
-            color_cache_bits: bits,
-            color_cache: vec![[0; 4]; 1 << bits],
-        });
-
-        let huffman_info = self.read_huffman_codes(is_argb_img, xsize, ysize, color_cache)?;
-        self.decode_image_data(xsize, ysize, huffman_info, data)
+    /// A transform's or entropy image's `xsize`×`ysize` RGBA pixels, decoded whole.
+    fn decode_image_stream(&mut self, xsize: u16, ysize: u16) -> Result<Vec<u8>, DecodingError> {
+        let color_cache = self.read_color_cache()?.map(ColorCache::new);
+        let huffman_info = self.read_huffman_codes(false, xsize, ysize, color_cache)?;
+        let pixels = usize::from(xsize) * usize::from(ysize);
+        let mut state = PixelState::new(huffman_info, xsize, pixels);
+        let mut window = Window::new(pixels, pixels);
+        self.decode_pixels(&mut state, &mut window, pixels)?;
+        Ok(window.data)
     }
 
     /// Reads transforms and their data from the bitstream
@@ -231,9 +168,7 @@ impl<R: BufRead> LosslessDecoder<R> {
                     let block_xsize = subsample_size(xsize, size_bits);
                     let block_ysize = subsample_size(self.height, size_bits);
 
-                    let mut predictor_data =
-                        vec![0; usize::from(block_xsize) * usize::from(block_ysize) * 4];
-                    self.decode_image_stream(block_xsize, block_ysize, false, &mut predictor_data)?;
+                    let predictor_data = self.decode_image_stream(block_xsize, block_ysize)?;
 
                     TransformType::PredictorTransform {
                         size_bits,
@@ -248,9 +183,7 @@ impl<R: BufRead> LosslessDecoder<R> {
                     let block_xsize = subsample_size(xsize, size_bits);
                     let block_ysize = subsample_size(self.height, size_bits);
 
-                    let mut transform_data =
-                        vec![0; usize::from(block_xsize) * usize::from(block_ysize) * 4];
-                    self.decode_image_stream(block_xsize, block_ysize, false, &mut transform_data)?;
+                    let transform_data = self.decode_image_stream(block_xsize, block_ysize)?;
 
                     TransformType::ColorTransform {
                         size_bits,
@@ -265,8 +198,7 @@ impl<R: BufRead> LosslessDecoder<R> {
                 3 => {
                     let color_table_size = self.bit_reader.read_bits::<u16>(8)? + 1;
 
-                    let mut color_map = vec![0; usize::from(color_table_size) * 4];
-                    self.decode_image_stream(color_table_size, 1, false, &mut color_map)?;
+                    let mut color_map = self.decode_image_stream(color_table_size, 1)?;
 
                     let bits = if color_table_size <= 2 {
                         3
@@ -324,8 +256,7 @@ impl<R: BufRead> LosslessDecoder<R> {
             huffman_xsize = subsample_size(xsize, huffman_bits);
             huffman_ysize = subsample_size(ysize, huffman_bits);
 
-            let mut data = vec![0; usize::from(huffman_xsize) * usize::from(huffman_ysize) * 4];
-            self.decode_image_stream(huffman_xsize, huffman_ysize, false, &mut data)?;
+            let data = self.decode_image_stream(huffman_xsize, huffman_ysize)?;
 
             entropy_image = data
                 .chunks_exact(4)
@@ -484,32 +415,31 @@ impl<R: BufRead> LosslessDecoder<R> {
     }
 
     /// Decodes the image data using the huffman trees and either of the 3 methods of decoding
-    fn decode_image_data(
-        &mut self,
-        width: u16,
-        height: u16,
-        mut huffman_info: HuffmanInfo,
-        data: &mut [u8],
-    ) -> Result<(), DecodingError> {
-        let num_values = usize::from(width) * usize::from(height);
+    /// Decodes pixels into `window` until pixel `until` is decoded, as libwebp's
+    /// `DecodeImageData` does, a backward reference or a run reaching past it.
+    fn decode_pixels(&mut self, st: &mut PixelState, window: &mut Window, until: usize) -> Result<(), DecodingError> {
+        let width = usize::from(st.width);
+        let num_values = st.num_values;
+        window.make_room(st.index, (until + MAX_COPY).min(num_values));
+        let base = window.base;
+        let last = window.base + window.cap;
+        let data = &mut window.data[..];
+        let huffman_info = &mut st.huffman;
+        let mut tree = &huffman_info.huffman_code_groups[st.huff_index];
+        let mut index = st.index;
+        let mut next_block_start = st.next_block_start;
 
-        let huff_index = huffman_info.get_huff_index(0, 0);
-        let mut tree = &huffman_info.huffman_code_groups[huff_index];
-        let mut index = 0;
-
-        let mut next_block_start = 0;
-        while index < num_values {
+        while index < until {
             self.bit_reader.fill()?;
+            let at = (index - base) * 4;
 
             if index >= next_block_start {
-                let x = index % usize::from(width);
-                let y = index / usize::from(width);
-                next_block_start = (x | usize::from(huffman_info.mask)).min(usize::from(width - 1))
-                    + y * usize::from(width)
-                    + 1;
+                let x = index % width;
+                let y = index / width;
+                next_block_start = (x | usize::from(huffman_info.mask)).min(width - 1) + y * width + 1;
 
-                let huff_index = huffman_info.get_huff_index(x as u16, y as u16);
-                tree = &huffman_info.huffman_code_groups[huff_index];
+                st.huff_index = huffman_info.get_huff_index(x as u16, y as u16);
+                tree = &huffman_info.huffman_code_groups[st.huff_index];
 
                 // Fast path: If all the codes each contain only a single
                 // symbol, then the pixel data isn't written to the bitstream
@@ -519,18 +449,19 @@ impl<R: BufRead> LosslessDecoder<R> {
                     let code = tree[GREEN].read_symbol(&mut self.bit_reader)?;
                     if code < 256 {
                         let n = if huffman_info.bits == 0 {
-                            num_values
+                            num_values - index
                         } else {
                             next_block_start - index
-                        };
+                        }
+                        .min(until - index);
 
                         let red = tree[RED].read_symbol(&mut self.bit_reader)?;
                         let blue = tree[BLUE].read_symbol(&mut self.bit_reader)?;
                         let alpha = tree[ALPHA].read_symbol(&mut self.bit_reader)?;
                         let value = [red as u8, code as u8, blue as u8, alpha as u8];
 
-                        for i in 0..n {
-                            data[index * 4 + i * 4..][..4].copy_from_slice(&value);
+                        for px in data[at..at + n * 4].chunks_exact_mut(4) {
+                            px.copy_from_slice(&value);
                         }
 
                         if let Some(color_cache) = huffman_info.color_cache.as_mut() {
@@ -555,10 +486,10 @@ impl<R: BufRead> LosslessDecoder<R> {
                 let blue = tree[BLUE].read_symbol(&mut self.bit_reader)? as u8;
                 let alpha = tree[ALPHA].read_symbol(&mut self.bit_reader)? as u8;
 
-                data[index * 4] = red;
-                data[index * 4 + 1] = green;
-                data[index * 4 + 2] = blue;
-                data[index * 4 + 3] = alpha;
+                data[at] = red;
+                data[at + 1] = green;
+                data[at + 2] = blue;
+                data[at + 3] = alpha;
 
                 if let Some(color_cache) = huffman_info.color_cache.as_mut() {
                     color_cache.insert([red, green, blue, alpha]);
@@ -570,36 +501,38 @@ impl<R: BufRead> LosslessDecoder<R> {
                 let length = Self::get_copy_distance(&mut self.bit_reader, length_symbol)?;
 
                 let dist_symbol = tree[DIST].read_symbol(&mut self.bit_reader)?;
+                // Two 15-bit codes and 18 extra bits outrun one fill, as libwebp refills here.
+                self.bit_reader.fill()?;
                 let dist_code = Self::get_copy_distance(&mut self.bit_reader, dist_symbol)?;
-                let dist = Self::plane_code_to_distance(width, dist_code);
+                let dist = Self::plane_code_to_distance(st.width, dist_code);
 
                 if index < dist || num_values - index < length {
                     return Err(DecodingError::BitStreamError);
                 }
 
                 if dist == 1 {
-                    let value: [u8; 4] = data[(index - dist) * 4..][..4].try_into().unwrap();
-                    for i in 0..length {
-                        data[index * 4 + i * 4..][..4].copy_from_slice(&value);
+                    let value: [u8; 4] = data[at - 4..][..4].try_into().unwrap();
+                    for px in data[at..at + length * 4].chunks_exact_mut(4) {
+                        px.copy_from_slice(&value);
                     }
                 } else {
-                    if index + length + 3 <= num_values {
-                        let start = (index - dist) * 4;
-                        data.copy_within(start..start + 16, index * 4);
+                    if index + length + 3 <= last {
+                        let start = at - dist * 4;
+                        data.copy_within(start..start + 16, at);
 
                         if length > 4 || dist < 4 {
                             for i in (0..length * 4).step_by((dist * 4).min(16)).skip(1) {
-                                data.copy_within(start + i..start + i + 16, index * 4 + i);
+                                data.copy_within(start + i..start + i + 16, at + i);
                             }
                         }
                     } else {
-                        for i in 0..length * 4 {
-                            data[index * 4 + i] = data[index * 4 + i - dist * 4];
+                        for i in at..at + length * 4 {
+                            data[i] = data[i - dist * 4];
                         }
                     }
 
                     if let Some(color_cache) = huffman_info.color_cache.as_mut() {
-                        for pixel in data[index * 4..][..length * 4].chunks_exact(4) {
+                        for pixel in data[at..][..length * 4].chunks_exact(4) {
                             color_cache.insert(pixel.try_into().unwrap());
                         }
                     }
@@ -612,7 +545,7 @@ impl<R: BufRead> LosslessDecoder<R> {
                     .as_mut()
                     .ok_or(DecodingError::BitStreamError)?;
                 let color = color_cache.lookup((code - 280).into());
-                data[index * 4..][..4].copy_from_slice(&color);
+                data[at..][..4].copy_from_slice(&color);
                 color_cache.insert(color);
                 index += 1;
 
@@ -622,7 +555,7 @@ impl<R: BufRead> LosslessDecoder<R> {
                         if code >= 280 {
                             self.bit_reader.consume(bits)?;
                             let color = color_cache.lookup((code - 280).into());
-                            data[index * 4..][..4].copy_from_slice(&color);
+                            data[at + 4..][..4].copy_from_slice(&color);
                             color_cache.insert(color);
                             index += 1;
                         }
@@ -631,6 +564,8 @@ impl<R: BufRead> LosslessDecoder<R> {
             }
         }
 
+        st.index = index;
+        st.next_block_start = next_block_start;
         Ok(())
     }
 
@@ -737,6 +672,127 @@ impl<R: BufRead> LosslessDecoder<R> {
 }
 
 #[derive(Debug, Clone)]
+/// The entropy-decoded pixels a backward reference can still reach: libwebp's distance codes
+/// reach `WINDOW - 120` pixels back, the longest run `MAX_COPY` pixels on. Pixel `i` sits at
+/// `i - base`; the last `WINDOW` pixels slide to the front when the next band would not fit.
+struct Window {
+    data: Vec<u8>,
+    base: usize,
+    cap: usize,
+}
+
+const WINDOW: usize = 1 << 20;
+const MAX_COPY: usize = 4096;
+
+impl Window {
+    fn new(num_values: usize, band: usize) -> Self {
+        let cap = num_values.min(WINDOW + WINDOW.max(band + MAX_COPY));
+        Self { data: vec![0; cap * 4], base: 0, cap }
+    }
+
+    fn make_room(&mut self, index: usize, need: usize) {
+        if need <= self.base + self.cap || index < WINDOW {
+            return;
+        }
+        let keep = index - WINDOW;
+        self.data.copy_within((keep - self.base) * 4..(index - self.base) * 4, 0);
+        self.base = keep;
+    }
+
+    fn rows(&self, from: usize, to: usize) -> &[u8] {
+        &self.data[(from - self.base) * 4..(to - self.base) * 4]
+    }
+}
+
+/// Where a pixel decode stands between bands.
+struct PixelState {
+    huffman: HuffmanInfo,
+    width: u16,
+    num_values: usize,
+    index: usize,
+    next_block_start: usize,
+    huff_index: usize,
+}
+
+impl PixelState {
+    fn new(huffman: HuffmanInfo, width: u16, num_values: usize) -> Self {
+        let huff_index = huffman.get_huff_index(0, 0);
+        Self { huffman, width, num_values, index: 0, next_block_start: 0, huff_index }
+    }
+}
+
+/// The main image of a VP8L stream decoded a band of rows at a time as libwebp's `ProcessRows`
+/// hands them on: the entropy-coded pixels kept in a [`Window`], the inverse transforms run over
+/// each band in a cache holding the band and, before it, the previous row the predictor needs.
+pub(crate) struct LosslessBands<R> {
+    decoder: LosslessDecoder<R>,
+    state: PixelState,
+    window: Window,
+    cache: Vec<u8>,
+    top: Vec<u8>,
+    row: u16,
+}
+
+pub(crate) const BAND_ROWS: usize = 16;
+
+impl<R: BufRead> LosslessBands<R> {
+    fn new(decoder: LosslessDecoder<R>, xsize: u16, huffman: HuffmanInfo) -> Self {
+        let (width, height) = (usize::from(decoder.width), usize::from(decoder.height));
+        let pixels = usize::from(xsize) * height;
+        let band = usize::from(xsize) * BAND_ROWS.min(height);
+        Self {
+            decoder,
+            state: PixelState::new(huffman, xsize, pixels),
+            window: Window::new(pixels, band),
+            cache: vec![0; width * 4 * (1 + BAND_ROWS.min(height))],
+            top: vec![0; width * 4],
+            row: 0,
+        }
+    }
+
+    /// The next band's first row and its RGBA rows, or `None` after the last.
+    pub(crate) fn next_band(&mut self) -> Result<Option<(u16, &[u8])>, DecodingError> {
+        let (width, height) = (usize::from(self.decoder.width), usize::from(self.decoder.height));
+        let y0 = usize::from(self.row);
+        if y0 >= height {
+            return Ok(None);
+        }
+        let rows = BAND_ROWS.min(height - y0);
+        let xsize = usize::from(self.state.width);
+        self.decoder.decode_pixels(&mut self.state, &mut self.window, (y0 + rows) * xsize)?;
+        let head = width * 4;
+        self.cache[head..head + rows * xsize * 4].copy_from_slice(self.window.rows(y0 * xsize, (y0 + rows) * xsize));
+        self.transform(y0, rows);
+        self.row += rows as u16;
+        Ok(Some((y0 as u16, &self.cache[head..head + rows * width * 4])))
+    }
+
+    fn transform(&mut self, y0: usize, rows: usize) {
+        let full = usize::from(self.decoder.width);
+        let head = full * 4;
+        let mut width = usize::from(self.state.width);
+        for &t in self.decoder.transform_order.iter().rev() {
+            let stride = width * 4;
+            match self.decoder.transforms[usize::from(t)].as_ref().unwrap() {
+                TransformType::PredictorTransform { size_bits, predictor_data } => {
+                    let band = &mut self.cache[head - stride..head + rows * stride];
+                    band[..stride].copy_from_slice(&self.top[..stride]);
+                    apply_predictor_transform(band, width as u16, y0, rows, *size_bits, predictor_data);
+                    self.top[..stride].copy_from_slice(&band[rows * stride..]);
+                }
+                TransformType::ColorTransform { size_bits, transform_data } => {
+                    apply_color_transform(&mut self.cache[head..head + rows * stride], width as u16, y0, *size_bits, transform_data);
+                }
+                TransformType::SubtractGreen => apply_subtract_green_transform(&mut self.cache[head..head + rows * stride]),
+                TransformType::ColorIndexingTransform { table_size, table_data } => {
+                    width = full;
+                    apply_color_indexing_transform(&mut self.cache[head..head + rows * full * 4], full as u16, rows as u16, *table_size, table_data);
+                }
+            }
+        }
+    }
+}
+
 struct HuffmanInfo {
     xsize: u16,
     _ysize: u16,
@@ -766,6 +822,10 @@ struct ColorCache {
 }
 
 impl ColorCache {
+    fn new(bits: u8) -> Self {
+        Self { color_cache_bits: bits, color_cache: vec![[0; 4]; 1 << bits] }
+    }
+
     #[inline(always)]
     fn insert(&mut self, color: [u8; 4]) {
         let [r, g, b, a] = color;

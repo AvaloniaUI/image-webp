@@ -1118,3 +1118,90 @@ fn encode_alpha_plane(
 pub(crate) fn bench_alpha_plane(alpha: &[u8], width: u32, height: u32, method: u8) -> usize {
     encode_alpha_plane(alpha, width, height, i32::from(method), true).len()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::backward_refs::{distance_to_plane_code, PixOrCopy};
+    use super::*;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+
+    /// A stream of one code group written from chosen references and codes: literals, copies
+    /// of the row above and four-pixel copies from half a million to a million pixels back,
+    /// whose length and distance symbols get 15-bit codes from a geometric histogram, so the
+    /// distance's 18 extra bits follow two long codes, past one fill of the decoder's window.
+    #[test]
+    fn far_copies_after_long_codes_decode() {
+        let (width, height) = (2048u32, 600u32);
+        let total = (width * height) as usize;
+        let mut rng = StdRng::seed_from_u64(3);
+        let mut argb: Vec<u32> = Vec::with_capacity(total);
+        let mut refs: BackwardRefs = Vec::new();
+        let mut far = 0;
+        while argb.len() < total {
+            let at = argb.len();
+            let left = total - at;
+            let (dist, len) = if at >= (1 << 19) + 1000 && rng.gen_range(0..300) == 0 && left >= 4 {
+                far += 1;
+                (rng.gen_range((1 << 19) + 1000..((1 << 20) - 120).min(at)), 4)
+            } else if at >= width as usize && rng.gen_range(0..50) == 0 && left >= 10 {
+                (width as usize, 10)
+            } else {
+                let green = rng.gen::<u32>().trailing_zeros().min(13);
+                let p = 0xff000000 | rng.gen_range(0..4u32) << 16 | green << 8;
+                argb.push(p);
+                refs.push(PixOrCopy::literal(p));
+                continue;
+            };
+            for i in 0..len {
+                argb.push(argb[at - dist + i]);
+            }
+            refs.push(PixOrCopy::copy(distance_to_plane_code(width, dist as u32), len as u32));
+        }
+        assert!(far > 1000, "{far} far copies");
+        let mut histo = Histogram::new(0);
+        histo.store_refs(&refs, None);
+        for k in 0..14 {
+            histo.literal[k] = 1 << (14 - k);
+            histo.distance[k] = 1 << (14 - k);
+        }
+        histo.literal[256 + 3] = 1;
+        histo.literal[256 + 7] = 1 << 4;
+        histo.distance[38] = 1;
+        histo.distance[39] = 1;
+        let mut codes = get_huff_bit_lengths_and_codes(std::slice::from_mut(&mut histo));
+        assert_eq!((codes[0].code_lengths[256 + 3], codes[4].code_lengths[38]), (15, 15));
+        let mut bw = BitWriter::with_capacity(total);
+        bw.put_bits(width - 1, 14);
+        bw.put_bits(height - 1, 14);
+        bw.put_bits(0, 1);
+        bw.put_bits(0, 3);
+        bw.put_bits(0, 1);
+        bw.put_bits(0, 1);
+        bw.put_bits(0, 1);
+        store_huffman_codes(&mut bw, &mut codes);
+        store_image_to_bit_mask(&mut bw, width, 0, &refs, &[0], &codes);
+        let mut payload = vec![0x2f];
+        payload.extend_from_slice(&bw.finish());
+        let mut data = Vec::new();
+        data.extend_from_slice(b"RIFF");
+        data.extend_from_slice(&(12 + payload.len() as u32 + payload.len() as u32 % 2).to_le_bytes());
+        data.extend_from_slice(b"WEBPVP8L");
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(&payload);
+        if payload.len() % 2 == 1 {
+            data.push(0);
+        }
+        let headers = crate::headers::decoding(&data).unwrap();
+        let mut decoder = crate::FrameDecoder::new(&data, &headers, None, true).unwrap();
+        let mut rgba = Vec::with_capacity(total * 4);
+        while let Some((_, rows)) = decoder.next_band().unwrap() {
+            rgba.extend_from_slice(rows);
+        }
+        let expected: Vec<u8> = argb
+            .iter()
+            .flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, (p >> 24) as u8])
+            .collect();
+        let wrong = rgba.chunks(4).zip(expected.chunks(4)).filter(|(a, b)| a != b).count();
+        assert_eq!(wrong, 0, "{wrong} wrong pixels");
+    }
+}
