@@ -2522,6 +2522,19 @@ pub(crate) fn encode_frame_lossy(
     quality: u8,
     method: u8,
     keep_alpha: bool,
+    read_row: impl FnMut(u32, &mut [u8]),
+) -> Result<EncodedFrame, crate::EncodingError> {
+    let config = Config::new(f32::from(quality.min(100)), i32::from(method.min(6)));
+    encode_frame_lossy_with(config, width, height, color, keep_alpha, read_row)
+}
+
+/// [`encode_frame_lossy`] with a `config` of its own.
+pub(crate) fn encode_frame_lossy_with(
+    config: Config,
+    width: u32,
+    height: u32,
+    color: crate::ColorType,
+    keep_alpha: bool,
     mut read_row: impl FnMut(u32, &mut [u8]),
 ) -> Result<EncodedFrame, crate::EncodingError> {
     use crate::ColorType;
@@ -2529,7 +2542,6 @@ pub(crate) fn encode_frame_lossy(
         return Err(crate::EncodingError::InvalidDimensions);
     }
     let (w, h) = (width as usize, height as usize);
-    let config = Config::new(f32::from(quality.min(100)), i32::from(method.min(6)));
     let mut src = match color {
         ColorType::Rgb8 => Source::new(w, h, 3, move |y, row| read_row(y as u32, row)),
         ColorType::Rgba8 => Source::new(w, h, 4, move |y, row| read_row(y as u32, row)),

@@ -14,6 +14,7 @@ pub use decoder::{
     WebPDecodeOptions, WebPDecoder, ALPHA_FLAG, ANIMATION_FLAG, EXIF_FLAG, ICCP_FLAG, XMP_FLAG,
 };
 pub use frame::FrameDecoder;
+pub use animation::{AnimationEncoder, AnimationParams};
 pub use encoder::{encode_alpha_chunk, ColorType, EncodingError, WebPEncoder};
 pub use lossless::EncoderParams;
 
@@ -22,6 +23,7 @@ pub(crate) trait ReadSeek: std::io::Read + std::io::Seek {}
 impl<R: std::io::Read + std::io::Seek> ReadSeek for R {}
 
 mod alpha_blending;
+mod animation;
 mod decoder;
 mod encoder;
 mod extended;

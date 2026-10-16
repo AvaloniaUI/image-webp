@@ -28,8 +28,12 @@ fn blend_channel_nonpremult(
 fn blend_pixel_nonpremult(src: u32, dst: u32) -> u32 {
     let src_a = ((src >> channel_shift(3)) & 0xff) as u8;
 
+    // libwebp's BlendPixelRowNonPremult leaves opaque pixels alone: scaled through
+    // (1 << 24) / 255 they would lose one.
     if src_a == 0 {
         dst
+    } else if src_a == 0xff {
+        src
     } else {
         let dst_a = ((dst >> channel_shift(3)) & 0xff) as u8;
         // Approximate integer arithmetic for: dst_factor_a = (dst_a * (255 - src_a)) / 255

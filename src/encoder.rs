@@ -55,7 +55,7 @@ quick_error! {
     }
 }
 
-const fn chunk_size(inner_bytes: usize) -> u32 {
+pub(crate) const fn chunk_size(inner_bytes: usize) -> u32 {
     if inner_bytes % 2 == 1 {
         (inner_bytes + 1) as u32 + 8
     } else {
@@ -63,11 +63,11 @@ const fn chunk_size(inner_bytes: usize) -> u32 {
     }
 }
 
-fn write_chunk<W: Write>(w: W, name: &[u8], data: &[u8]) -> io::Result<()> {
+pub(crate) fn write_chunk<W: Write>(w: W, name: &[u8], data: &[u8]) -> io::Result<()> {
     write_chunk_parts(w, name, &[data])
 }
 
-fn write_chunk_parts<W: Write>(mut w: W, name: &[u8], parts: &[&[u8]]) -> io::Result<()> {
+pub(crate) fn write_chunk_parts<W: Write>(mut w: W, name: &[u8], parts: &[&[u8]]) -> io::Result<()> {
     debug_assert!(name.len() == 4);
     let len: usize = parts.iter().map(|p| p.len()).sum();
 
@@ -231,7 +231,7 @@ impl<W: Write> WebPEncoder<W> {
 
     /// Writes the RIFF container around a frame chunk of `frame_parts`, with a lossy frame's
     /// `ALPH` chunk.
-    fn write_container(
+    pub(crate) fn write_container(
         mut self,
         frame_chunk: &[u8; 4],
         frame_parts: Vec<Vec<u8>>,
@@ -342,7 +342,7 @@ pub fn encode_alpha_chunk(
     Some(alpha_chunk_payload(alpha, width, height, params))
 }
 
-fn alpha_chunk_payload(alpha: &[u8], width: u32, height: u32, params: &EncoderParams) -> Vec<u8> {
+pub(crate) fn alpha_chunk_payload(alpha: &[u8], width: u32, height: u32, params: &EncoderParams) -> Vec<u8> {
     if params.alpha_compression {
         vp8l::encode_alpha(alpha, width, height, params.lossy_method)
     } else {

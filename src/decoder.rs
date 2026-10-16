@@ -577,14 +577,11 @@ impl<R: BufRead + Seek + Send> WebPDecoder<R> {
         let (frame_x, frame_y) = (f.x_offset as u32, f.y_offset as u32);
         let (frame_width, frame_height) = (f.width as u32, f.height as u32);
 
-        let clear_color = if self.animation.dispose_next_frame {
-            match (self.background_color, frame_has_alpha) {
-                (color @ Some(_), _) => color,
-                (_, true) => Some([0, 0, 0, 0]),
-                _ => None,
-            }
-        } else {
-            None
+        // A frame disposes to transparent whatever the next frame carries, as libwebp's
+        // animation decoder disposes it.
+        let clear_color = match self.animation.dispose_next_frame {
+            true => Some(self.background_color.unwrap_or([0, 0, 0, 0])),
+            false => None,
         };
 
         // fill starting canvas with clear color

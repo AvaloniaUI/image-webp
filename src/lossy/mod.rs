@@ -26,7 +26,7 @@ use sse2 as simd;
 mod transform;
 pub(crate) mod vp8enc;
 mod yuv;
-pub(crate) use yuv::fill_row_yuv;
+pub(crate) use yuv::{fill_row_yuv, upsample_chroma_row};
 
 #[derive(Clone, Copy)]
 pub(crate) struct TreeNode {
