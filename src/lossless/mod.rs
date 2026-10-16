@@ -26,6 +26,10 @@ pub struct EncoderParams {
     /// Keep the RGB values of fully transparent pixels in lossless encoding, as libwebp's
     /// `exact`. Off by default, which lets them become black for better compression.
     pub lossless_exact: bool,
+    /// Near-lossless level for lossless encoding, 0 (most change) to 100 (none), as libwebp's
+    /// `near_lossless`: pixels move within a bound before the encode where that packs their
+    /// residuals better. Defaults to 100.
+    pub near_lossless: u8,
     /// Compress the alpha plane of lossy images, as libwebp's `alpha_compression`. When off,
     /// the `ALPH` chunk holds the plane uncompressed, which is faster and bigger. Defaults to on.
     pub alpha_compression: bool,
@@ -41,6 +45,7 @@ impl Default for EncoderParams {
             lossless_quality: 75,
             lossless_method: 4,
             lossless_exact: false,
+            near_lossless: 100,
             alpha_compression: true,
         }
     }

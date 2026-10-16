@@ -151,6 +151,7 @@ impl<W: Write> WebPEncoder<W> {
             method: i32::from(self.params.lossless_method.min(6)),
             exact: self.params.lossless_exact,
             use_predictor: self.params.use_predictor_transform,
+            near_lossless: i32::from(self.params.near_lossless.min(100)),
         };
         let frame = vp8l::encode_lossless(data, width, height, color, config);
         let has_alpha = frame[4] & 0x10 != 0;

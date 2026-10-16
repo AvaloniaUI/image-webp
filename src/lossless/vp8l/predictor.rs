@@ -1,6 +1,7 @@
 //! Spatial prediction and cross-colour transforms (libwebp's `enc/predictor_enc.c`).
 
 use super::entropy::*;
+use super::near_lossless::{self, add_pixels};
 
 const HISTO_SIZE: usize = 4 * 256;
 const SPATIAL_PREDICTOR_BIAS: i64 = 15 << LOG_2_PRECISION_BITS;
@@ -172,6 +173,10 @@ macro_rules! dispatch_mode {
     };
 }
 
+fn predict_mode(mode: usize, left: u32, tl: u32, t: u32, tr: u32) -> u32 {
+    dispatch_mode!(mode, predict, left, tl, t, tr)
+}
+
 /// `PredictBatch`: residuals of `current[x_start..x_start + num_pixels]` into `out`.
 fn predict_batch(
     mode: usize,
@@ -199,20 +204,23 @@ fn predict_batch(
     }
 }
 
-/// `GetResidual` without near-lossless quantization.
+/// `GetResidual`: the residuals of `current_row[x_start..x_end]`, quantized within
+/// `max_diffs` where `res` asks for near-lossless.
 #[allow(clippy::too_many_arguments)]
 fn get_residual(
     width: usize,
+    height: usize,
     upper_row: &mut [u32],
     current_row: &mut [u32],
+    max_diffs: &[u8],
     mode: usize,
     x_start: usize,
     x_end: usize,
     y: usize,
-    exact: bool,
+    res: Residuals,
     out: &mut [u32],
 ) {
-    if exact {
+    if res.exact {
         predict_batch(
             mode,
             x_start,
@@ -222,6 +230,43 @@ fn get_residual(
             upper_row,
             out,
         );
+        return;
+    }
+    if res.max_quantization > 1 && mode != 0 && y != 0 && y != height - 1 {
+        for x in x_start..x_end {
+            let predict_v = if x == 0 {
+                upper_row[0]
+            } else {
+                predict_mode(
+                    mode,
+                    current_row[x - 1],
+                    upper_row[x - 1],
+                    upper_row[x],
+                    upper_row[x + 1],
+                )
+            };
+            let mut residual = if x == 0 || x == width - 1 {
+                sub_pixels(current_row[x], predict_v)
+            } else {
+                let r = near_lossless::residual(
+                    current_row[x],
+                    predict_v,
+                    res.max_quantization,
+                    max_diffs[x],
+                    res.subtract_green,
+                );
+                current_row[x] = add_pixels(predict_v, r);
+                r
+            };
+            if near_lossless::transparent(current_row[x]) {
+                residual &= MASK_ALPHA;
+                current_row[x] = predict_v & !MASK_ALPHA;
+                if x == 0 {
+                    upper_row[width] = current_row[0];
+                }
+            }
+            out[x - x_start] = residual;
+        }
         return;
     }
     let mut out = &mut out[..x_end - x_start];
@@ -320,9 +365,19 @@ fn update_histo(histo: &mut [u32; HISTO_SIZE], residuals: &[u32]) {
     }
 }
 
+/// How residuals are taken: `exact` keeps transparent pixels' RGB, a `max_quantization` above
+/// 1 quantizes them near-losslessly (after subtract-green when `subtract_green`).
+#[derive(Clone, Copy)]
+pub(crate) struct Residuals {
+    pub(crate) exact: bool,
+    pub(crate) max_quantization: u32,
+    pub(crate) subtract_green: bool,
+}
+
 struct Scratch {
     rows: Vec<u32>,
     residuals: Vec<u32>,
+    max_diffs: [Vec<u8>; 2],
     width: usize,
     swapped: bool,
 }
@@ -332,6 +387,7 @@ impl Scratch {
         Self {
             rows: vec![0; 2 * (width + 1)],
             residuals: Vec::new(),
+            max_diffs: [vec![0; width], vec![0; width]],
             width,
             swapped: false,
         }
@@ -361,7 +417,7 @@ fn compute_residuals_for_tile(
     all_argb: &mut [u32],
     scratch: &mut Scratch,
     argb: &[u32],
-    exact: bool,
+    res: Residuals,
 ) {
     let start_x = tile_x << min_bits;
     let start_y = tile_y << min_bits;
@@ -370,8 +426,10 @@ fn compute_residuals_for_tile(
     let max_x = tile_size.min(width - start_x);
     let have_left = usize::from(start_x > 0);
     let context_start_x = start_x - have_left;
+    let context_width = max_x + have_left + usize::from(max_x < width - start_x);
     let mut residuals = core::mem::take(&mut scratch.residuals);
     residuals.resize(max_x * max_y, 0);
+    let mut max_diffs = core::mem::take(&mut scratch.max_diffs);
     scratch.swapped = false;
     for mode in 0..NUM_PRED_MODES {
         if start_y > 0 {
@@ -387,15 +445,27 @@ fn compute_residuals_for_tile(
             let src = y * width + context_start_x;
             let (upper, current) = scratch.rows();
             current[context_start_x..context_start_x + n].copy_from_slice(&argb[src..src + n]);
+            if res.max_quantization > 1 && y >= 1 && y + 1 < height {
+                near_lossless::max_diffs_for_row(
+                    context_width,
+                    width,
+                    argb,
+                    src,
+                    &mut max_diffs[0][context_start_x..],
+                    res.subtract_green,
+                );
+            }
             get_residual(
                 width,
+                height,
                 upper,
                 current,
+                &max_diffs[0],
                 mode,
                 start_x,
                 start_x + max_x,
                 y,
-                exact,
+                res,
                 &mut residuals[relative_y * max_x..],
             );
         }
@@ -407,6 +477,7 @@ fn compute_residuals_for_tile(
         }
     }
     scratch.residuals = residuals;
+    scratch.max_diffs = max_diffs;
 }
 
 fn copy_image_with_prediction(
@@ -417,19 +488,34 @@ fn copy_image_with_prediction(
     scratch: &mut Scratch,
     argb: &mut [u32],
     low_effort: bool,
-    exact: bool,
+    res: Residuals,
 ) {
     let tiles_per_row = sub_sample_size(width as u32, bits) as usize;
     scratch.swapped = false;
+    let [mut current_max_diffs, mut lower_max_diffs] = core::mem::take(&mut scratch.max_diffs);
     for y in 0..height {
         scratch.swap();
         let n = width + usize::from(y + 1 < height);
         let (upper, current) = scratch.rows();
         current[..n].copy_from_slice(&argb[y * width..y * width + n]);
-        let out = &mut argb[y * width..(y + 1) * width];
         if low_effort {
+            let out = &mut argb[y * width..(y + 1) * width];
             predict_batch(PRED_LOW_EFFORT, 0, y, width, current, upper, out);
         } else {
+            if res.max_quantization > 1 {
+                core::mem::swap(&mut current_max_diffs, &mut lower_max_diffs);
+                if y + 2 < height {
+                    near_lossless::max_diffs_for_row(
+                        width,
+                        width,
+                        argb,
+                        (y + 1) * width,
+                        &mut lower_max_diffs,
+                        res.subtract_green,
+                    );
+                }
+            }
+            let out = &mut argb[y * width..(y + 1) * width];
             let mut x = 0;
             while x < width {
                 let mode =
@@ -437,19 +523,22 @@ fn copy_image_with_prediction(
                 let x_end = (x + (1 << bits)).min(width);
                 get_residual(
                     width,
+                    height,
                     upper,
                     current,
+                    &current_max_diffs,
                     mode,
                     x,
                     x_end,
                     y,
-                    exact,
+                    res,
                     &mut out[x..x_end],
                 );
                 x = x_end;
             }
         }
     }
+    scratch.max_diffs = [current_max_diffs, lower_max_diffs];
 }
 
 /// `VP8LOptimizeSampling`: subsamples `image` further while its blocks are uniform.
@@ -530,7 +619,7 @@ fn get_best_predictors_and_sub_sampling(
     max_bits: u32,
     scratch: &mut Scratch,
     argb: &[u32],
-    exact: bool,
+    res: Residuals,
     all_modes: &mut [Vec<u32>],
 ) -> u32 {
     let tiles_per_row = sub_sample_size(width as u32, min_bits) as usize;
@@ -556,7 +645,7 @@ fn get_best_predictors_and_sub_sampling(
             &mut all_argb,
             scratch,
             argb,
-            exact,
+            res,
         );
         let mut subsampling_index = 0usize;
         loop {
@@ -705,7 +794,7 @@ pub(crate) fn residual_image(
     low_effort: bool,
     argb: &mut [u32],
     image: &mut [u32],
-    exact: bool,
+    res: Residuals,
 ) -> u32 {
     let mut scratch = Scratch::new(width);
     let best_bits;
@@ -731,7 +820,7 @@ pub(crate) fn residual_image(
             max_bits,
             &mut scratch,
             argb,
-            exact,
+            res,
             &mut all_modes,
         );
         let n = (sub_sample_size(width as u32, best_bits)
@@ -746,7 +835,7 @@ pub(crate) fn residual_image(
         &mut scratch,
         argb,
         low_effort,
-        exact,
+        res,
     );
     best_bits
 }

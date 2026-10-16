@@ -12,6 +12,7 @@ mod cost;
 mod entropy;
 mod histogram;
 mod huffman;
+mod near_lossless;
 #[cfg(target_arch = "aarch64")]
 mod neon;
 mod palette;
@@ -38,7 +39,7 @@ use huffman::{
 };
 use palette::{apply_palette, get_color_palette, palette_sort, PaletteSorting, MAX_PALETTE_SIZE};
 use predictor::{
-    color_space_transform, optimize_sampling, residual_image, MAX_TRANSFORM_BITS,
+    color_space_transform, optimize_sampling, residual_image, Residuals, MAX_TRANSFORM_BITS,
     MIN_TRANSFORM_BITS,
 };
 
@@ -65,6 +66,8 @@ pub(crate) struct Config {
     pub(crate) exact: bool,
     /// Off restricts the transforms to the ones without spatial prediction.
     pub(crate) use_predictor: bool,
+    /// Near-lossless level 0..=100, 100 for none.
+    pub(crate) near_lossless: i32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -420,6 +423,14 @@ impl Encoder {
                     self.argb.extend_from_slice(&pic);
                 }
                 self.current_width = self.width;
+                if self.config.near_lossless < 100 && !use_predict {
+                    near_lossless::NearLossless::apply(
+                        &mut self.argb,
+                        self.width as usize,
+                        height as usize,
+                        self.config.near_lossless,
+                    );
+                }
             }
             let cw = self.current_width;
             if use_subtract_green {
@@ -434,7 +445,15 @@ impl Encoder {
                 }
             }
             if use_predict {
-                self.apply_predict_filter(&mut w, cw, height, quality, low_effort, use_palette);
+                self.apply_predict_filter(
+                    &mut w,
+                    cw,
+                    height,
+                    quality,
+                    low_effort,
+                    use_palette,
+                    use_subtract_green,
+                );
             }
             if use_cross_color {
                 self.apply_cross_color_filter(&mut w, cw, height, quality, low_effort);
@@ -477,6 +496,7 @@ impl Encoder {
         quality: i32,
         low_effort: bool,
         used_palette: bool,
+        used_subtract_green: bool,
     ) {
         let method = self.config.method;
         let max_bits = clamp_bits(
@@ -495,7 +515,16 @@ impl Encoder {
             MAX_TRANSFORM_BITS,
             MAX_PREDICTOR_IMAGE_SIZE,
         );
-        let _ = used_palette;
+        let strength = if used_palette {
+            100
+        } else {
+            self.config.near_lossless
+        };
+        let res = Residuals {
+            exact: self.config.exact,
+            max_quantization: near_lossless::max_quantization(strength),
+            subtract_green: used_subtract_green,
+        };
         let n = self.transform_data_len(width, height);
         self.transform_data.clear();
         self.transform_data.resize(n, 0);
@@ -507,7 +536,7 @@ impl Encoder {
             low_effort,
             &mut self.argb,
             &mut self.transform_data,
-            self.config.exact,
+            res,
         );
         bw.put_bits(1, 1);
         bw.put_bits(PREDICTOR_TRANSFORM, 2);
@@ -1109,6 +1138,7 @@ fn encode_alpha_plane(
         method: effort_level,
         exact: true,
         use_predictor: true,
+        near_lossless: 100,
     };
     let mut bw = BitWriter::with_capacity(alpha.len() >> 3);
     encode_stream(config, argb, width, height, &mut bw);
