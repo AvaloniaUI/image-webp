@@ -218,7 +218,7 @@ impl HuffmanTree {
                 secondary_table,
                 table_mask,
             } => {
-                let v = bit_reader.peek_full() as u16;
+                let v = bit_reader.peek_code() as u16;
                 let entry = primary_table[(v & table_mask) as usize];
                 if (entry >> 12) <= MAX_TABLE_BITS as u16 {
                     bit_reader.consume((entry >> 12) as u8)?;
@@ -228,6 +228,27 @@ impl HuffmanTree {
                 Self::read_symbol_slowpath(secondary_table, v, entry, bit_reader)
             }
             HuffmanTreeInner::Single(symbol) => Ok(*symbol),
+        }
+    }
+
+    /// libwebp's `ReadSymbol`: the code's bits are consumed without checking for the end.
+    pub(crate) fn read_symbol_unchecked<R: BufRead>(&self, bit_reader: &mut BitReader<R>) -> u16 {
+        match &self.0 {
+            HuffmanTreeInner::Tree { primary_table, secondary_table, table_mask } => {
+                let v = bit_reader.peek_code() as u16;
+                let entry = primary_table[(v & table_mask) as usize];
+                let length = entry >> 12;
+                if length <= MAX_TABLE_BITS as u16 {
+                    bit_reader.advance(length as u8);
+                    return entry & 0xfff;
+                }
+                let mask = (1 << (length - MAX_TABLE_BITS as u16)) - 1;
+                let index = (entry & 0xfff) as usize + ((v >> MAX_TABLE_BITS) as usize & mask as usize);
+                let secondary = secondary_table[index];
+                bit_reader.advance((secondary & 0xf) as u8);
+                secondary >> 4
+            }
+            HuffmanTreeInner::Single(symbol) => *symbol,
         }
     }
 
@@ -242,7 +263,7 @@ impl HuffmanTree {
                 table_mask,
                 ..
             } => {
-                let v = bit_reader.peek_full() as u16;
+                let v = bit_reader.peek_code() as u16;
                 let entry = primary_table[(v & table_mask) as usize];
                 if (entry >> 12) <= MAX_TABLE_BITS as u16 {
                     return Some(((entry >> 12) as u8, entry & 0xfff));

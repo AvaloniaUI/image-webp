@@ -1,26 +1,9 @@
 use super::lossless::LosslessDecoder;
 use crate::decoder::DecodingError;
 use byteorder_lite::ReadBytesExt;
-use std::io::{BufRead, Read};
+use std::io::BufRead;
 
 use crate::alpha_blending::do_alpha_blending;
-
-#[derive(Debug, Clone)]
-pub(crate) struct WebPExtendedInfo {
-    pub(crate) alpha: bool,
-
-    pub(crate) canvas_width: u32,
-    pub(crate) canvas_height: u32,
-
-    #[allow(unused)]
-    pub(crate) icc_profile: bool,
-    pub(crate) exif_metadata: bool,
-    pub(crate) xmp_metadata: bool,
-    pub(crate) animation: bool,
-
-    pub(crate) background_color: Option<[u8; 4]>,
-    pub(crate) background_color_hint: [u8; 4],
-}
 
 /// Composites a frame onto a canvas.
 ///
@@ -128,69 +111,6 @@ pub(crate) fn composite_frame(
     }
 }
 
-pub(crate) fn get_alpha_predictor(
-    x: usize,
-    y: usize,
-    width: usize,
-    filtering_method: FilteringMethod,
-    image_slice: &[u8],
-) -> u8 {
-    match filtering_method {
-        FilteringMethod::None => 0,
-        FilteringMethod::Horizontal => {
-            if x == 0 && y == 0 {
-                0
-            } else if x == 0 {
-                let index = (y - 1) * width + x;
-                image_slice[index * 4 + 3]
-            } else {
-                let index = y * width + x - 1;
-                image_slice[index * 4 + 3]
-            }
-        }
-        FilteringMethod::Vertical => {
-            if x == 0 && y == 0 {
-                0
-            } else if y == 0 {
-                let index = y * width + x - 1;
-                image_slice[index * 4 + 3]
-            } else {
-                let index = (y - 1) * width + x;
-                image_slice[index * 4 + 3]
-            }
-        }
-        FilteringMethod::Gradient => {
-            let (left, top, top_left) = match (x, y) {
-                (0, 0) => (0, 0, 0),
-                (0, y) => {
-                    let above_index = (y - 1) * width + x;
-                    let val = image_slice[above_index * 4 + 3];
-                    (val, val, val)
-                }
-                (x, 0) => {
-                    let before_index = y * width + x - 1;
-                    let val = image_slice[before_index * 4 + 3];
-                    (val, val, val)
-                }
-                (x, y) => {
-                    let left_index = y * width + x - 1;
-                    let left = image_slice[left_index * 4 + 3];
-                    let top_index = (y - 1) * width + x;
-                    let top = image_slice[top_index * 4 + 3];
-                    let top_left_index = (y - 1) * width + x - 1;
-                    let top_left = image_slice[top_left_index * 4 + 3];
-
-                    (left, top, top_left)
-                }
-            };
-
-            let combination = i16::from(left) + i16::from(top) - i16::from(top_left);
-            i16::clamp(combination, 0, 255).try_into().unwrap()
-        }
-    }
-}
-
-/// Reverses the alpha filter on one row, in place, given the unfiltered row above.
 pub(crate) fn unfilter_alpha_row(method: FilteringMethod, prev: Option<&[u8]>, row: &mut [u8]) {
     if row.is_empty() {
         return;
@@ -254,51 +174,6 @@ fn clamp_gradient(g: i32) -> i32 {
     g.clamp(0, 255)
 }
 
-pub(crate) fn read_extended_header<R: Read>(
-    reader: &mut R,
-) -> Result<WebPExtendedInfo, DecodingError> {
-    let chunk_flags = reader.read_u8()?;
-
-    let icc_profile = chunk_flags & 0b00100000 != 0;
-    let alpha = chunk_flags & 0b00010000 != 0;
-    let exif_metadata = chunk_flags & 0b00001000 != 0;
-    let xmp_metadata = chunk_flags & 0b00000100 != 0;
-    let animation = chunk_flags & 0b00000010 != 0;
-
-    // reserved bytes are ignored
-    let _reserved_bytes = read_3_bytes(reader)?;
-
-    let canvas_width = read_3_bytes(reader)? + 1;
-    let canvas_height = read_3_bytes(reader)? + 1;
-
-    //product of canvas dimensions cannot be larger than u32 max
-    if u32::checked_mul(canvas_width, canvas_height).is_none() {
-        return Err(DecodingError::ImageTooLarge);
-    }
-
-    let info = WebPExtendedInfo {
-        icc_profile,
-        alpha,
-        exif_metadata,
-        xmp_metadata,
-        animation,
-        canvas_width,
-        canvas_height,
-        background_color_hint: [0; 4],
-        background_color: None,
-    };
-
-    Ok(info)
-}
-
-pub(crate) fn read_3_bytes<R: Read>(reader: &mut R) -> Result<u32, DecodingError> {
-    let mut buffer: [u8; 3] = [0; 3];
-    reader.read_exact(&mut buffer)?;
-    let value: u32 =
-        (u32::from(buffer[2]) << 16) | (u32::from(buffer[1]) << 8) | u32::from(buffer[0]);
-    Ok(value)
-}
-
 #[derive(Debug)]
 pub(crate) struct AlphaChunk {
     _preprocessing: bool,
@@ -346,16 +221,7 @@ pub(crate) fn read_alpha_chunk<R: BufRead>(
     };
 
     let data = if lossless_compression {
-        let mut decoder = LosslessDecoder::new(reader);
-
-        let mut data = vec![0; usize::from(width) * usize::from(height) * 4];
-        decoder.decode_frame(u32::from(width), u32::from(height), true, &mut data)?;
-
-        let mut green = vec![0; usize::from(width) * usize::from(height)];
-        for (rgba_val, green_val) in data.chunks_exact(4).zip(green.iter_mut()) {
-            *green_val = rgba_val[1];
-        }
-        green
+        LosslessDecoder::new(reader).decode_alpha(width, height)?
     } else {
         let mut framedata = vec![0; width as usize * height as usize];
         reader.read_exact(&mut framedata)?;

@@ -1,8 +1,9 @@
 use byteorder_lite::{LittleEndian, ReadBytesExt};
 use std::default::Default;
-use std::io::Read;
+use std::io::{self, Read, Seek, SeekFrom};
 
 use crate::decoder::{DecodingError, UpsamplingMethod};
+use crate::ReadSeek;
 use common::*;
 use prediction::*;
 
@@ -25,6 +26,7 @@ use sse2 as simd;
 mod transform;
 pub(crate) mod vp8enc;
 mod yuv;
+pub(crate) use yuv::fill_row_yuv;
 
 #[derive(Clone, Copy)]
 pub(crate) struct TreeNode {
@@ -156,78 +158,9 @@ pub struct Frame {
 }
 
 impl Frame {
-    const fn chroma_width(&self) -> u16 {
-        self.width.div_ceil(2)
-    }
 
-    const fn buffer_width(&self) -> u16 {
-        let difference = self.width % 16;
-        if difference > 0 {
-            self.width + (16 - difference % 16)
-        } else {
-            self.width
-        }
-    }
 
-    /// Fills an rgb buffer from the YUV buffers
-    pub(crate) fn fill_rgb(&self, buf: &mut [u8], upsampling_method: UpsamplingMethod) {
-        const BPP: usize = 3;
 
-        match upsampling_method {
-            UpsamplingMethod::Bilinear => {
-                yuv::fill_rgb_buffer_fancy::<BPP>(
-                    buf,
-                    &self.ybuf,
-                    &self.ubuf,
-                    &self.vbuf,
-                    usize::from(self.width),
-                    usize::from(self.height),
-                    usize::from(self.buffer_width()),
-                );
-            }
-            UpsamplingMethod::Simple => {
-                yuv::fill_rgb_buffer_simple::<BPP>(
-                    buf,
-                    &self.ybuf,
-                    &self.ubuf,
-                    &self.vbuf,
-                    usize::from(self.width),
-                    usize::from(self.chroma_width()),
-                    usize::from(self.buffer_width()),
-                );
-            }
-        }
-    }
-
-    /// Fills an rgba buffer from the YUV buffers
-    pub(crate) fn fill_rgba(&self, buf: &mut [u8], upsampling_method: UpsamplingMethod) {
-        const BPP: usize = 4;
-
-        match upsampling_method {
-            UpsamplingMethod::Bilinear => {
-                yuv::fill_rgb_buffer_fancy::<BPP>(
-                    buf,
-                    &self.ybuf,
-                    &self.ubuf,
-                    &self.vbuf,
-                    usize::from(self.width),
-                    usize::from(self.height),
-                    usize::from(self.buffer_width()),
-                );
-            }
-            UpsamplingMethod::Simple => {
-                yuv::fill_rgb_buffer_simple::<BPP>(
-                    buf,
-                    &self.ybuf,
-                    &self.ubuf,
-                    &self.vbuf,
-                    usize::from(self.width),
-                    usize::from(self.chroma_width()),
-                    usize::from(self.buffer_width()),
-                );
-            }
-        }
-    }
     /// Gets the buffer size
     #[must_use]
     pub fn get_buf_size(&self) -> usize {
@@ -238,8 +171,9 @@ impl Frame {
 /// VP8 Decoder
 ///
 /// Only decodes keyframes
-pub struct Vp8Decoder<R> {
-    r: R,
+pub struct Vp8Decoder<'a> {
+    /// The data the bitstream is read from.
+    source: Box<dyn ReadSeek + Send + 'a>,
     b: ArithmeticDecoder,
 
     mbwidth: u16,
@@ -287,15 +221,13 @@ pub struct Vp8Decoder<R> {
     band_rows: bool,
 }
 
-impl<R: Read> Vp8Decoder<R> {
-    /// Create a new decoder.
-    /// The reader must present a raw vp8 bitstream to the decoder
-    fn new(r: R) -> Self {
+impl<'a> Vp8Decoder<'a> {
+    fn new() -> Self {
         let f = Frame::default();
         let s = Segment::default();
 
         Self {
-            r,
+            source: Box::new(io::Cursor::new(&[][..])),
             b: ArithmeticDecoder::new(),
 
             mbwidth: 0,
@@ -364,31 +296,27 @@ impl<R: Read> Vp8Decoder<R> {
         self.b.check(res, ())
     }
 
-    fn init_partitions(&mut self, n: usize) -> Result<(), DecodingError> {
-        if n > 1 {
-            let mut sizes = vec![0; 3 * n - 3];
-            self.r.read_exact(sizes.as_mut_slice())?;
-
-            for (i, s) in sizes.chunks(3).enumerate() {
-                let size = { s }
-                    .read_u24::<LittleEndian>()
-                    .expect("Reading from &[u8] can't fail and the chunk is complete");
-
-                let size = size as usize;
-                let mut buf = vec![[0; 4]; size.div_ceil(4)];
-                let bytes: &mut [u8] = buf.as_mut_slice().as_flattened_mut();
-                self.r.read_exact(&mut bytes[..size])?;
-                self.partitions[i].init(buf, size)?;
-            }
+    /// Partitions as libwebp splits the data `start..end`: sizes past the data are cut to it,
+    /// and the last partition takes the rest of the data, which must not be empty.
+    fn init_partitions(&mut self, n: usize, start: u64, end: u64) -> Result<(), DecodingError> {
+        let last = n - 1;
+        if end - start < 3 * last as u64 {
+            return Err(DecodingError::NotEnoughInitData);
         }
-
-        let mut buf = Vec::new();
-        self.r.read_to_end(&mut buf)?;
-        let size = buf.len();
-        let mut chunks = vec![[0; 4]; size.div_ceil(4)];
-        chunks.as_mut_slice().as_flattened_mut()[..size].copy_from_slice(&buf);
-        self.partitions[n - 1].init(chunks, size)?;
-
+        let mut sizes = [0; 21];
+        self.source.seek(SeekFrom::Start(start))?;
+        self.source.read_exact(&mut sizes[..3 * last])?;
+        let mut at = start + 3 * last as u64;
+        for (i, s) in sizes[..3 * last].chunks_exact(3).enumerate() {
+            let size = u64::from(s[0]) | u64::from(s[1]) << 8 | u64::from(s[2]) << 16;
+            let part_end = (at + size).min(end);
+            self.partitions[i].init_window(&mut *self.source, at, part_end)?;
+            at = part_end;
+        }
+        if at == end {
+            return Err(DecodingError::NotEnoughInitData);
+        }
+        self.partitions[last].init_window(&mut *self.source, at, end)?;
         Ok(())
     }
 
@@ -505,8 +433,15 @@ impl<R: Read> Vp8Decoder<R> {
         self.b.check(res, ())
     }
 
-    fn read_frame_header(&mut self) -> Result<(), DecodingError> {
-        let tag = self.r.read_u24::<LittleEndian>()?;
+    /// Reads the frame header of the VP8 bitstream at `start` of the source, which runs to
+    /// the end of the data at `end`, and splits the rest into partitions.
+    fn read_frame_header(&mut self, start: u64, end: u64) -> Result<(), DecodingError> {
+        let mut header = [0; 10];
+        let have = (end - start).min(10) as usize;
+        self.source.seek(SeekFrom::Start(start))?;
+        self.source.read_exact(&mut header[..have])?;
+        let mut r = &header[..have];
+        let tag = r.read_u24::<LittleEndian>()?;
 
         let keyframe = tag & 1 == 0;
         if !keyframe {
@@ -518,18 +453,21 @@ impl<R: Read> Vp8Decoder<R> {
 
         self.frame.version = ((tag >> 1) & 7) as u8;
         self.frame.for_display = (tag >> 4) & 1 != 0;
+        if self.frame.version > 3 || !self.frame.for_display {
+            return Err(DecodingError::UnsupportedFeature("VP8 profile or hidden frame".to_owned()));
+        }
 
         let first_partition_size = tag >> 5;
 
         let mut tag = [0u8; 3];
-        self.r.read_exact(&mut tag)?;
+        r.read_exact(&mut tag)?;
 
         if tag != [0x9d, 0x01, 0x2a] {
             return Err(DecodingError::Vp8MagicInvalid(tag));
         }
 
-        let w = self.r.read_u16::<LittleEndian>()?;
-        let h = self.r.read_u16::<LittleEndian>()?;
+        let w = r.read_u16::<LittleEndian>()?;
+        let h = r.read_u16::<LittleEndian>()?;
 
         self.frame.width = w & 0x3FFF;
         self.frame.height = h & 0x3FFF;
@@ -560,21 +498,22 @@ impl<R: Read> Vp8Decoder<R> {
 
         self.top_border_v = vec![127u8; 8 * self.mbwidth as usize];
 
-        let size = first_partition_size as usize;
-        let mut buf = vec![[0; 4]; size.div_ceil(4)];
-        let bytes: &mut [u8] = buf.as_mut_slice().as_flattened_mut();
-        self.r.read_exact(&mut bytes[..size])?;
-
-        // initialise binary decoder
-        self.b.init(buf, size)?;
+        let size = u64::from(first_partition_size);
+        let first_start = start + 10;
+        if end - first_start < size {
+            return Err(DecodingError::IoError(io::ErrorKind::UnexpectedEof.into()));
+        }
+        let mut first = vec![0; size as usize];
+        self.source.seek(SeekFrom::Start(first_start))?;
+        self.source.read_exact(&mut first)?;
+        self.b.init(&first);
 
         let mut res = self.b.start_accumulated_result();
         let color_space = self.b.read_literal(1).or_accumulate(&mut res);
         self.frame.pixel_type = self.b.read_literal(1).or_accumulate(&mut res);
 
-        if color_space != 0 {
-            return Err(DecodingError::ColorSpaceInvalid(color_space));
-        }
+        // libwebp reads and ignores the colour space bit.
+        let _ = color_space;
 
         self.segments_enabled = self.b.read_flag().or_accumulate(&mut res);
         if self.segments_enabled {
@@ -594,7 +533,7 @@ impl<R: Read> Vp8Decoder<R> {
         self.b.check(res, ())?;
 
         self.num_partitions = num_partitions as u8;
-        self.init_partitions(num_partitions)?;
+        self.init_partitions(num_partitions, first_start + size, end)?;
 
         self.read_quantization_indices()?;
 
@@ -986,14 +925,18 @@ impl<R: Read> Vp8Decoder<R> {
         (filter_level, interior_limit, hev_threshold)
     }
 
-    /// Decodes the current frame
-    pub fn decode_frame(r: R) -> Result<Frame, DecodingError> {
-        let decoder = Self::new(r);
+    /// Decodes the frame of a VP8 bitstream read from `r` to its end.
+    pub fn decode_frame<R: Read>(mut r: R) -> Result<Frame, DecodingError> {
+        let mut data = Vec::new();
+        r.read_to_end(&mut data)?;
+        let end = data.len() as u64;
+        let mut decoder = Vp8Decoder::new();
+        decoder.source = Box::new(io::Cursor::new(data));
+        decoder.read_frame_header(0, end)?;
         decoder.decode_frame_()
     }
 
     fn decode_frame_(mut self) -> Result<Frame, DecodingError> {
-        self.read_frame_header()?;
         let mut row = Vec::with_capacity(usize::from(self.mbwidth));
         for mby in 0..self.mbheight as usize {
             self.decode_mb_row(mby, &mut row)?;
@@ -1022,6 +965,7 @@ impl<R: Read> Vp8Decoder<R> {
             let mut mb = self.read_macroblock_header(mbx)?;
             let mut kinds = [transform::NO_COEFFS; 24];
             if !mb.coeffs_skipped {
+                self.partitions[p].top_up(&mut *self.source)?;
                 self.read_residual_data(&mut mb, mbx, p, &mut blocks, &mut kinds)?;
             } else {
                 if mb.luma_mode != LumaMode::B {
@@ -1051,8 +995,8 @@ impl<R: Read> Vp8Decoder<R> {
 /// Decodes a frame a macroblock row at a time into bands of finished rows, top to bottom, as
 /// RGB (`BPP` 3) or RGBA (`BPP` 4, alpha 255). Holds about 23 rows of YUV and RGB instead of
 /// the whole frame.
-pub(crate) struct BandDecoder<R, const BPP: usize> {
-    dec: Vp8Decoder<R>,
+pub(crate) struct BandDecoder<'a, const BPP: usize> {
+    dec: Vp8Decoder<'a>,
     upsampling: UpsamplingMethod,
     row: Vec<MacroBlock>,
     mby: usize,
@@ -1060,14 +1004,26 @@ pub(crate) struct BandDecoder<R, const BPP: usize> {
     rgb: Vec<u8>,
     u_full: Vec<u8>,
     v_full: Vec<u8>,
+    uv_emitted: usize,
+    bypass_filter: bool,
 }
 
-impl<R: Read, const BPP: usize> BandDecoder<R, BPP> {
-    /// Reads the frame header.
-    pub(crate) fn new(r: R, upsampling: UpsamplingMethod) -> Result<Self, DecodingError> {
-        let mut dec = Vp8Decoder::new(r);
+/// A plane of a frame's pixels.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Channel {
+    Y,
+    U,
+    V,
+}
+
+impl<'a, const BPP: usize> BandDecoder<'a, BPP> {
+    /// Reads the frame header of the VP8 bitstream at `start` of `source`, a bitstream that
+    /// runs to the end of the data at `end`.
+    pub(crate) fn new(source: Box<dyn ReadSeek + Send + 'a>, start: u64, end: u64, upsampling: UpsamplingMethod) -> Result<Self, DecodingError> {
+        let mut dec = Vp8Decoder::new();
+        dec.source = source;
         dec.band_rows = true;
-        dec.read_frame_header()?;
+        dec.read_frame_header(start, end)?;
         let width = usize::from(dec.frame.width);
         let mut rgb = vec![0u8; (BAND_KEEP_Y + 16) * width * BPP];
         if BPP == 4 {
@@ -1084,17 +1040,78 @@ impl<R: Read, const BPP: usize> BandDecoder<R, BPP> {
             rgb,
             u_full: vec![0; width],
             v_full: vec![0; width],
+            uv_emitted: 0,
+            bypass_filter: false,
         })
+    }
+
+    /// Leaves out the loop filter, as libwebp does for a decode scaled well down.
+    pub(crate) fn bypass_filter(&mut self) {
+        self.bypass_filter = true;
+    }
+
+    /// Decodes the next macroblock row and hands the rows of each plane it finished to `f`,
+    /// top to bottom; the luma rows final so far, or `None` after the last row.
+    pub(crate) fn next_planes(
+        &mut self,
+        mut f: impl FnMut(Channel, &[u8]),
+    ) -> Result<Option<usize>, DecodingError> {
+        let dec = &mut self.dec;
+        let mbheight = usize::from(dec.mbheight);
+        if self.mby == mbheight {
+            return Ok(None);
+        }
+        let width = usize::from(dec.frame.width);
+        let height = usize::from(dec.frame.height);
+        let luma_w = usize::from(dec.mbwidth) * 16;
+        let chroma_w = luma_w / 2;
+        let chroma_width = width.div_ceil(2);
+        let chroma_height = height.div_ceil(2);
+        let mby = self.mby;
+        self.mby += 1;
+        self.decode_row(mby)?;
+        let dec = &self.dec;
+        let last = mby + 1 == mbheight;
+        let end = if last { height } else { (mby * 16 + 16 - BAND_KEEP_Y).min(height) };
+        let uv_end = if last { chroma_height } else { end.div_ceil(2).min(chroma_height) };
+        for y in self.emitted..end {
+            f(Channel::Y, &dec.frame.ybuf[y.wrapping_sub(dec.y_base) * luma_w..][..width]);
+        }
+        for c in self.uv_emitted..uv_end {
+            f(Channel::U, &dec.frame.ubuf[c.wrapping_sub(dec.uv_base) * chroma_w..][..chroma_width]);
+        }
+        for c in self.uv_emitted..uv_end {
+            f(Channel::V, &dec.frame.vbuf[c.wrapping_sub(dec.uv_base) * chroma_w..][..chroma_width]);
+        }
+        self.emitted = self.emitted.max(end);
+        self.uv_emitted = self.uv_emitted.max(uv_end);
+        Ok(Some(self.emitted))
+    }
+
+    fn decode_row(&mut self, mby: usize) -> Result<(), DecodingError> {
+        let dec = &mut self.dec;
+        let luma_w = usize::from(dec.mbwidth) * 16;
+        let chroma_w = luma_w / 2;
+        if mby > 0 {
+            dec.frame.ybuf.copy_within(16 * luma_w.., 0);
+            dec.frame.ubuf.copy_within(8 * chroma_w.., 0);
+            dec.frame.vbuf.copy_within(8 * chroma_w.., 0);
+        }
+        dec.y_base = (mby * 16).wrapping_sub(BAND_KEEP_Y);
+        dec.uv_base = (mby * 8).wrapping_sub(BAND_KEEP_UV);
+        dec.decode_mb_row(mby, &mut self.row)?;
+        if !self.bypass_filter {
+            for (mbx, mb) in self.row.iter().enumerate() {
+                dec.loop_filter(mbx, mby, mb);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn dimensions(&self) -> (u16, u16) {
         (self.dec.frame.width, self.dec.frame.height)
     }
 
-    /// The most rows a band has.
-    pub(crate) fn max_band_rows(&self) -> usize {
-        (BAND_KEEP_Y + 16).min(usize::from(self.dec.frame.height))
-    }
 
     /// Decodes macroblock rows until a band of rows is final and returns its first row and
     /// pixels, or `None` after the last band.
@@ -1110,17 +1127,8 @@ impl<R: Read, const BPP: usize> BandDecoder<R, BPP> {
         while self.mby < mbheight {
             let mby = self.mby;
             self.mby += 1;
-            if mby > 0 {
-                dec.frame.ybuf.copy_within(16 * luma_w.., 0);
-                dec.frame.ubuf.copy_within(8 * chroma_w.., 0);
-                dec.frame.vbuf.copy_within(8 * chroma_w.., 0);
-            }
-            dec.y_base = (mby * 16).wrapping_sub(BAND_KEEP_Y);
-            dec.uv_base = (mby * 8).wrapping_sub(BAND_KEEP_UV);
-            dec.decode_mb_row(mby, &mut self.row)?;
-            for (mbx, mb) in self.row.iter().enumerate() {
-                dec.loop_filter(mbx, mby, mb);
-            }
+            self.decode_row(mby)?;
+            let dec = &self.dec;
             let end = if mby + 1 == mbheight {
                 height
             } else {
@@ -1172,6 +1180,8 @@ impl<R: Read, const BPP: usize> BandDecoder<R, BPP> {
 /// filter changes plus those whose fancy upsampling needs the next chroma rows, and the
 /// chroma rows the filter reads.
 const BAND_KEEP_Y: usize = 7;
+/// The most rows a band of [`BandDecoder::next_band`] has.
+pub(crate) const MAX_BAND_ROWS: usize = BAND_KEEP_Y + 16;
 const BAND_KEEP_UV: usize = 4;
 
 /// Loop filter parameters of one macroblock.

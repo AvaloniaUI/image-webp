@@ -855,7 +855,7 @@ mod tests {
         whole
     }
 
-    fn decode_bands<R: std::io::BufRead>(mut bands: crate::BandReader<'_, R>) -> Vec<u8> {
+    fn decode_bands(mut bands: crate::BandReader) -> Vec<u8> {
         let (width, height) = bands.dimensions();
         let stride = width as usize * bands.bytes_per_pixel();
         let max_rows = bands.max_band_rows() as usize;
@@ -947,7 +947,7 @@ mod tests {
     #[test]
     fn band_reader_runs_on_consumer_threads() {
         fn assert_send<T: Send>() {}
-        assert_send::<crate::BandReader<'static, std::io::BufReader<Pipe>>>();
+        assert_send::<crate::BandReader>();
         for (lossy, rgba) in [(true, false), (true, true), (false, true)] {
             let data = encode_test_image(301, 203, lossy, rgba);
             let shared: PipeState = Default::default();

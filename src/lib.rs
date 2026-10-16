@@ -10,15 +10,24 @@
 extern crate test;
 
 pub use decoder::{
-    BandReader, DecodingError, LoopCount, UpsamplingMethod, WebPDecodeOptions, WebPDecoder,
+    BandReader, ChunkData, ChunkInfo, DecodingError, FrameInfo, LoopCount, UpsamplingMethod,
+    WebPDecodeOptions, WebPDecoder, ALPHA_FLAG, ANIMATION_FLAG, EXIF_FLAG, ICCP_FLAG, XMP_FLAG,
 };
+pub use frame::FrameDecoder;
 pub use encoder::{encode_alpha_chunk, ColorType, EncodingError, WebPEncoder};
 pub use lossless::EncoderParams;
+
+/// The data a decoder reads at offsets.
+pub(crate) trait ReadSeek: std::io::Read + std::io::Seek {}
+impl<R: std::io::Read + std::io::Seek> ReadSeek for R {}
 
 mod alpha_blending;
 mod decoder;
 mod encoder;
 mod extended;
+mod frame;
+pub mod headers;
+mod rescaler;
 mod lossless;
 mod lossy;
 

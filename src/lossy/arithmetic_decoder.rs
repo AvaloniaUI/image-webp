@@ -1,7 +1,10 @@
 // The coefficient reading follows libwebp's GetCoeffsFast and VP8GetBit: Copyright Google Inc.,
 // BSD 3-Clause, see LICENSE-LIBWEBP.
 
+use std::io::SeekFrom;
+
 use crate::decoder::DecodingError;
+use crate::ReadSeek;
 
 use super::common::{PROB_DCT_CAT, ZIGZAG};
 use super::TreeNode;
@@ -147,12 +150,23 @@ impl<T: Default> BitResult<T> {
     }
 }
 
+/// The most bytes a partition holds at once.
+const WINDOW: usize = 64 * 1024;
+/// Bytes a macroblock may need: 25 blocks of at most 304 bits read, each of at most 7 bits of
+/// data, are 6650 bytes, and the reader looks 8 bytes ahead.
+const MARGIN: usize = 16 * 1024;
+
+/// A partition's bits, read four bytes at a time from a window of the partition that
+/// [`top_up`](Self::top_up) refills from the data.
 #[cfg_attr(test, derive(Debug))]
 pub(crate) struct ArithmeticDecoder {
-    chunks: Box<[[u8; 4]]>,
+    chunks: Vec<[u8; 4]>,
     state: State,
     final_bytes: [u8; 3],
     final_bytes_remaining: i8,
+    /// Where the bytes not yet in the window start, and where the partition ends.
+    next: u64,
+    end: u64,
 }
 
 #[cfg_attr(test, derive(Debug))]
@@ -173,53 +187,75 @@ struct FastDecoder<'a> {
 }
 
 impl ArithmeticDecoder {
-    pub(crate) fn new() -> ArithmeticDecoder {
-        let state = State {
-            chunk_index: 0,
-            value: 0,
-            range: 254,
-            bit_count: -8,
-        };
+    const START: State = State {
+        chunk_index: 0,
+        value: 0,
+        range: 254,
+        bit_count: -8,
+    };
+
+    pub(crate) fn new() -> Self {
         ArithmeticDecoder {
-            chunks: Box::new([]),
-            state,
+            chunks: Vec::new(),
+            state: Self::START,
             final_bytes: [0; 3],
             final_bytes_remaining: Self::FINAL_BYTES_REMAINING_EOF,
+            next: 0,
+            end: 0,
         }
     }
 
-    pub(crate) fn init(&mut self, mut buf: Vec<[u8; 4]>, len: usize) -> Result<(), DecodingError> {
+    /// Reads `data`, four bytes at a time and its last 0 to 3 bytes one by one.
+    pub(crate) fn init(&mut self, data: &[u8]) {
+        let (chunks, tail) = data.as_chunks::<4>();
         let mut final_bytes = [0; 3];
-        let final_bytes_remaining = if len == 4 * buf.len() {
-            0
-        } else {
-            // Pop the last chunk (which is partial), then get length.
-            let Some(last_chunk) = buf.pop() else {
-                return Err(DecodingError::NotEnoughInitData);
-            };
-            let len_rounded_down = 4 * buf.len();
-            let num_bytes_popped = len - len_rounded_down;
-            debug_assert!(num_bytes_popped <= 3);
-            final_bytes[..num_bytes_popped].copy_from_slice(&last_chunk[..num_bytes_popped]);
-            for i in num_bytes_popped..4 {
-                debug_assert_eq!(last_chunk[i], 0, "unexpected {last_chunk:?}");
-            }
-            num_bytes_popped as i8
-        };
-
-        let chunks = buf.into_boxed_slice();
-        let state = State {
-            chunk_index: 0,
-            value: 0,
-            range: 254,
-            bit_count: -8,
-        };
+        final_bytes[..tail.len()].copy_from_slice(tail);
         *self = Self {
-            chunks,
-            state,
+            chunks: chunks.to_vec(),
+            state: Self::START,
             final_bytes,
-            final_bytes_remaining,
+            final_bytes_remaining: tail.len() as i8,
+            next: 0,
+            end: 0,
         };
+    }
+
+    /// Reads the bytes `start..end` of the data a window at a time, refilled by
+    /// [`top_up`](Self::top_up).
+    pub(crate) fn init_window(&mut self, r: &mut dyn ReadSeek, start: u64, end: u64) -> Result<(), DecodingError> {
+        *self = Self {
+            chunks: Vec::with_capacity(WINDOW.min((end - start) as usize).div_ceil(4)),
+            state: Self::START,
+            final_bytes: [0; 3],
+            final_bytes_remaining: 0,
+            next: start,
+            end,
+        };
+        self.top_up(r)
+    }
+
+    /// Refills the window from `r` unless it holds what a macroblock may read or the rest of
+    /// the partition.
+    pub(crate) fn top_up(&mut self, r: &mut dyn ReadSeek) -> Result<(), DecodingError> {
+        let held = (self.chunks.len() - self.state.chunk_index) * 4;
+        if held >= MARGIN || self.next == self.end {
+            return Ok(());
+        }
+        self.chunks.drain(..self.state.chunk_index);
+        self.state.chunk_index = 0;
+        let left = self.end - self.next;
+        let last = left <= (WINDOW - held) as u64;
+        let read = if last { left as usize } else { (WINDOW - held) & !3 };
+        let at = self.chunks.len();
+        self.chunks.resize(at + read / 4, [0; 4]);
+        r.seek(SeekFrom::Start(self.next))?;
+        r.read_exact(self.chunks[at..].as_flattened_mut())?;
+        if last {
+            let tail = read % 4;
+            r.read_exact(&mut self.final_bytes[..tail])?;
+            self.final_bytes_remaining = tail as i8;
+        }
+        self.next += read as u64;
         Ok(())
     }
 
@@ -405,13 +441,6 @@ impl ArithmeticDecoder {
                 self.final_bytes.rotate_left(1);
                 self.state.value <<= 8;
                 self.state.value |= u64::from(byte);
-                self.state.bit_count += 8;
-            }
-            0 => {
-                // libwebp seems to (sometimes?) allow bitstreams that read one byte past the end.
-                // This replicates that logic.
-                self.final_bytes_remaining -= 1;
-                self.state.value <<= 8;
                 self.state.bit_count += 8;
             }
             _ => {
@@ -757,11 +786,7 @@ mod tests {
     #[test]
     fn test_arithmetic_decoder_hello_short() {
         let mut decoder = ArithmeticDecoder::new();
-        let data = b"hel";
-        let size = data.len();
-        let mut buf = vec![[0u8; 4]; 1];
-        buf.as_mut_slice().as_flattened_mut()[..size].copy_from_slice(&data[..]);
-        decoder.init(buf, size).unwrap();
+        decoder.init(b"hel");
         let mut res = decoder.start_accumulated_result();
         assert_eq!(false, decoder.read_flag().or_accumulate(&mut res));
         assert_eq!(true, decoder.read_bool(10).or_accumulate(&mut res));
@@ -769,18 +794,15 @@ mod tests {
         assert_eq!(1, decoder.read_literal(1).or_accumulate(&mut res));
         assert_eq!(5, decoder.read_literal(3).or_accumulate(&mut res));
         assert_eq!(64, decoder.read_literal(8).or_accumulate(&mut res));
-        assert_eq!(185, decoder.read_literal(8).or_accumulate(&mut res));
-        decoder.check(res, ()).unwrap();
+        // The last literal needs a byte past the data, which libwebp counts as an error.
+        let _ = decoder.read_literal(8).or_accumulate(&mut res);
+        assert!(decoder.check(res, ()).is_err());
     }
 
     #[test]
     fn test_arithmetic_decoder_hello_long() {
         let mut decoder = ArithmeticDecoder::new();
-        let data = b"hello world";
-        let size = data.len();
-        let mut buf = vec![[0u8; 4]; (size + 3) / 4];
-        buf.as_mut_slice().as_flattened_mut()[..size].copy_from_slice(&data[..]);
-        decoder.init(buf, size).unwrap();
+        decoder.init(b"hello world");
         let mut res = decoder.start_accumulated_result();
         assert_eq!(false, decoder.read_flag().or_accumulate(&mut res));
         assert_eq!(true, decoder.read_bool(10).or_accumulate(&mut res));
@@ -799,17 +821,14 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(3);
         for _ in 0..500 {
             let len: usize = rng.gen_range(1..40);
-            let mut buf = vec![[0u8; 4]; len.div_ceil(4)];
-            for b in &mut buf.as_mut_slice().as_flattened_mut()[..len] {
-                *b = rng.gen();
-            }
+            let buf: Vec<u8> = (0..len).map(|_| rng.gen()).collect();
             let mut probs: PlaneProbs = [[[0; 11]; 3]; 8];
             for p in probs.as_flattened_mut().as_flattened_mut() {
                 *p = rng.gen_range(1..=255);
             }
             let (mut fast, mut cold) = (ArithmeticDecoder::new(), ArithmeticDecoder::new());
-            fast.init(buf.clone(), len).unwrap();
-            cold.init(buf, len).unwrap();
+            fast.init(&buf);
+            cold.init(&buf);
             for _ in 0..len {
                 let (mut a, mut b) = ([0; 16], [0; 16]);
                 (a[0], b[0]) = (775, 775);

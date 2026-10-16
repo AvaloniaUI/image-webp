@@ -5,7 +5,7 @@
 mod huffman;
 mod reverse_transform;
 
-use std::io::BufRead;
+use std::io::{self, BufRead, Read};
 use std::mem;
 
 use super::{CODE_LENGTH_CODES, CODE_LENGTH_CODE_ORDER, DISTANCE_MAP};
@@ -59,50 +59,85 @@ impl<R: BufRead> LosslessDecoder<R> {
         }
     }
 
-    /// Decodes a frame.
-    ///
-    /// In an alpha chunk the width and height are not included in the header, so they should be
-    /// provided by setting the `implicit_dimensions` argument. Otherwise that argument should be
-    /// `None` and the frame dimensions will be determined by reading the VP8L header.
-    pub(crate) fn decode_frame(
-        &mut self,
-        width: u32,
-        height: u32,
-        implicit_dimensions: bool,
-        buf: &mut [u8],
-    ) -> Result<(), DecodingError> {
-        if implicit_dimensions {
-            self.width = width as u16;
-            self.height = height as u16;
-        } else {
-            let signature = self.bit_reader.read_bits::<u8>(8)?;
-            if signature != 0x2f {
-                return Err(DecodingError::LosslessSignatureInvalid(signature));
-            }
+    /// Decodes a frame of `width`×`height` RGBA pixels into `buf`, failing where the VP8L
+    /// header gives another size.
+    pub(crate) fn decode_frame(&mut self, width: u32, height: u32, buf: &mut [u8]) -> Result<(), DecodingError> {
+        let signature = self.bit_reader.read_bits::<u8>(8)?;
+        if signature != 0x2f {
+            return Err(DecodingError::LosslessSignatureInvalid(signature));
+        }
 
-            self.width = self.bit_reader.read_bits::<u16>(14)? + 1;
-            self.height = self.bit_reader.read_bits::<u16>(14)? + 1;
-            if u32::from(self.width) != width || u32::from(self.height) != height {
-                return Err(DecodingError::InconsistentImageSizes);
-            }
+        self.width = self.bit_reader.read_bits::<u16>(14)? + 1;
+        self.height = self.bit_reader.read_bits::<u16>(14)? + 1;
+        if u32::from(self.width) != width || u32::from(self.height) != height {
+            return Err(DecodingError::InconsistentImageSizes);
+        }
 
-            let _alpha_used = self.bit_reader.read_bits::<u8>(1)?;
-            let version_num = self.bit_reader.read_bits::<u8>(3)?;
-            if version_num != 0 {
-                return Err(DecodingError::VersionNumberInvalid(version_num));
-            }
+        let _alpha_used = self.bit_reader.read_bits::<u8>(1)?;
+        let version_num = self.bit_reader.read_bits::<u8>(3)?;
+        if version_num != 0 {
+            return Err(DecodingError::VersionNumberInvalid(version_num));
         }
 
         let transformed_width = self.read_transforms()?;
         let transformed_size = usize::from(transformed_width) * usize::from(self.height) * 4;
-        self.decode_image_stream(
-            transformed_width,
-            self.height,
-            true,
-            &mut buf[..transformed_size],
-        )?;
+        self.decode_image_stream(transformed_width, self.height, true, &mut buf[..transformed_size])?;
+        self.apply_transforms(transformed_width, buf)
+    }
 
-        let mut image_size = transformed_size;
+    /// Decodes the headerless stream of an ALPH chunk: the green channel of a `width`×`height`
+    /// image, a byte per pixel. A stream of palette indices only is decoded a byte at a time,
+    /// as libwebp's `DecodeAlphaData` does it, and allowed to end inside its last code.
+    pub(crate) fn decode_alpha(&mut self, width: u16, height: u16) -> Result<Vec<u8>, DecodingError> {
+        self.width = width;
+        self.height = height;
+        let xsize = self.read_transforms()?;
+        let color_cache = self.read_color_cache()?.map(|bits| ColorCache {
+            color_cache_bits: bits,
+            color_cache: vec![[0; 4]; 1 << bits],
+        });
+        let huffman_info = self.read_huffman_codes(true, xsize, height, color_cache)?;
+        let pixels = usize::from(width) * usize::from(height);
+        let indices_only = self.transform_order == [3]
+            && huffman_info.color_cache.is_none()
+            && huffman_info.huffman_code_groups.iter().all(|g| g[RED].is_single_node() && g[BLUE].is_single_node() && g[ALPHA].is_single_node());
+        if !indices_only {
+            let mut argb = vec![0; pixels * 4];
+            let transformed_size = usize::from(xsize) * usize::from(height) * 4;
+            self.decode_image_data(xsize, height, huffman_info, &mut argb[..transformed_size])?;
+            self.apply_transforms(xsize, &mut argb)?;
+            return Ok(argb.chunks_exact(4).map(|p| p[1]).collect());
+        }
+        let mut plane = vec![0; pixels];
+        self.decode_alpha_8b(xsize, height, &huffman_info, &mut plane)?;
+        let Some(TransformType::ColorIndexingTransform { table_size, table_data }) = &self.transforms[3] else {
+            unreachable!()
+        };
+        let mut greens = [0u8; 256];
+        for (g, c) in greens.iter_mut().zip(table_data.chunks_exact(4)) {
+            *g = c[1];
+        }
+        let bits = match table_size {
+            ..=2 => 3,
+            3..=4 => 2,
+            5..=16 => 1,
+            _ => 0,
+        };
+        let (w, xsize) = (usize::from(width), usize::from(xsize));
+        let (per_byte, mask) = (1 << bits, (1u16 << (8 >> bits)) - 1);
+        // Indices expand in place from the end: a row's pixels never land before its indices.
+        for y in (0..usize::from(height)).rev() {
+            for x in (0..w).rev() {
+                let packed = plane[y * xsize + x / per_byte];
+                let index = (u16::from(packed) >> ((x % per_byte) << (3 - bits))) & mask;
+                plane[y * w + x] = greens[usize::from(index)];
+            }
+        }
+        Ok(plane)
+    }
+
+    fn apply_transforms(&self, transformed_width: u16, buf: &mut [u8]) -> Result<(), DecodingError> {
+        let mut image_size = usize::from(transformed_width) * usize::from(self.height) * 4;
         let mut width = transformed_width;
         for &trans_index in self.transform_order.iter().rev() {
             let transform = self.transforms[usize::from(trans_index)].as_ref().unwrap();
@@ -350,19 +385,16 @@ impl<R: BufRead> LosslessDecoder<R> {
 
             let is_first_8bits = self.bit_reader.read_bits::<u8>(1)?;
             let zero_symbol = self.bit_reader.read_bits::<u16>(1 + 7 * is_first_8bits)?;
-
-            if zero_symbol >= alphabet_size {
-                return Err(DecodingError::BitStreamError);
-            }
-
-            if num_symbols == 1 {
-                Ok(HuffmanTree::build_single_node(zero_symbol))
-            } else {
-                let one_symbol = self.bit_reader.read_bits::<u16>(8)?;
-                if one_symbol >= alphabet_size {
-                    return Err(DecodingError::BitStreamError);
-                }
-                Ok(HuffmanTree::build_two_node(zero_symbol, one_symbol))
+            let one_symbol = match num_symbols {
+                2 => Some(self.bit_reader.read_bits::<u16>(8)?),
+                _ => None,
+            };
+            // As libwebp: symbols past the alphabet are left out, a repeated one counts once.
+            let mut symbols = [Some(zero_symbol), one_symbol].into_iter().flatten().filter(|&s| s < alphabet_size);
+            match (symbols.next(), symbols.next()) {
+                (None, _) => Err(DecodingError::BitStreamError),
+                (Some(a), Some(b)) if a != b => Ok(HuffmanTree::build_two_node(a.min(b), a.max(b))),
+                (Some(a), _) => Ok(HuffmanTree::build_single_node(a)),
             }
         } else {
             let mut code_length_code_lengths = vec![0; CODE_LENGTH_CODES];
@@ -518,10 +550,9 @@ impl<R: BufRead> LosslessDecoder<R> {
                 //literal, so just use huffman codes and read as argb
                 let green = code as u8;
                 let red = tree[RED].read_symbol(&mut self.bit_reader)? as u8;
+                // A 32-bit window holds two codes, as libwebp reads them.
+                self.bit_reader.fill()?;
                 let blue = tree[BLUE].read_symbol(&mut self.bit_reader)? as u8;
-                if self.bit_reader.nbits < 15 {
-                    self.bit_reader.fill()?;
-                }
                 let alpha = tree[ALPHA].read_symbol(&mut self.bit_reader)? as u8;
 
                 data[index * 4] = red;
@@ -582,14 +613,17 @@ impl<R: BufRead> LosslessDecoder<R> {
                     .ok_or(DecodingError::BitStreamError)?;
                 let color = color_cache.lookup((code - 280).into());
                 data[index * 4..][..4].copy_from_slice(&color);
+                color_cache.insert(color);
                 index += 1;
 
                 if index < next_block_start {
+                    self.bit_reader.fill()?;
                     if let Some((bits, code)) = tree[GREEN].peek_symbol(&self.bit_reader) {
                         if code >= 280 {
                             self.bit_reader.consume(bits)?;
-                            data[index * 4..][..4]
-                                .copy_from_slice(&color_cache.lookup((code - 280).into()));
+                            let color = color_cache.lookup((code - 280).into());
+                            data[index * 4..][..4].copy_from_slice(&color);
+                            color_cache.insert(color);
                             index += 1;
                         }
                     }
@@ -598,6 +632,62 @@ impl<R: BufRead> LosslessDecoder<R> {
         }
 
         Ok(())
+    }
+
+    /// libwebp's `DecodeAlphaData`: green codes only, a byte each, the end of the stream
+    /// checked after each code, and an end inside the last code accepted.
+    fn decode_alpha_8b(
+        &mut self,
+        width: u16,
+        height: u16,
+        huffman_info: &HuffmanInfo,
+        data: &mut [u8],
+    ) -> Result<(), DecodingError> {
+        let end = usize::from(width) * usize::from(height);
+        let mut pos = 0;
+        while pos < end {
+            let (x, y) = (pos % usize::from(width), pos / usize::from(width));
+            let tree = &huffman_info.huffman_code_groups[huffman_info.get_huff_index(x as u16, y as u16)];
+            self.bit_reader.fill()?;
+            let code = tree[GREEN].read_symbol_unchecked(&mut self.bit_reader);
+            if code < 256 {
+                data[pos] = code as u8;
+                pos += 1;
+            } else if code < 256 + 24 {
+                let length = Self::copy_distance_unchecked(&mut self.bit_reader, code - 256)?;
+                let dist_symbol = tree[DIST].read_symbol_unchecked(&mut self.bit_reader);
+                self.bit_reader.fill()?;
+                let dist_code = Self::copy_distance_unchecked(&mut self.bit_reader, dist_symbol)?;
+                let dist = Self::plane_code_to_distance(width, dist_code);
+                if pos < dist || end - pos < length {
+                    return Err(DecodingError::BitStreamError);
+                }
+                for i in pos..pos + length {
+                    data[i] = data[i - dist];
+                }
+                pos += length;
+            } else {
+                return Err(DecodingError::BitStreamError);
+            }
+            if self.bit_reader.is_eos()? {
+                self.bit_reader.eos = true;
+                break;
+            }
+        }
+        if pos < end {
+            return Err(DecodingError::BitStreamError);
+        }
+        Ok(())
+    }
+
+    /// `GetCopyDistance` with libwebp's reads past the end.
+    fn copy_distance_unchecked(bit_reader: &mut BitReader<R>, prefix_code: u16) -> Result<usize, DecodingError> {
+        if prefix_code < 4 {
+            return Ok(usize::from(prefix_code + 1));
+        }
+        let extra_bits = ((prefix_code - 2) >> 1) as u8;
+        let offset = (2 + (usize::from(prefix_code) & 1)) << extra_bits;
+        Ok(offset + bit_reader.read_bits_raw(extra_bits)? as usize + 1)
     }
 
     /// Reads color cache data from the bitstream
@@ -626,9 +716,7 @@ impl<R: BufRead> LosslessDecoder<R> {
         let extra_bits: u8 = ((prefix_code - 2) >> 1).try_into().unwrap();
         let offset = (2 + (usize::from(prefix_code) & 1)) << extra_bits;
 
-        let bits = bit_reader.peek(extra_bits) as usize;
-        bit_reader.consume(extra_bits)?;
-
+        let bits = bit_reader.read_bits::<u32>(extra_bits)? as usize;
         Ok(offset + bits + 1)
     }
 
@@ -693,83 +781,177 @@ impl ColorCache {
     }
 }
 
+/// libwebp's VP8L bit reader: a 64-bit window `val` over the stream, read from `bit_pos`, with
+/// bytes shifted in at the top. Past the end it keeps libwebp's values (reads wrap around the
+/// window, and set `eos`), since a stream may end inside its last code. The stream is read a
+/// [`READ_AHEAD`] window at a time.
 #[derive(Debug, Clone)]
 pub(crate) struct BitReader<R> {
     reader: R,
-    buffer: u64,
-    nbits: u8,
+    buf: Vec<u8>,
+    /// Where the bytes of `buf` not shifted in yet start.
+    at: usize,
+    val: u64,
+    bit_pos: u32,
+    eos: bool,
+    started: bool,
 }
+
+const LBITS: u32 = 64;
+const WBITS: u32 = 32;
+const READ_AHEAD: usize = 64 * 1024;
 
 impl<R: BufRead> BitReader<R> {
     const fn new(reader: R) -> Self {
         Self {
             reader,
-            buffer: 0,
-            nbits: 0,
+            buf: Vec::new(),
+            at: 0,
+            val: 0,
+            bit_pos: 0,
+            eos: false,
+            started: false,
         }
     }
 
-    /// Fills the buffer with bits from the input stream.
-    ///
-    /// After this function, the internal buffer will contain 64-bits or have reached the end of
-    /// the input stream.
-    pub(crate) fn fill(&mut self) -> Result<(), DecodingError> {
-        debug_assert!(self.nbits < 64);
+    /// The stream's bytes not shifted in yet, empty at its end.
+    #[inline]
+    fn bytes(&mut self) -> Result<&[u8], DecodingError> {
+        if self.at == self.buf.len() {
+            self.read_ahead()?;
+        }
+        Ok(&self.buf[self.at..])
+    }
 
-        let mut buf = self.reader.fill_buf()?;
-        if buf.len() >= 8 {
-            let lookahead = u64::from_le_bytes(buf[..8].try_into().unwrap());
-            self.reader.consume(usize::from((63 - self.nbits) / 8));
-            self.buffer |= lookahead << self.nbits;
-            self.nbits |= 56;
-        } else {
-            while !buf.is_empty() && self.nbits < 56 {
-                self.buffer |= u64::from(buf[0]) << self.nbits;
-                self.nbits += 8;
-                self.reader.consume(1);
-                buf = self.reader.fill_buf()?;
+    #[cold]
+    fn read_ahead(&mut self) -> Result<(), DecodingError> {
+        self.buf.resize(READ_AHEAD, 0);
+        let mut n = 0;
+        while n < READ_AHEAD {
+            match self.reader.read(&mut self.buf[n..]) {
+                Ok(0) => break,
+                Ok(k) => n += k,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.into()),
             }
         }
-
+        self.buf.truncate(n);
+        self.at = 0;
         Ok(())
     }
 
-    /// Peeks at the next `num` bits in the buffer.
-    pub(crate) const fn peek(&self, num: u8) -> u64 {
-        self.buffer & ((1 << num) - 1)
+    fn start(&mut self) -> Result<(), DecodingError> {
+        self.started = true;
+        for i in 0..8 {
+            let Some(&b) = self.bytes()?.first() else { break };
+            self.val |= u64::from(b) << (8 * i);
+            self.at += 1;
+        }
+        Ok(())
     }
 
-    /// Peeks at the full buffer.
-    pub(crate) const fn peek_full(&self) -> u64 {
-        self.buffer
+    fn exhausted(&mut self) -> Result<bool, DecodingError> {
+        Ok(self.bytes()?.is_empty())
     }
 
-    /// Consumes `num` bits from the buffer returning an error if there are not enough bits.
+    /// `VP8LIsEndOfStream`.
+    pub(crate) fn is_eos(&mut self) -> Result<bool, DecodingError> {
+        Ok(self.eos || (self.bit_pos > LBITS && self.exhausted()?))
+    }
+
+    fn shift_bytes(&mut self) -> Result<(), DecodingError> {
+        while self.bit_pos >= 8 {
+            let Some(&b) = self.bytes()?.first() else { break };
+            self.val = (self.val >> 8) | u64::from(b) << (LBITS - 8);
+            self.at += 1;
+            self.bit_pos -= 8;
+        }
+        if self.is_eos()? {
+            self.eos = true;
+            self.bit_pos = 0;
+        }
+        Ok(())
+    }
+
+    /// `VP8LFillBitWindow`.
+    pub(crate) fn fill(&mut self) -> Result<(), DecodingError> {
+        if !self.started {
+            self.start()?;
+        }
+        if self.bit_pos >= WBITS {
+            let buf = self.bytes()?;
+            // libwebp loads four bytes at once only with more than eight left; the window
+            // comes out the same either way short of the end.
+            if buf.len() > 8 {
+                let w = u32::from_le_bytes(buf[..4].try_into().unwrap());
+                self.at += 4;
+                self.val = (self.val >> WBITS) | u64::from(w) << (LBITS - WBITS);
+                self.bit_pos -= WBITS;
+            } else {
+                self.shift_bytes()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `VP8LPrefetchBits`, all 64 bits of it.
+    pub(crate) fn peek_full(&self) -> u64 {
+        self.val >> (self.bit_pos & (LBITS - 1))
+    }
+
+    pub(crate) fn peek(&self, num: u8) -> u64 {
+        self.peek_full() & ((1 << num) - 1)
+    }
+
+    /// The bits a code of up to 15 bits is looked up with: libwebp reads a longer code's bits
+    /// past the eighth from a second window read, which wraps differently past the end.
+    pub(crate) fn peek_code(&self) -> u64 {
+        let v = self.peek_full();
+        if self.bit_pos + 15 <= LBITS {
+            return v;
+        }
+        let second = self.val >> ((self.bit_pos + 8) & (LBITS - 1));
+        (v & 0xff) | second << 8
+    }
+
+    /// `VP8LSetBitPos`: no check, as libwebp checks for the end where it decides.
+    pub(crate) fn advance(&mut self, num: u8) {
+        self.bit_pos += u32::from(num);
+    }
+
+    /// Advances, failing where that runs past the end of the stream.
     pub(crate) fn consume(&mut self, num: u8) -> Result<(), DecodingError> {
-        if self.nbits < num {
+        self.advance(num);
+        if self.is_eos()? {
             return Err(DecodingError::BitStreamError);
         }
-
-        self.buffer >>= num;
-        self.nbits -= num;
         Ok(())
     }
 
-    /// Convenience function to read a number of bits and convert them to a type.
+    /// `VP8LReadBits`: zero once at the end.
+    pub(crate) fn read_bits_raw(&mut self, num: u8) -> Result<u32, DecodingError> {
+        if !self.started {
+            self.start()?;
+        }
+        if self.eos || num > 24 {
+            self.eos = true;
+            self.bit_pos = 0;
+            return Ok(0);
+        }
+        let v = self.peek(num) as u32;
+        self.bit_pos += u32::from(num);
+        self.shift_bytes()?;
+        Ok(v)
+    }
+
+    /// Reads `num` bits, failing where that runs past the end of the stream.
     pub(crate) fn read_bits<T: TryFrom<u32>>(&mut self, num: u8) -> Result<T, DecodingError> {
         debug_assert!(num as usize <= 8 * mem::size_of::<T>());
-        debug_assert!(num <= 32);
-
-        if self.nbits < num {
-            self.fill()?;
+        let value = self.read_bits_raw(num)?;
+        if self.eos {
+            return Err(DecodingError::BitStreamError);
         }
-        let value = self.peek(num) as u32;
-        self.consume(num)?;
-
-        value.try_into().map_err(|_| {
-            debug_assert!(false, "Value too large to fit in type");
-            DecodingError::BitStreamError
-        })
+        value.try_into().map_err(|_| DecodingError::BitStreamError)
     }
 }
 
@@ -799,6 +981,10 @@ mod test {
 
         assert_eq!(bit_reader.read_bits::<u8>(3).unwrap(), 2); //010
         assert_eq!(bit_reader.read_bits::<u8>(5).unwrap(), 13); //01101
-        assert!(bit_reader.read_bits::<u8>(4).is_err()); //error
+        // As libwebp, zeros up to 64 bits, then the end.
+        assert_eq!(bit_reader.read_bits::<u32>(24).unwrap(), 0);
+        assert_eq!(bit_reader.read_bits::<u32>(24).unwrap(), 0);
+        assert_eq!(bit_reader.read_bits::<u8>(8).unwrap(), 0);
+        assert!(bit_reader.read_bits::<u8>(1).is_err());
     }
 }

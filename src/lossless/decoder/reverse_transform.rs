@@ -46,7 +46,8 @@ pub(crate) fn apply_predictor_transform(
     for y in 1..height {
         for block_x in 0..block_xsize {
             let block_index = (y >> size_bits) * block_xsize + block_x;
-            let predictor = predictor_data[block_index * 4 + 1];
+            // libwebp uses the low four bits; modes 14 and 15 predict as mode 0.
+            let predictor = predictor_data[block_index * 4 + 1] & 0xf;
             let start_index = (y * width + (block_x << size_bits).max(1)) * 4;
             let end_index = (y * width + ((block_x + 1) << size_bits).min(width)) * 4;
 
@@ -65,7 +66,7 @@ pub(crate) fn apply_predictor_transform(
                 11 => apply_predictor_transform_11(image_data, start_index..end_index, width),
                 12 => apply_predictor_transform_12(image_data, start_index..end_index, width),
                 13 => apply_predictor_transform_13(image_data, start_index..end_index, width),
-                _ => {}
+                _ => apply_predictor_transform_0(image_data, start_index..end_index, width),
             }
         }
     }

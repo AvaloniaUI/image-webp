@@ -3,7 +3,7 @@ name = "image-webp"
 version = "0.2.4"
 edition = "2021"
 license = "(MIT OR Apache-2.0) AND BSD-3-Clause"
-rust-version = "1.80.1"
+rust-version = "1.88"
 
 description = "WebP encoding and decoding in pure Rust"
 homepage = "https://github.com/image-rs/image-webp"
