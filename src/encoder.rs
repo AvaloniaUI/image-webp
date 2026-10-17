@@ -52,6 +52,12 @@ quick_error! {
         InvalidDimensions {
             display("Invalid dimensions")
         }
+
+        /// The lossy frame's first partition does not fit its 19-bit size field, even without
+        /// intra 4x4 modes.
+        Partition0Overflow {
+            display("First partition over 512 KiB")
+        }
     }
 }
 
@@ -413,6 +419,52 @@ mod tests {
             lossless_exact: true,
             ..Default::default()
         });
+    }
+
+    /// 4000x4000 grey noise at quality 100 and method 0 wants 16 intra 4x4 modes a macroblock,
+    /// which overrun partition 0's 512 KiB: libwebp fails, its callers restart it at method 3
+    /// with `partition_limit` 100, and the encoder writes that restart's bytes.
+    #[test]
+    fn restarts_without_intra4x4_when_partition0_overflows() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(4000);
+        let (width, height) = (4000u32, 4000u32);
+        let mut img = vec![0u8; (width * height * 3) as usize];
+        for px in img.chunks_exact_mut(3) {
+            px.fill(rng.gen());
+        }
+        let mut output = Vec::new();
+        let mut encoder = WebPEncoder::new(&mut output);
+        encoder.set_params(EncoderParams {
+            use_lossy: true,
+            lossy_quality: 100,
+            lossy_method: 0,
+            ..Default::default()
+        });
+        encoder
+            .encode(&img, width, height, crate::ColorType::Rgb8)
+            .unwrap();
+        let at = output.windows(4).position(|w| w == b"VP8 ").unwrap();
+        let size0 = u32::from_le_bytes([output[at + 8], output[at + 9], output[at + 10], 0]) >> 5;
+        assert!(size0 < 1 << 19, "{size0}");
+        let mut streamed = Vec::new();
+        let mut encoder = WebPEncoder::new(&mut streamed);
+        encoder.set_params(EncoderParams {
+            use_lossy: true,
+            lossy_quality: 100,
+            lossy_method: 0,
+            ..Default::default()
+        });
+        let stride = width as usize * 3;
+        encoder
+            .encode_rows(width, height, crate::ColorType::Rgb8, |y, row| {
+                row.copy_from_slice(&img[y as usize * stride..][..stride])
+            })
+            .unwrap();
+        assert!(streamed == output, "streamed restart differs");
+        let reference = libwebp_encode_with(&img, width, height, false, 100.0, 3, false, |c| {
+            c.partition_limit = 100
+        });
+        assert!(output == reference);
     }
 
     #[allow(unsafe_code)]

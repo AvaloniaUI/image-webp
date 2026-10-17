@@ -2481,19 +2481,34 @@ fn trellis_quantize_block(
 /// it was kept.
 pub(crate) type EncodedFrame = (Vec<Vec<u8>>, (bool, Option<Vec<u8>>));
 
-/// Encodes `src` as a VP8 bitstream (the payload of a `VP8 ` chunk).
 /// Encodes `src` as a VP8 bitstream (the payload of a `VP8 ` chunk), in pieces to write one
-/// after the other.
-pub(crate) fn encode(src: Source, config: Config) -> EncodedFrame {
+/// after the other. A first partition that does not fit its 19-bit size field is coded again
+/// without intra 4x4 modes, at method 3 at least, as libwebp's callers restart it with
+/// `partition_limit` 100; one that still does not fit is `Partition0Overflow`.
+pub(crate) fn encode(
+    mut src: Source,
+    mut config: Config,
+) -> Result<EncodedFrame, crate::EncodingError> {
     let (width, height) = (src.width, src.height);
-    let mut enc = Encoder::new(config, src);
-    enc.analyze();
-    let tokens = if enc.rd_opt_level >= RdLevel::Basic {
-        enc.token_loop()
-    } else {
-        enc.enc_loop()
+    let (mut enc, part0, tokens) = loop {
+        let mut enc = Encoder::new(config, src);
+        enc.analyze();
+        let tokens = if enc.rd_opt_level >= RdLevel::Basic {
+            enc.token_loop()
+        } else {
+            enc.enc_loop()
+        };
+        let part0 = enc.generate_partition0();
+        if (part0.buf.len() as u64) < VP8_MAX_PARTITION0_SIZE {
+            break (enc, part0, tokens);
+        }
+        if config.partition_limit >= 100 {
+            return Err(crate::EncodingError::Partition0Overflow);
+        }
+        config.method = config.method.max(3);
+        config.partition_limit = 100;
+        src = enc.src;
     };
-    let part0 = enc.generate_partition0();
 
     let size0 = part0.buf.len();
     let mut head = Vec::with_capacity(10 + size0);
@@ -2508,7 +2523,7 @@ pub(crate) fn encode(src: Source, config: Config) -> EncodedFrame {
     if parts.iter().map(Vec::len).sum::<usize>() % 2 == 1 {
         parts.push(vec![0]);
     }
-    (parts, enc.src.take_alpha())
+    Ok((parts, enc.src.take_alpha()))
 }
 
 /// Encodes rows of `color` pixels as the payload of a `VP8 ` chunk, in pieces, like libwebp at
@@ -2565,5 +2580,5 @@ pub(crate) fn encode_frame_lossy_with(
         }
     };
     src.keep_alpha = keep_alpha;
-    Ok(encode(src, config))
+    encode(src, config)
 }
