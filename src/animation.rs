@@ -154,8 +154,9 @@ impl Pending {
 
 /// Animated WebP encoder.
 ///
-/// Frames are added with [`add_frame`](Self::add_frame) and the file is completed with
-/// [`finish`](Self::finish). The writer is seeked back to at the end to fill in the sizes.
+/// Frames are added whole with [`add_frame`](Self::add_frame), or a band of rows at a time with
+/// [`push_rows`](Self::push_rows) and [`end_frame`](Self::end_frame), and the file is completed
+/// with [`finish`](Self::finish). The writer is seeked back to at the end to fill in the sizes.
 pub struct AnimationEncoder<W> {
     writer: W,
     params: EncoderParams,
@@ -169,6 +170,8 @@ pub struct AnimationEncoder<W> {
     prev: Vec<u32>,
     /// The frame being added, ARGB.
     curr: Vec<u32>,
+    /// How many pixels of `curr` the rows pushed so far filled.
+    filled: usize,
     prev_rect: Rect,
     pending: VecDeque<Pending>,
     /// How many of `pending` are settled, from the front.
@@ -202,6 +205,7 @@ impl<W: Write + Seek> AnimationEncoder<W> {
             height,
             prev: vec![0; pixels],
             curr: vec![0; pixels],
+            filled: 0,
             prev_rect: Rect {
                 x: 0,
                 y: 0,
@@ -278,6 +282,30 @@ impl<W: Write + Seek> AnimationEncoder<W> {
         duration: u32,
     ) -> Result<(), EncodingError> {
         import(data, color, &mut self.curr);
+        self.filled = self.curr.len();
+        self.end_frame(duration)
+    }
+
+    /// Adds whole rows of the next frame in `color`, below the rows pushed before, so a frame
+    /// need not be held whole by the caller too. [`end_frame`](Self::end_frame) codes it.
+    pub fn push_rows(&mut self, data: &[u8], color: ColorType) -> Result<(), EncodingError> {
+        let bpp = color.bytes_per_pixel();
+        let pixels = data.len() / bpp;
+        if data.len() % (self.width as usize * bpp) != 0 || self.filled + pixels > self.curr.len() {
+            return Err(EncodingError::InvalidDimensions);
+        }
+        import(data, color, &mut self.curr[self.filled..self.filled + pixels]);
+        self.filled += pixels;
+        Ok(())
+    }
+
+    /// Adds the frame whose rows were pushed, shown for `duration` ms. Fails unless every row
+    /// of the canvas was pushed.
+    pub fn end_frame(&mut self, duration: u32) -> Result<(), EncodingError> {
+        if self.filled != self.curr.len() {
+            return Err(EncodingError::InvalidDimensions);
+        }
+        self.filled = 0;
         if self.params.use_lossy && self.animation.subsample_first {
             chroma_roundtrip(&mut self.curr, self.width, self.height);
         }

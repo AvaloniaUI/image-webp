@@ -297,3 +297,42 @@ fn a_tiny_canvas_and_rgb_input() {
     assert_eq!(&ours[2].0[..4], &[80, 0, 0, 255]);
     assert_eq!(decode_libwebp(&data).len(), 3);
 }
+
+#[test]
+fn rows_pushed_in_bands_code_as_whole_frames() {
+    let frames: Vec<_> = (0..6)
+        .map(|i| (frame(i * 3, i % 2 == 1, (i > 3).then_some((i * 4, 5))), 50))
+        .collect();
+    for lossless in [true, false] {
+        let mut enc = AnimationEncoder::new(Cursor::new(Vec::new()), W, H).unwrap();
+        let mut params = EncoderParams::default();
+        params.use_lossy = !lossless;
+        params.lossy_quality = 80;
+        enc.set_params(params);
+        let mut anim = AnimationParams::default();
+        anim.loop_count = 3;
+        enc.set_animation_params(anim);
+        enc.set_exif_metadata(b"Exif\0\0II*\0".to_vec());
+        for (i, (f, d)) in frames.iter().enumerate() {
+            let band = (W * 4) as usize * (1 + i % 7);
+            for rows in f.chunks(band) {
+                enc.push_rows(rows, ColorType::Rgba8).unwrap();
+            }
+            enc.end_frame(*d).unwrap();
+        }
+        let banded = enc.finish().unwrap().into_inner();
+        assert!(banded == encode(&frames, lossless, 9, 10), "lossless {lossless}");
+    }
+}
+
+#[test]
+fn a_frame_of_the_wrong_rows_fails() {
+    let mut enc = AnimationEncoder::new(Cursor::new(Vec::new()), W, H).unwrap();
+    let f = frame(0, false, None);
+    assert!(enc.push_rows(&f[..(W * 4) as usize + 4], ColorType::Rgba8).is_err());
+    enc.push_rows(&f[..(W * 4 * 3) as usize], ColorType::Rgba8).unwrap();
+    assert!(enc.end_frame(100).is_err());
+    enc.push_rows(&f[(W * 4 * 3) as usize..], ColorType::Rgba8).unwrap();
+    assert!(enc.push_rows(&f[..(W * 4) as usize], ColorType::Rgba8).is_err());
+    enc.end_frame(100).unwrap();
+}

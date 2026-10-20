@@ -26,7 +26,7 @@ pub enum ColorType {
 }
 
 impl ColorType {
-    fn bytes_per_pixel(self) -> usize {
+    pub(crate) fn bytes_per_pixel(self) -> usize {
         match self {
             ColorType::L8 => 1,
             ColorType::La8 => 2,
