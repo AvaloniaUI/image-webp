@@ -6,6 +6,8 @@
 //! every `kmax` frames as a key frame. A frame identical to the previous one lengthens it
 //! instead. Frames are written as soon as the next frame has settled how they dispose, so only
 //! the two canvases, the rectangle being coded and the undecided coded frames are held.
+//!
+//! libwebp: Copyright Google Inc., BSD 3-Clause, see LICENSE-LIBWEBP.
 
 use std::collections::VecDeque;
 use std::io::{self, Seek, SeekFrom, Write};

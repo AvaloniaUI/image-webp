@@ -1,6 +1,8 @@
 //! Optimized alpha blending routines based on libwebp
 //!
 //! <https://github.com/webmproject/libwebp/blob/e4f7a9f0c7c9fbfae1568bc7fa5c94b989b50872/src/demux/anim_decode.c#L215-L267>
+//!
+//! libwebp: Copyright Google Inc., BSD 3-Clause, see LICENSE-LIBWEBP.
 
 const fn channel_shift(i: u32) -> u32 {
     i * 8

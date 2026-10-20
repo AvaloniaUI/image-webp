@@ -1,6 +1,8 @@
 //! Resampling rows to another size with the fixed-point arithmetic of libwebp's rescaler
 //! (`utils/rescaler_utils.c`, `dsp/rescaler.c`), so a scaled decode gives libwebp's pixels:
 //! box averaging where a side shrinks, bilinear interpolation where it grows.
+//!
+//! libwebp: Copyright Google Inc., BSD 3-Clause, see LICENSE-LIBWEBP.
 
 const FIX: u32 = 32;
 const ONE: u64 = 1 << FIX;

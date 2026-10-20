@@ -25,6 +25,8 @@
 //! It interpolates u and v so that for e.g. the pixel 1 down and 1 from the left the u value
 //! would be (9*u0 + 3*u1 + 3*u2 + u3 + 8) / 16 and similar for the other pixels
 //! The edges are mirrored, so for the pixel 1 down and 0 from the left it uses (9*u0 + 3*u2 + 3*u0 + u2 + 8) / 16
+//!
+//! libwebp: Copyright Google Inc., BSD 3-Clause, see LICENSE-LIBWEBP.
 
 /// `_mm_mulhi_epu16` emulation
 #[inline(always)]
