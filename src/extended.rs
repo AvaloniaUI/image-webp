@@ -253,7 +253,7 @@ pub(crate) fn read_alpha_chunk<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lossless::vp8l::encode_alpha_filtered;
+    use crate::lossless::encoder::encode_alpha_filtered;
     use rand::{rngs::StdRng, Rng, SeedableRng};
 
     /// The plane as it was decoded before it came a row at a time: whole, then unfiltered.

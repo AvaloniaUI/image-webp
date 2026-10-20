@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Generates src/lossy/vp8enc/tables.rs from libwebp's C sources.
+"""Generates src/lossy/encoder/tables.rs from libwebp's C sources.
 
-Usage: extract_libwebp_tables.py <libwebp>/src > src/lossy/vp8enc/tables.rs
-       extract_libwebp_tables.py <libwebp>/src vp8l > src/lossless/vp8l/tables.rs
+Usage: extract_libwebp_tables.py <libwebp>/src > src/lossy/encoder/tables.rs
+       extract_libwebp_tables.py <libwebp>/src vp8l > src/lossless/encoder/tables.rs
 """
 import re
 import sys

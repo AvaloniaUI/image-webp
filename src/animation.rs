@@ -13,8 +13,8 @@ use std::collections::VecDeque;
 use std::io::{self, Seek, SeekFrom, Write};
 
 use crate::encoder::{alpha_chunk_payload, chunk_size, write_chunk, write_chunk_parts};
-use crate::lossless::{vp8l, EncoderParams};
-use crate::lossy::{fill_row_yuv, upsample_chroma_row, vp8enc};
+use crate::lossless::{self, EncoderParams};
+use crate::lossy::{self, fill_row_yuv, upsample_chroma_row};
 use crate::{ColorType, EncodingError, WebPEncoder};
 
 const MAX_DURATION: u32 = 1 << 24;
@@ -993,7 +993,7 @@ fn chroma_roundtrip(argb: &mut [u32], width: u32, height: u32) {
     let (w, h) = (width as usize, height as usize);
     let uv_h = h.div_ceil(2);
     let canvas = std::cell::RefCell::new(argb);
-    let mut src = vp8enc::csp::Source::new(w, h, 4, |y, row| {
+    let mut src = lossy::encoder::csp::Source::new(w, h, 4, |y, row| {
         argb_to_rgba(&canvas.borrow()[y * w..][..w], row)
     });
     src.keep_alpha = false;
@@ -1059,14 +1059,14 @@ fn similar(src: u32, dst: u32, max_diff: i32) -> bool {
 
 /// Codes `argb` (`width` x `height`) as a `VP8L` payload.
 fn encode_lossless(params: &EncoderParams, argb: Vec<u32>, width: u32, height: u32) -> FrameData {
-    let config = vp8l::Config {
+    let config = lossless::encoder::Config {
         quality: f32::from(params.lossless_quality.min(100)),
         method: i32::from(params.lossless_method.min(6)),
         exact: params.lossless_exact,
         use_predictor: params.use_predictor_transform,
         near_lossless: i32::from(params.near_lossless.min(100)),
     };
-    let payload = vp8l::encode_argb(config, argb, width, height);
+    let payload = lossless::encoder::encode_argb(config, argb, width, height);
     let has_alpha = payload[4] & 0x10 != 0;
     FrameData {
         lossless: true,
@@ -1086,7 +1086,7 @@ fn encode_lossy(
     blended: bool,
     mut read_row: impl FnMut(usize, &mut [u8]),
 ) -> Result<FrameData, EncodingError> {
-    let mut config = vp8enc::Config::new(
+    let mut config = lossy::encoder::Config::new(
         f32::from(params.lossy_quality.min(100)),
         i32::from(params.lossy_method.min(6)),
     );
@@ -1094,7 +1094,7 @@ fn encode_lossy(
     if blended {
         config.filter_strength = 0;
     }
-    let (parts, (has_alpha, alpha)) = vp8enc::encode_frame_lossy_with(
+    let (parts, (has_alpha, alpha)) = lossy::encoder::encode_frame_lossy_with(
         config,
         width,
         height,

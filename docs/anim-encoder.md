@@ -11,7 +11,7 @@ image-processing (`../image-processing`) is removing libvips, sharp and libwebp.
 output is the last large piece that still needs libwebp: `src/engine/webp_anim.rs` (`Encoder`,
 `config`, `mux`) drives `WebPAnimEncoderNewInternal` / `WebPAnimEncoderAdd` /
 `WebPAnimEncoderAssemble` and then `WebPMux*` to set the loop count and the ICCP/EXIF/XMP chunks.
-Still frames are already coded by this crate (lossy `vp8enc`, lossless `vp8l`); what is missing
+Still frames are already coded by this crate (`lossy::encoder`, `lossless::encoder`); what is missing
 is everything between frames.
 
 ## What the caller does today (the contract to keep)
@@ -51,7 +51,7 @@ Per added frame:
 
 - An `AnimationEncoder` (name it in the crate's style) that takes frames one at a time
   (rows or a frame buffer), options as above, and writes the container. Reuse the crate's
-  `vp8enc` and `vp8l` frame encoders and its chunk/RIFF writers (`encoder.rs`, `extended.rs`,
+  `lossy::encoder` and `lossless::encoder` frame encoders and its chunk/RIFF writers (`encoder.rs`, `extended.rs`,
   `demux.rs` on branch `probe-demux` for the chunk layout); don't duplicate them.
 - Decide sub-rectangles, dispose/blend and keyframes with your own design. Start simple
   (changed rectangle, blend vs. no-blend, keyframe interval like kmin/kmax) and add libwebp's

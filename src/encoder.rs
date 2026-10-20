@@ -4,8 +4,8 @@ use std::io::{self, Write};
 use quick_error::quick_error;
 
 use crate::{
-    lossless::{vp8l, EncoderParams},
-    lossy::vp8enc::encode_frame_lossy,
+    lossless::{self, EncoderParams},
+    lossy::encoder::encode_frame_lossy,
 };
 
 /// Color type of the image.
@@ -152,14 +152,14 @@ impl<W: Write> WebPEncoder<W> {
         if width == 0 || width > 16384 || height == 0 || height > 16384 {
             return Err(EncodingError::InvalidDimensions);
         }
-        let config = vp8l::Config {
+        let config = lossless::encoder::Config {
             quality: f32::from(self.params.lossless_quality.min(100)),
             method: i32::from(self.params.lossless_method.min(6)),
             exact: self.params.lossless_exact,
             use_predictor: self.params.use_predictor_transform,
             near_lossless: i32::from(self.params.near_lossless.min(100)),
         };
-        let frame = vp8l::encode_lossless(data, width, height, color, config);
+        let frame = lossless::encoder::encode_lossless(data, width, height, color, config);
         let has_alpha = frame[4] & 0x10 != 0;
         self.write_container(b"VP8L", vec![frame], None, has_alpha, width, height)
     }
@@ -350,9 +350,9 @@ pub fn encode_alpha_chunk(
 
 pub(crate) fn alpha_chunk_payload(alpha: &[u8], width: u32, height: u32, params: &EncoderParams) -> Vec<u8> {
     if params.alpha_compression {
-        vp8l::encode_alpha(alpha, width, height, params.lossy_method)
+        lossless::encoder::encode_alpha(alpha, width, height, params.lossy_method)
     } else {
-        vp8l::encode_alpha_raw(alpha)
+        lossless::encoder::encode_alpha_raw(alpha)
     }
 }
 

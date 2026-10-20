@@ -51,11 +51,11 @@ pub mod vp8 {
 /// The `ALPH` chunk payload of an alpha plane at `method`, for benchmarks.
 #[doc(hidden)]
 pub fn bench_encode_alpha(alpha: &[u8], width: u32, height: u32, method: u8) -> usize {
-    lossless::vp8l::encode_alpha(alpha, width, height, method).len()
+    lossless::encoder::encode_alpha(alpha, width, height, method).len()
 }
 
 /// The unfiltered VP8L stream of an alpha plane at `method`, for benchmarks.
 #[doc(hidden)]
 pub fn bench_encode_alpha_plane(alpha: &[u8], width: u32, height: u32, method: u8) -> usize {
-    lossless::vp8l::bench_alpha_plane(alpha, width, height, method)
+    lossless::encoder::bench_alpha_plane(alpha, width, height, method)
 }

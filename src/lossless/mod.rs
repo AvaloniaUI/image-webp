@@ -1,5 +1,5 @@
 mod decoder;
-pub(crate) mod vp8l;
+pub(crate) mod encoder;
 
 pub(crate) use decoder::{AlphaBands, LosslessBands, LosslessDecoder};
 

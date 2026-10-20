@@ -13,7 +13,7 @@ done | awk '{t=$(NF-1); k=$1; if (!(k in best) || t < best[k]) best[k]=t; print}
 if [ -n "${PROFILE:-}" ]; then
   CARGO_PROFILE_RELEASE_DEBUG=true cargo build -q --release --example lossy_bench
   perf record -g -o target/perf.data ./target/release/examples/lossy_bench ours tests/reference/gallery1/3.png 3000x2000 80 4 >/dev/null 2>&1
-  perf report -i target/perf.data --no-children --percent-limit 1 --stdio 2>/dev/null | grep -E "^ +[0-9]+\.[0-9]+%" | sed -E 's/_R[A-Za-z0-9_]*vp8enc//' | head -25
+  perf report -i target/perf.data --no-children --percent-limit 1 --stdio 2>/dev/null | grep -E "^ +[0-9]+\.[0-9]+%" | sed -E 's/_R[A-Za-z0-9_]*lossy7encoder//' | head -25
 fi
 if [ -n "${MEM:-}" ]; then
   for which in libwebp ours ours-rows; do
