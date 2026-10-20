@@ -26,6 +26,8 @@ use sse2 as simd;
 mod tables;
 
 pub(crate) use alpha::{encode_alpha, encode_alpha_raw};
+#[cfg(test)]
+pub(crate) use alpha::encode_alpha_filtered;
 
 use std::borrow::Cow;
 

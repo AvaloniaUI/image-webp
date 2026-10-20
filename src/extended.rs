@@ -1,7 +1,7 @@
-use super::lossless::LosslessDecoder;
+use super::lossless::{AlphaBands, LosslessDecoder};
 use crate::decoder::DecodingError;
 use byteorder_lite::ReadBytesExt;
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 
 use crate::alpha_blending::do_alpha_blending;
 
@@ -174,11 +174,19 @@ fn clamp_gradient(g: i32) -> i32 {
     g.clamp(0, 255)
 }
 
-#[derive(Debug)]
-pub(crate) struct AlphaChunk {
-    _preprocessing: bool,
-    pub(crate) filtering_method: FilteringMethod,
-    pub(crate) data: Vec<u8>,
+/// An ALPH chunk's plane handed out a row at a time, top to bottom, decoded and unfiltered as
+/// the rows are asked for: libwebp's `VP8DecompressAlphaRows`.
+pub(crate) struct AlphaRows<'a> {
+    filtering_method: FilteringMethod,
+    source: AlphaSource<'a>,
+    prev: Vec<u8>,
+    row: Vec<u8>,
+    y: usize,
+}
+
+enum AlphaSource<'a> {
+    Raw(Box<dyn BufRead + Send + 'a>),
+    Lossless(AlphaBands<Box<dyn BufRead + Send + 'a>>),
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -189,22 +197,35 @@ pub(crate) enum FilteringMethod {
     Gradient,
 }
 
-pub(crate) fn read_alpha_chunk<R: BufRead>(
-    reader: &mut R,
+impl AlphaRows<'_> {
+    /// The next row of the plane.
+    pub(crate) fn next_row(&mut self) -> Result<&[u8], DecodingError> {
+        std::mem::swap(&mut self.prev, &mut self.row);
+        match &mut self.source {
+            AlphaSource::Raw(r) => r.read_exact(&mut self.row)?,
+            AlphaSource::Lossless(bands) => bands.read_row(self.y, &mut self.row)?,
+        }
+        let prev = (self.y > 0).then_some(&self.prev[..]);
+        unfilter_alpha_row(self.filtering_method, prev, &mut self.row);
+        self.y += 1;
+        Ok(&self.row)
+    }
+}
+
+pub(crate) fn read_alpha_chunk<'a>(
+    mut reader: Box<dyn BufRead + Send + 'a>,
     width: u16,
     height: u16,
-) -> Result<AlphaChunk, DecodingError> {
+) -> Result<AlphaRows<'a>, DecodingError> {
     let info_byte = reader.read_u8()?;
 
     let preprocessing = (info_byte & 0b00110000) >> 4;
     let filtering = (info_byte & 0b00001100) >> 2;
     let compression = info_byte & 0b00000011;
 
-    let preprocessing = match preprocessing {
-        0 => false,
-        1 => true,
-        _ => return Err(DecodingError::InvalidAlphaPreprocessing),
-    };
+    if preprocessing > 1 {
+        return Err(DecodingError::InvalidAlphaPreprocessing);
+    }
 
     let filtering_method = match filtering {
         0 => FilteringMethod::None,
@@ -214,32 +235,127 @@ pub(crate) fn read_alpha_chunk<R: BufRead>(
         _ => unreachable!(),
     };
 
-    let lossless_compression = match compression {
-        0 => false,
-        1 => true,
+    let source = match compression {
+        0 => AlphaSource::Raw(reader),
+        1 => AlphaSource::Lossless(LosslessDecoder::new(reader).alpha(width, height)?),
         _ => return Err(DecodingError::InvalidCompressionMethod),
     };
 
-    let data = if lossless_compression {
-        LosslessDecoder::new(reader).decode_alpha(width, height)?
-    } else {
-        let mut framedata = vec![0; width as usize * height as usize];
-        reader.read_exact(&mut framedata)?;
-        framedata
-    };
-
-    let chunk = AlphaChunk {
-        _preprocessing: preprocessing,
+    Ok(AlphaRows {
         filtering_method,
-        data,
-    };
-
-    Ok(chunk)
+        source,
+        prev: vec![0; usize::from(width)],
+        row: vec![0; usize::from(width)],
+        y: 0,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lossless::vp8l::encode_alpha_filtered;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+
+    /// The plane as it was decoded before it came a row at a time: whole, then unfiltered.
+    fn whole(mut payload: &[u8], w: u16, h: u16) -> Result<Vec<u8>, DecodingError> {
+        let info = payload.read_u8()?;
+        let filter = [FilteringMethod::None, FilteringMethod::Horizontal, FilteringMethod::Vertical, FilteringMethod::Gradient]
+            [usize::from(info >> 2 & 3)];
+        let mut data = match info & 3 {
+            0 => {
+                let mut d = vec![0; usize::from(w) * usize::from(h)];
+                payload.read_exact(&mut d)?;
+                d
+            }
+            _ => LosslessDecoder::new(payload).decode_alpha_whole(w, h)?,
+        };
+        let w = usize::from(w);
+        for y in 0..usize::from(h) {
+            let (above, rest) = data.split_at_mut(y * w);
+            unfilter_alpha_row(filter, (y > 0).then(|| &above[(y - 1) * w..]), &mut rest[..w]);
+        }
+        Ok(data)
+    }
+
+    fn banded(payload: &[u8], w: u16, h: u16) -> Result<Vec<u8>, DecodingError> {
+        let mut rows = read_alpha_chunk(Box::new(payload), w, h)?;
+        let mut out = Vec::new();
+        for _ in 0..h {
+            out.extend_from_slice(rows.next_row()?);
+        }
+        Ok(out)
+    }
+
+    fn planes(w: usize, h: usize, seed: u64) -> Vec<Vec<u8>> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let n = w * h;
+        vec![
+            (0..n).map(|i| if (i % w) * 3 > w + (i / w) { 255 } else { 0 }).collect(),
+            (0..n).map(|i| [0, 64, 128, 255][(i / 7 + i % w / 9) % 4]).collect(),
+            (0..n).map(|i| ((i % w) * 255 / w.max(2)) as u8).collect(),
+            (0..n).map(|_| rng.gen_range(0..12u8) * 20).collect(),
+            (0..n).map(|_| rng.gen()).collect(),
+            (0..n).map(|i| ((i % w) * 2 + (i / w) * 3 + rng.gen_range(0..3)) as u8).collect(),
+        ]
+    }
+
+    /// Rows decoded and unfiltered in step with the colour come out as the whole plane did, for
+    /// every filter, stored or compressed, and fail where it failed on cut or damaged data.
+    #[test]
+    fn alpha_rows_match_the_whole_plane() {
+        for (w, h) in [(67usize, 41usize), (1, 300), (300, 1), (5, 5), (130, 70)] {
+            for (k, plane) in planes(w, h, (w * h) as u64).iter().enumerate() {
+                for filter in 0..4 {
+                    for method in [None, Some(0), Some(3), Some(6)] {
+                        let payload = encode_alpha_filtered(plane, w as u32, h as u32, filter, method);
+                        let label = format!("{w}x{h} plane {k} filter {filter} method {method:?}");
+                        let got = banded(&payload, w as u16, h as u16).unwrap();
+                        assert!(got == *plane, "{label}");
+                        assert!(whole(&payload, w as u16, h as u16).unwrap() == got, "{label}");
+                        let mut damaged: Vec<Vec<u8>> = [1, 2, 5, payload.len() / 2, payload.len() - 3]
+                            .iter()
+                            .filter(|&&cut| cut < payload.len())
+                            .map(|&cut| payload[..payload.len() - cut].to_vec())
+                            .collect();
+                        for at in [1, 2, 3, payload.len() / 3, payload.len() - 1] {
+                            let mut p = payload.clone();
+                            p[at] ^= 0x5a;
+                            damaged.push(p);
+                        }
+                        for (d, p) in damaged.iter().enumerate() {
+                            let (a, b) = (whole(p, w as u16, h as u16), banded(p, w as u16, h as u16));
+                            match (a, b) {
+                                (Ok(a), Ok(b)) => assert!(a == b, "{label} damage {d}"),
+                                (Err(_), Err(_)) => {}
+                                (a, b) => panic!("{label} damage {d}: whole {:?} banded {:?}", a.is_ok(), b.is_ok()),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Palette indices a byte each, over more pixels than the decoder's window holds.
+    #[test]
+    fn alpha_rows_past_the_window() {
+        let (w, h) = (2100usize, 1100usize);
+        let mut rng = StdRng::seed_from_u64(5);
+        let mut plane: Vec<u8> = (0..w * 480).map(|_| rng.gen_range(0..40u8) * 6).collect();
+        while plane.len() < w * h {
+            let at = plane.len();
+            plane.push(plane[at - w * 480]);
+        }
+        for method in [Some(0), Some(4)] {
+            let payload = encode_alpha_filtered(&plane, w as u32, h as u32, 0, method);
+            let bands = LosslessDecoder::new(&payload[1..]).alpha(w as u16, h as u16).unwrap();
+            let indices = matches!(bands, AlphaBands::Indices(_));
+            let got = banded(&payload, w as u16, h as u16).unwrap();
+            assert!(got == plane, "method {method:?} indices {indices}");
+            assert!(whole(&payload, w as u16, h as u16).unwrap() == got);
+            assert!(indices || method != Some(0), "a byte per index at method 0");
+        }
+    }
 
     /// Regression test: clearing the canvas for a non-alpha frame used 3-byte
     /// stride on the always-RGBA canvas, corrupting pixel alignment.

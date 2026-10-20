@@ -85,29 +85,24 @@ impl<R: BufRead> LosslessDecoder<R> {
         Ok(LosslessBands::new(self, xsize, huffman_info))
     }
 
-    /// Decodes the headerless stream of an ALPH chunk: the green channel of a `width`×`height`
-    /// image, a byte per pixel. A stream of palette indices only is decoded a byte at a time,
-    /// as libwebp's `DecodeAlphaData` does it, and allowed to end inside its last code.
-    pub(crate) fn decode_alpha(mut self, width: u16, height: u16) -> Result<Vec<u8>, DecodingError> {
+    /// Reads the headerless stream of an ALPH chunk, the green channel of a `width`×`height`
+    /// image, up to its pixels, which [`AlphaBands`] decodes a band of rows at a time.
+    pub(crate) fn alpha(mut self, width: u16, height: u16) -> Result<AlphaBands<R>, DecodingError> {
         self.width = width;
         self.height = height;
         let xsize = self.read_transforms()?;
         let color_cache = self.read_color_cache()?.map(ColorCache::new);
         let huffman_info = self.read_huffman_codes(true, xsize, height, color_cache)?;
-        let pixels = usize::from(width) * usize::from(height);
         let indices_only = self.transform_order == [3]
             && huffman_info.color_cache.is_none()
             && huffman_info.huffman_code_groups.iter().all(|g| g[RED].is_single_node() && g[BLUE].is_single_node() && g[ALPHA].is_single_node());
         if !indices_only {
-            let mut bands = LosslessBands::new(self, xsize, huffman_info);
-            let mut plane = Vec::with_capacity(pixels);
-            while let Some((_, rows)) = bands.next_band()? {
-                plane.extend(rows.chunks_exact(4).map(|p| p[1]));
-            }
-            return Ok(plane);
+            return Ok(AlphaBands::Argb {
+                bands: LosslessBands::new(self, xsize, huffman_info),
+                greens: Vec::new(),
+                first: 0,
+            });
         }
-        let mut plane = vec![0; pixels];
-        self.decode_alpha_8b(xsize, height, &huffman_info, &mut plane)?;
         let Some(TransformType::ColorIndexingTransform { table_size, table_data }) = &self.transforms[3] else {
             unreachable!()
         };
@@ -121,17 +116,17 @@ impl<R: BufRead> LosslessDecoder<R> {
             5..=16 => 1,
             _ => 0,
         };
-        let (w, xsize) = (usize::from(width), usize::from(xsize));
-        let (per_byte, mask) = (1 << bits, (1u16 << (8 >> bits)) - 1);
-        // Indices expand in place from the end: a row's pixels never land before its indices.
-        for y in (0..usize::from(height)).rev() {
-            for x in (0..w).rev() {
-                let packed = plane[y * xsize + x / per_byte];
-                let index = (u16::from(packed) >> ((x % per_byte) << (3 - bits))) & mask;
-                plane[y * w + x] = greens[usize::from(index)];
-            }
-        }
-        Ok(plane)
+        let packed = usize::from(xsize) * usize::from(height);
+        let band = usize::from(xsize) * BAND_ROWS.min(usize::from(height));
+        Ok(AlphaBands::Indices(Box::new(AlphaIndices {
+            decoder: self,
+            huffman: huffman_info,
+            window: Window::new(packed, band),
+            index: 0,
+            greens,
+            bits,
+            xsize: usize::from(xsize),
+        })))
     }
 
     /// A transform's or entropy image's `xsize`×`ysize` RGBA pixels, decoded whole.
@@ -569,24 +564,29 @@ impl<R: BufRead> LosslessDecoder<R> {
         Ok(())
     }
 
-    /// libwebp's `DecodeAlphaData`: green codes only, a byte each, the end of the stream
-    /// checked after each code, and an end inside the last code accepted.
+    /// libwebp's `DecodeAlphaData` up to index `until`: green codes only, a byte each, the end of
+    /// the stream checked after each code, and an end inside the last code accepted.
     fn decode_alpha_8b(
         &mut self,
         width: u16,
         height: u16,
         huffman_info: &HuffmanInfo,
-        data: &mut [u8],
+        window: &mut Window<1>,
+        index: &mut usize,
+        until: usize,
     ) -> Result<(), DecodingError> {
         let end = usize::from(width) * usize::from(height);
-        let mut pos = 0;
-        while pos < end {
+        window.make_room(*index, (until + MAX_COPY).min(end));
+        let base = window.base;
+        let data = &mut window.data[..];
+        let mut pos = *index;
+        while pos < until {
             let (x, y) = (pos % usize::from(width), pos / usize::from(width));
             let tree = &huffman_info.huffman_code_groups[huffman_info.get_huff_index(x as u16, y as u16)];
             self.bit_reader.fill()?;
             let code = tree[GREEN].read_symbol_unchecked(&mut self.bit_reader);
             if code < 256 {
-                data[pos] = code as u8;
+                data[pos - base] = code as u8;
                 pos += 1;
             } else if code < 256 + 24 {
                 let length = Self::copy_distance_unchecked(&mut self.bit_reader, code - 256)?;
@@ -597,7 +597,7 @@ impl<R: BufRead> LosslessDecoder<R> {
                 if pos < dist || end - pos < length {
                     return Err(DecodingError::BitStreamError);
                 }
-                for i in pos..pos + length {
+                for i in pos - base..pos - base + length {
                     data[i] = data[i - dist];
                 }
                 pos += length;
@@ -609,7 +609,8 @@ impl<R: BufRead> LosslessDecoder<R> {
                 break;
             }
         }
-        if pos < end {
+        *index = pos;
+        if self.bit_reader.eos && pos < end {
             return Err(DecodingError::BitStreamError);
         }
         Ok(())
@@ -675,7 +676,7 @@ impl<R: BufRead> LosslessDecoder<R> {
 /// The entropy-decoded pixels a backward reference can still reach: libwebp's distance codes
 /// reach `WINDOW - 120` pixels back, the longest run `MAX_COPY` pixels on. Pixel `i` sits at
 /// `i - base`; the last `WINDOW` pixels slide to the front when the next band would not fit.
-struct Window {
+struct Window<const B: usize = 4> {
     data: Vec<u8>,
     base: usize,
     cap: usize,
@@ -684,10 +685,10 @@ struct Window {
 const WINDOW: usize = 1 << 20;
 const MAX_COPY: usize = 4096;
 
-impl Window {
+impl<const B: usize> Window<B> {
     fn new(num_values: usize, band: usize) -> Self {
         let cap = num_values.min(WINDOW + WINDOW.max(band + MAX_COPY));
-        Self { data: vec![0; cap * 4], base: 0, cap }
+        Self { data: vec![0; cap * B], base: 0, cap }
     }
 
     fn make_room(&mut self, index: usize, need: usize) {
@@ -695,12 +696,12 @@ impl Window {
             return;
         }
         let keep = index - WINDOW;
-        self.data.copy_within((keep - self.base) * 4..(index - self.base) * 4, 0);
+        self.data.copy_within((keep - self.base) * B..(index - self.base) * B, 0);
         self.base = keep;
     }
 
     fn rows(&self, from: usize, to: usize) -> &[u8] {
-        &self.data[(from - self.base) * 4..(to - self.base) * 4]
+        &self.data[(from - self.base) * B..(to - self.base) * B]
     }
 }
 
@@ -790,6 +791,154 @@ impl<R: BufRead> LosslessBands<R> {
                 }
             }
         }
+    }
+}
+
+/// The pixels of an ALPH chunk's lossless stream, decoded a band of rows at a time: as RGBA
+/// whose green is kept, or as palette indices a byte at a time, as libwebp decodes them.
+pub(crate) enum AlphaBands<R> {
+    Argb {
+        bands: LosslessBands<R>,
+        greens: Vec<u8>,
+        first: usize,
+    },
+    Indices(Box<AlphaIndices<R>>),
+}
+
+pub(crate) struct AlphaIndices<R> {
+    decoder: LosslessDecoder<R>,
+    huffman: HuffmanInfo,
+    window: Window<1>,
+    index: usize,
+    greens: [u8; 256],
+    bits: u8,
+    xsize: usize,
+}
+
+impl<R: BufRead> AlphaBands<R> {
+    /// Row `y`'s green bytes into `row`, the rows read top to bottom.
+    pub(crate) fn read_row(&mut self, y: usize, row: &mut [u8]) -> Result<(), DecodingError> {
+        let w = row.len();
+        match self {
+            AlphaBands::Argb { bands, greens, first } => {
+                if y >= *first + greens.len() / w {
+                    let (y0, band) = bands.next_band()?.ok_or(DecodingError::BitStreamError)?;
+                    greens.clear();
+                    greens.extend(band.chunks_exact(4).map(|p| p[1]));
+                    *first = usize::from(y0);
+                }
+                row.copy_from_slice(&greens[(y - *first) * w..][..w]);
+            }
+            AlphaBands::Indices(a) => {
+                let (xsize, height) = (a.xsize, usize::from(a.decoder.height));
+                if a.index < (y + 1) * xsize {
+                    let until = (y + BAND_ROWS).min(height) * xsize;
+                    let (width, huffman) = (xsize as u16, &a.huffman);
+                    a.decoder.decode_alpha_8b(width, height as u16, huffman, &mut a.window, &mut a.index, until)?;
+                }
+                let packed = a.window.rows(y * xsize, (y + 1) * xsize);
+                let (per_byte, mask) = (1 << a.bits, (1u16 << (8 >> a.bits)) - 1);
+                for (x, g) in row.iter_mut().enumerate() {
+                    let index = (u16::from(packed[x / per_byte]) >> ((x % per_byte) << (3 - a.bits))) & mask;
+                    *g = a.greens[usize::from(index)];
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The whole-plane ALPH decode banded decoding replaced, kept as the reference it is held to.
+#[cfg(test)]
+impl<R: BufRead> LosslessDecoder<R> {
+    pub(crate) fn decode_alpha_whole(mut self, width: u16, height: u16) -> Result<Vec<u8>, DecodingError> {
+        self.width = width;
+        self.height = height;
+        let xsize = self.read_transforms()?;
+        let color_cache = self.read_color_cache()?.map(ColorCache::new);
+        let huffman_info = self.read_huffman_codes(true, xsize, height, color_cache)?;
+        let pixels = usize::from(width) * usize::from(height);
+        let indices_only = self.transform_order == [3]
+            && huffman_info.color_cache.is_none()
+            && huffman_info.huffman_code_groups.iter().all(|g| g[RED].is_single_node() && g[BLUE].is_single_node() && g[ALPHA].is_single_node());
+        if !indices_only {
+            let mut bands = LosslessBands::new(self, xsize, huffman_info);
+            let mut plane = Vec::with_capacity(pixels);
+            while let Some((_, rows)) = bands.next_band()? {
+                plane.extend(rows.chunks_exact(4).map(|p| p[1]));
+            }
+            return Ok(plane);
+        }
+        let mut plane = vec![0; pixels];
+        self.decode_alpha_8b_whole(xsize, height, &huffman_info, &mut plane)?;
+        let Some(TransformType::ColorIndexingTransform { table_size, table_data }) = &self.transforms[3] else {
+            unreachable!()
+        };
+        let mut greens = [0u8; 256];
+        for (g, c) in greens.iter_mut().zip(table_data.chunks_exact(4)) {
+            *g = c[1];
+        }
+        let bits = match table_size {
+            ..=2 => 3,
+            3..=4 => 2,
+            5..=16 => 1,
+            _ => 0,
+        };
+        let (w, xsize) = (usize::from(width), usize::from(xsize));
+        let (per_byte, mask) = (1 << bits, (1u16 << (8 >> bits)) - 1);
+        // Indices expand in place from the end: a row's pixels never land before its indices.
+        for y in (0..usize::from(height)).rev() {
+            for x in (0..w).rev() {
+                let packed = plane[y * xsize + x / per_byte];
+                let index = (u16::from(packed) >> ((x % per_byte) << (3 - bits))) & mask;
+                plane[y * w + x] = greens[usize::from(index)];
+            }
+        }
+        Ok(plane)
+    }
+
+    fn decode_alpha_8b_whole(
+        &mut self,
+        width: u16,
+        height: u16,
+        huffman_info: &HuffmanInfo,
+        data: &mut [u8],
+    ) -> Result<(), DecodingError> {
+        let end = usize::from(width) * usize::from(height);
+        let mut pos = 0;
+        while pos < end {
+            let (x, y) = (pos % usize::from(width), pos / usize::from(width));
+            let tree = &huffman_info.huffman_code_groups[huffman_info.get_huff_index(x as u16, y as u16)];
+            self.bit_reader.fill()?;
+            let code = tree[GREEN].read_symbol_unchecked(&mut self.bit_reader);
+            if code < 256 {
+                data[pos] = code as u8;
+                pos += 1;
+            } else if code < 256 + 24 {
+                let length = Self::copy_distance_unchecked(&mut self.bit_reader, code - 256)?;
+                let dist_symbol = tree[DIST].read_symbol_unchecked(&mut self.bit_reader);
+                self.bit_reader.fill()?;
+                let dist_code = Self::copy_distance_unchecked(&mut self.bit_reader, dist_symbol)?;
+                let dist = Self::plane_code_to_distance(width, dist_code);
+                if pos < dist || end - pos < length {
+                    return Err(DecodingError::BitStreamError);
+                }
+                for i in pos..pos + length {
+                    data[i] = data[i - dist];
+                }
+                pos += length;
+            } else {
+                return Err(DecodingError::BitStreamError);
+            }
+            if self.bit_reader.is_eos()? {
+                self.bit_reader.eos = true;
+                break;
+            }
+        }
+        if pos < end {
+            return Err(DecodingError::BitStreamError);
+        }
+        Ok(())
     }
 }
 

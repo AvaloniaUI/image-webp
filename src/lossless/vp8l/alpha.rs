@@ -174,3 +174,22 @@ pub(crate) fn encode_alpha(alpha: &[u8], width: u32, height: u32, method: u8) ->
     }
     best.unwrap()
 }
+
+/// The `ALPH` payload of `alpha` with `filter`, compressed at `method` or stored.
+#[cfg(test)]
+pub(crate) fn encode_alpha_filtered(alpha: &[u8], width: u32, height: u32, filter: usize, method: Option<u8>) -> Vec<u8> {
+    let (w, h) = (width as usize, height as usize);
+    let mut filtered = vec![0u8; alpha.len()];
+    match method {
+        Some(m) => encode_alpha_internal(alpha, w, h, filter, i32::from(m), &mut filtered),
+        None => {
+            match filter {
+                FILTER_NONE => filtered.copy_from_slice(alpha),
+                _ => apply_filter(filter, alpha, w, h, &mut filtered),
+            }
+            let mut out = vec![(filter as u8) << 2];
+            out.extend_from_slice(&filtered);
+            out
+        }
+    }
+}

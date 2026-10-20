@@ -3,15 +3,16 @@
 //! and the frames a demuxer hands out.
 
 use std::collections::VecDeque;
-use std::io::{BufRead, Cursor, Read, Seek, SeekFrom, Take};
+use std::io::{self, BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Take};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::decoder::DecodingError;
-use crate::extended::{read_alpha_chunk, unfilter_alpha_row, AlphaChunk};
+use crate::extended::{read_alpha_chunk, AlphaRows};
 use crate::headers::Headers;
 use crate::lossless::{LosslessBands, LosslessDecoder};
 use crate::lossy::{BandDecoder, Channel};
 use crate::rescaler::{self, Rescaler};
-use crate::UpsamplingMethod;
+use crate::{ReadSeek, UpsamplingMethod};
 
 const BUFFERED_BAND_ROWS: usize = 16;
 
@@ -25,8 +26,8 @@ pub struct FrameDecoder<'a> {
 }
 
 enum Source<'a> {
-    Rgb(BandDecoder<'a, 3>),
-    Rgba(BandDecoder<'a, 4>, Option<AlphaChunk>),
+    Rgb(BandDecoder<'a, 3>, Option<AlphaRows<'a>>),
+    Rgba(BandDecoder<'a, 4>, Option<AlphaRows<'a>>),
     Scaled(Box<ScaledLossy<'a>>),
     /// RGBA bands handed out as they are, or as RGB through `band`.
     Lossless { bands: Lossless<'a>, band: Vec<u8> },
@@ -98,9 +99,14 @@ impl<'a> FrameDecoder<'a> {
                 None => Source::Lossless { bands, band: Vec::new() },
             }
         } else {
-            let alpha_chunk = match &headers.alpha {
-                Some(range) => Some(decode_alpha(&mut r, start + range.start as u64, range.len(), width, height)?),
-                None => None,
+            // The alpha plane is read in step with the colour, from where its chunk is.
+            let (r, alpha_rows): (Box<dyn ReadSeek + Send + 'a>, _) = match &headers.alpha {
+                Some(range) => {
+                    let shared = Shared::new(r);
+                    let alpha = decode_alpha(shared.clone(), start + range.start as u64, range.len(), width, height)?;
+                    (Box::new(shared), Some(alpha))
+                }
+                None => (Box::new(r), None),
             };
             let check = |(w, h): (u16, u16)| match (u32::from(w), u32::from(h)) == (width, height) {
                 true => Ok(()),
@@ -108,24 +114,23 @@ impl<'a> FrameDecoder<'a> {
             };
             match scaled {
                 Some(size) => {
-                    let mut bands = BandDecoder::new(Box::new(r), bitstream, end, UpsamplingMethod::Simple)?;
+                    let mut bands = BandDecoder::new(r, bitstream, end, UpsamplingMethod::Simple)?;
                     check(bands.dimensions())?;
                     if rescaler::bypasses_filter(width, height, size) {
                         bands.bypass_filter();
                     }
-                    Source::Scaled(Box::new(ScaledLossy::new(bands, alpha_chunk.filter(|_| alpha), (width, height), size, bpp)))
+                    Source::Scaled(Box::new(ScaledLossy::new(bands, alpha_rows, alpha, (width, height), size, bpp)))
                 }
                 None if alpha => {
-                    let bands = BandDecoder::new(Box::new(r), bitstream, end, upsampling)?;
+                    let bands = BandDecoder::new(r, bitstream, end, upsampling)?;
                     check(bands.dimensions())?;
-                    Source::Rgba(bands, alpha_chunk)
+                    Source::Rgba(bands, alpha_rows)
                 }
                 None => {
-                    let bands = BandDecoder::new(Box::new(r), bitstream, end, upsampling)?;
+                    let bands = BandDecoder::new(r, bitstream, end, upsampling)?;
                     check(bands.dimensions())?;
                     // libwebp decodes the alpha plane of an RGB decode too, for its errors.
-                    drop(alpha_chunk);
-                    Source::Rgb(bands)
+                    Source::Rgb(bands, alpha_rows)
                 }
             }
         };
@@ -140,7 +145,7 @@ impl<'a> FrameDecoder<'a> {
     /// The most rows a band has.
     pub fn max_band_rows(&self) -> u32 {
         let rows = match self.source {
-            Source::Rgb(_) | Source::Rgba(..) => crate::lossy::MAX_BAND_ROWS,
+            Source::Rgb(..) | Source::Rgba(..) => crate::lossy::MAX_BAND_ROWS,
             _ => BUFFERED_BAND_ROWS,
         };
         (rows as u32).min(self.height)
@@ -155,15 +160,24 @@ impl<'a> FrameDecoder<'a> {
     pub fn next_band(&mut self) -> Result<Option<(u32, &[u8])>, DecodingError> {
         let w = self.width as usize;
         match &mut self.source {
-            Source::Rgb(bands) => Ok(bands.next_band()?.map(|(y, rows)| (y, &*rows))),
+            Source::Rgb(bands, alpha) => {
+                let Some((y0, rows)) = bands.next_band()? else {
+                    return Ok(None);
+                };
+                if let Some(alpha) = alpha {
+                    for _ in 0..rows.len() / (w * 3) {
+                        alpha.next_row()?;
+                    }
+                }
+                Ok(Some((y0, rows)))
+            }
             Source::Rgba(bands, alpha) => {
                 let Some((y0, rows)) = bands.next_band()? else {
                     return Ok(None);
                 };
                 if let Some(alpha) = alpha {
-                    for (y, row) in (y0 as usize..).zip(rows.chunks_exact_mut(w * 4)) {
-                        let cur = unfiltered_row(alpha, y, w);
-                        for (px, &a) in row.chunks_exact_mut(4).zip(cur) {
+                    for row in rows.chunks_exact_mut(w * 4) {
+                        for (px, &a) in row.chunks_exact_mut(4).zip(alpha.next_row()?) {
                             px[3] = a;
                         }
                     }
@@ -188,19 +202,10 @@ impl<'a> FrameDecoder<'a> {
 
 }
 
-/// Unfilters alpha row `y` in place, rows above it already unfiltered.
-fn unfiltered_row(alpha: &mut AlphaChunk, y: usize, w: usize) -> &[u8] {
-    let (above, rest) = alpha.data.split_at_mut(y * w);
-    let prev = (y > 0).then(|| &above[(y - 1) * w..]);
-    let cur = &mut rest[..w];
-    unfilter_alpha_row(alpha.filtering_method, prev, cur);
-    cur
-}
-
 /// The ALPH payload of `size` bytes at `at`, with libwebp's header checks.
-fn decode_alpha<R: BufRead + Seek>(r: &mut R, at: u64, size: usize, width: u32, height: u32) -> Result<AlphaChunk, DecodingError> {
+fn decode_alpha<'a, R: Read + Seek + Send + 'a>(mut r: R, at: u64, size: usize, width: u32, height: u32) -> Result<AlphaRows<'a>, DecodingError> {
     r.seek(SeekFrom::Start(at))?;
-    let mut payload = r.take(size as u64);
+    let mut payload: Box<dyn BufRead + Send + 'a> = Box::new(BufReader::new(r.take(size as u64)));
     let Some(&info) = payload.fill_buf()?.first().filter(|_| size > 1) else {
         return Err(DecodingError::InvalidCompressionMethod);
     };
@@ -211,7 +216,46 @@ fn decode_alpha<R: BufRead + Seek>(r: &mut R, at: u64, size: usize, width: u32, 
     if method == 0 && size - 1 < width as usize * height as usize {
         return Err(DecodingError::InvalidCompressionMethod);
     }
-    read_alpha_chunk(&mut payload, width as u16, height as u16)
+    read_alpha_chunk(payload, width as u16, height as u16)
+}
+
+/// A reader read at two places in turn, each handle at a position of its own.
+struct Shared<R> {
+    inner: Arc<Mutex<R>>,
+    pos: u64,
+}
+
+impl<R> Shared<R> {
+    fn new(inner: R) -> Self {
+        Self { inner: Arc::new(Mutex::new(inner)), pos: 0 }
+    }
+}
+
+impl<R> Clone for Shared<R> {
+    fn clone(&self) -> Self {
+        Self { inner: Arc::clone(&self.inner), pos: self.pos }
+    }
+}
+
+impl<R: Read + Seek> Read for Shared<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut r = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        r.seek(SeekFrom::Start(self.pos))?;
+        let n = r.read(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl<R: Seek> Seek for Shared<R> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.pos = match pos {
+            SeekFrom::Start(p) => p,
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d).ok_or(io::ErrorKind::InvalidInput)?,
+            SeekFrom::End(_) => self.inner.lock().unwrap_or_else(PoisonError::into_inner).seek(pos)?,
+        };
+        Ok(self.pos)
+    }
 }
 
 /// libwebp's alpha multiply: `round(x * a / 255)` forward, `x * 255 / a` back, in 24-bit
@@ -311,8 +355,9 @@ impl<'a> ScaledLossless<'a> {
 /// alpha each scaled to the output size, then converted per pixel.
 struct ScaledLossy<'a> {
     bands: BandDecoder<'a, 3>,
-    alpha: Option<AlphaChunk>,
-    width: usize,
+    alpha: Option<AlphaRows<'a>>,
+    /// Whether the alpha plane is scaled and handed out, not only decoded.
+    keep_alpha: bool,
     alpha_rows: usize,
     scalers: [Rescaler; 4],
     queues: [VecDeque<Vec<u8>>; 4],
@@ -324,13 +369,13 @@ struct ScaledLossy<'a> {
 }
 
 impl<'a> ScaledLossy<'a> {
-    fn new(bands: BandDecoder<'a, 3>, alpha: Option<AlphaChunk>, (w, h): (u32, u32), (ow, oh): (u32, u32), bpp: usize) -> Self {
+    fn new(bands: BandDecoder<'a, 3>, alpha: Option<AlphaRows<'a>>, keep_alpha: bool, (w, h): (u32, u32), (ow, oh): (u32, u32), bpp: usize) -> Self {
         let (w, h, ow, oh) = (w as usize, h as usize, ow as usize, oh as usize);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         Self {
             bands,
+            keep_alpha: keep_alpha && alpha.is_some(),
             alpha,
-            width: w,
             alpha_rows: 0,
             scalers: [
                 Rescaler::new(w, h, ow, oh, 1),
@@ -365,9 +410,9 @@ impl<'a> ScaledLossy<'a> {
 
     fn ready(&self) -> usize {
         let n = self.queues[..3].iter().map(VecDeque::len).min().unwrap_or(0);
-        match self.alpha {
-            Some(_) => n.min(self.queues[3].len()),
-            None => n,
+        match self.keep_alpha {
+            true => n.min(self.queues[3].len()),
+            false => n,
         }
     }
 
@@ -385,7 +430,7 @@ impl<'a> ScaledLossy<'a> {
                         _ => crate::lossy::fill_row_yuv::<3>(out, &y, &u, &v),
                     }
                     if self.bpp == 4 {
-                        let a = self.alpha.as_ref().map(|_| self.queues[3].pop_front().unwrap());
+                        let a = self.keep_alpha.then(|| self.queues[3].pop_front().unwrap());
                         for (i, px) in out.chunks_exact_mut(4).enumerate() {
                             px[3] = a.as_ref().map_or(255, |a| a[i]);
                         }
@@ -418,11 +463,19 @@ impl<'a> ScaledLossy<'a> {
                 None => self.done = true,
                 Some(end) => {
                     if let Some(mut alpha) = self.alpha.take() {
-                        for y in self.alpha_rows..end {
-                            let row = unfiltered_row(&mut alpha, y, self.width).to_vec();
-                            self.push(3, &row);
+                        let mut decoded = Ok(());
+                        for _ in self.alpha_rows..end {
+                            match alpha.next_row() {
+                                Ok(row) if self.keep_alpha => self.push(3, row),
+                                Ok(_) => {}
+                                Err(e) => {
+                                    decoded = Err(e);
+                                    break;
+                                }
+                            }
                         }
                         self.alpha = Some(alpha);
+                        decoded?;
                     }
                     self.alpha_rows = self.alpha_rows.max(end);
                 }
