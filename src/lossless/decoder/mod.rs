@@ -476,8 +476,11 @@ impl<R: BufRead> LosslessDecoder<R> {
                 //literal, so just use huffman codes and read as argb
                 let green = code as u8;
                 let red = tree[RED].read_symbol(&mut self.bit_reader)? as u8;
-                // A 32-bit window holds two codes, as libwebp reads them.
-                self.bit_reader.fill()?;
+                // Blue and alpha take up to 30 bits, which the window still holds below this; a
+                // fill there cannot reach the end of the stream, so skipping it changes nothing.
+                if self.bit_reader.bit_pos > LBITS - 30 {
+                    self.bit_reader.fill()?;
+                }
                 let blue = tree[BLUE].read_symbol(&mut self.bit_reader)? as u8;
                 let alpha = tree[ALPHA].read_symbol(&mut self.bit_reader)? as u8;
 
@@ -1089,13 +1092,11 @@ impl<R: BufRead> BitReader<R> {
     /// the state at the end of the stream come out as libwebp's.
     #[inline(always)]
     pub(crate) fn fill(&mut self) -> Result<(), DecodingError> {
-        if self.bit_pos < WBITS {
-            return Ok(());
-        }
         if self.bit_pos < LBITS && self.buf.len() - self.at > 8 {
             let w = u64::from_le_bytes(self.buf[self.at..self.at + 8].try_into().unwrap());
             let shift = self.bit_pos & !7;
-            self.val = (self.val >> shift) | w << (LBITS - shift);
+            // Branch-free: shifting by 64 in two steps leaves nothing of `w` where no byte is read.
+            self.val = (self.val >> shift) | (w << 1) << (LBITS - 1 - shift);
             self.at += (shift / 8) as usize;
             self.bit_pos &= 7;
             return Ok(());
@@ -1169,8 +1170,22 @@ impl<R: BufRead> BitReader<R> {
         Ok(())
     }
 
-    /// `VP8LReadBits`: zero once at the end.
+    /// `VP8LReadBits`: zero once at the end. Short of the end its byte shifts are one fill.
+    #[inline(always)]
     pub(crate) fn read_bits_raw(&mut self, num: u8) -> Result<u32, DecodingError> {
+        let bit_pos = self.bit_pos + u32::from(num);
+        if !self.eos && num <= 24 && bit_pos < LBITS && self.buf.len() - self.at > 8 {
+            let v = self.peek(num) as u32;
+            self.bit_pos = bit_pos;
+            self.fill()?;
+            return Ok(v);
+        }
+        self.read_bits_slow(num)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn read_bits_slow(&mut self, num: u8) -> Result<u32, DecodingError> {
         if !self.started {
             self.start()?;
         }

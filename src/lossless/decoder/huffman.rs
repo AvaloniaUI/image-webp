@@ -208,6 +208,7 @@ impl HuffmanTree {
     ///
     /// You must call call `bit_reader.fill()` before calling this function or it may erroroneosly
     /// detect the end of the stream and return a bitstream error.
+    #[inline(always)]
     pub(crate) fn read_symbol<R: BufRead>(
         &self,
         bit_reader: &mut BitReader<R>,
