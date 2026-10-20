@@ -14,7 +14,8 @@
 //! (exit 1) where a lossy case is more than 0.5 dB under libwebp or more than 5% larger, or a
 //! lossless case is not pixel-identical. `--crc` prints a checksum of this crate's file per case
 //! instead, to hold a speed change to the bytes it wrote before; `--bench N` times each side N
-//! times in turn and prints the fastest and the median run.
+//! times in turn and prints the fastest and the median run. `ANIM_REPEAT=N` makes a `--child`
+//! process encode N times, for profiling one side without the synthetic frames' cost.
 
 use std::io::Cursor;
 use std::process::Command;
@@ -614,13 +615,16 @@ fn main() {
     if let Some((index, ours)) = child_mode {
         // One process per side and animation: its peak memory is that side's, over the settings.
         let a = &animations[index];
+        let repeat: usize = std::env::var("ANIM_REPEAT").map_or(1, |r| r.parse().unwrap());
         let start = Instant::now();
-        for s in &settings {
-            std::hint::black_box(if ours {
-                encode_ours(a, *s)
-            } else {
-                encode_libwebp(a, *s)
-            });
+        for _ in 0..repeat {
+            for s in &settings {
+                std::hint::black_box(if ours {
+                    encode_ours(a, *s)
+                } else {
+                    encode_libwebp(a, *s)
+                });
+            }
         }
         println!(
             "{} {}",
