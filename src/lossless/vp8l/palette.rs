@@ -3,6 +3,7 @@
 
 use super::backward_refs::hash_pix;
 use super::entropy::sub_pixels;
+use super::Pixel;
 
 pub(crate) const MAX_PALETTE_SIZE: usize = 256;
 
@@ -42,13 +43,21 @@ pub(crate) fn prepare_map_to_palette(palette: &[u32]) -> (Vec<u32>, Vec<u32>) {
 }
 
 /// The sorted colours of `argb`, or `None` with more than 256.
-pub(crate) fn get_color_palette(argb: &[u32]) -> Option<Vec<u32>> {
+pub(crate) fn get_color_palette<P: Pixel>(argb: &[P]) -> Option<Vec<u32>> {
+    if let Some(bytes) = P::bytes(argb) {
+        let mut seen = [false; 256];
+        for &a in bytes {
+            seen[usize::from(a)] = true;
+        }
+        return Some((0..256u32).filter(|&a| seen[a as usize]).map(|a| a << 8).collect());
+    }
     const COLOR_HASH_SIZE: usize = MAX_PALETTE_SIZE * 4;
     let mut in_use = vec![false; COLOR_HASH_SIZE];
     let mut colors = vec![0u32; COLOR_HASH_SIZE];
     let mut num_colors = 0;
-    let mut last_pix = !argb[0];
+    let mut last_pix = !argb[0].argb();
     for &p in argb {
+        let p = p.argb();
         if p == last_pix {
             continue;
         }
@@ -168,15 +177,16 @@ fn cooccurrence_find_max(cooccurrence: &[u32], num_colors: usize) -> (u8, u8) {
     (c1, c2)
 }
 
-fn cooccurrence_build(argb: &[u32], width: usize, palette: &[u32], cooccurrence: &mut [u32]) {
+fn cooccurrence_build<P: Pixel>(argb: &[P], width: usize, palette: &[u32], cooccurrence: &mut [u32]) {
     let num_colors = palette.len();
     let mut lines = vec![0u32; 2 * width];
     let (mut top_off, mut cur_off) = (0usize, width);
     let (sorted, idx_map) = prepare_map_to_palette(palette);
-    let mut prev_pix = !argb[0];
+    let mut prev_pix = !argb[0].argb();
     let mut prev_idx = 0u32;
     for (y, row) in argb.chunks_exact(width).enumerate() {
         for (x, &pix) in row.iter().enumerate() {
+            let pix = pix.argb();
             if pix != prev_pix {
                 prev_idx = idx_map[search_color_no_idx(&sorted, pix, num_colors)];
                 prev_pix = pix;
@@ -203,7 +213,7 @@ struct Sum {
     sum: u32,
 }
 
-fn palette_sort_modified_zeng(argb: &[u32], width: usize, palette_in: &[u32]) -> Vec<u32> {
+fn palette_sort_modified_zeng<P: Pixel>(argb: &[P], width: usize, palette_in: &[u32]) -> Vec<u32> {
     let num_colors = palette_in.len() as u32;
     if num_colors <= 1 {
         return palette_in.to_vec();
@@ -278,9 +288,9 @@ fn palette_sort_modified_zeng(argb: &[u32], width: usize, palette_in: &[u32]) ->
 }
 
 /// `PaletteSort` of the lexicographically sorted palette.
-pub(crate) fn palette_sort(
+pub(crate) fn palette_sort<P: Pixel>(
     method: PaletteSorting,
-    argb: &[u32],
+    argb: &[P],
     width: usize,
     palette_sorted: &[u32],
 ) -> Vec<u32> {
@@ -322,8 +332,8 @@ fn bundle_color_map(row: &[u8], xbits: u32, dst: &mut [u32]) {
 
 /// `ApplyPalette`: replaces each pixel of `src` by its palette index, bundled `xbits`
 /// pixels per output pixel.
-pub(crate) fn apply_palette(
-    src: &[u32],
+pub(crate) fn apply_palette<P: Pixel>(
+    src: &[P],
     width: usize,
     height: usize,
     dst: &mut [u32],
@@ -333,12 +343,25 @@ pub(crate) fn apply_palette(
 ) {
     let palette_size = palette.len();
     let mut tmp_row = vec![0u8; width];
+    if let Some(bytes) = P::bytes(src) {
+        let mut index = [0u8; 256];
+        for (i, &c) in palette.iter().enumerate() {
+            index[(c >> 8 & 0xff) as usize] = i as u8;
+        }
+        for (y, row) in bytes.chunks_exact(width).take(height).enumerate() {
+            for (t, &a) in tmp_row.iter_mut().zip(row) {
+                *t = index[usize::from(a)];
+            }
+            bundle_color_map(&tmp_row, xbits, &mut dst[y * dst_stride..]);
+        }
+        return;
+    }
     let mut run = |index_of: &mut dyn FnMut(u32) -> u32| {
         let mut prev_pix = palette[0];
         let mut prev_idx = 0u32;
         for y in 0..height {
             for x in 0..width {
-                let pix = src[y * width + x];
+                let pix = src[y * width + x].argb();
                 if pix != prev_pix {
                     prev_idx = index_of(pix);
                     prev_pix = pix;

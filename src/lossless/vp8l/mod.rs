@@ -27,6 +27,8 @@ mod tables;
 
 pub(crate) use alpha::{encode_alpha, encode_alpha_raw};
 
+use std::borrow::Cow;
+
 use backward_refs::{
     get_backward_references, BackwardRefs, HashChain, PixOrCopyMode, RefsSet, LZ77_BOX, LZ77_RLE,
     LZ77_STANDARD,
@@ -102,14 +104,63 @@ struct CrunchConfig {
     sub_configs: Vec<CrunchSubConfig>,
 }
 
+/// A pixel of the picture the encoder is given: an ARGB word, or an alpha plane's byte, which
+/// is coded as green.
+pub(crate) trait Pixel: Copy + Eq {
+    fn argb(self) -> u32;
+
+    /// The alpha plane's bytes, which palette lookups take a byte at a time.
+    fn bytes(pic: &[Self]) -> Option<&[u8]>;
+
+    /// The picture as the ARGB words the transforms work in, kept in `argb`.
+    fn store_argb(pic: Cow<'_, [Self]>, argb: &mut Vec<u32>);
+}
+
+impl Pixel for u32 {
+    #[inline(always)]
+    fn argb(self) -> u32 {
+        self
+    }
+
+    fn bytes(_: &[u32]) -> Option<&[u8]> {
+        None
+    }
+
+    fn store_argb(pic: Cow<'_, [u32]>, argb: &mut Vec<u32>) {
+        match pic {
+            Cow::Owned(pic) => *argb = pic,
+            Cow::Borrowed(pic) => {
+                argb.clear();
+                argb.extend_from_slice(pic);
+            }
+        }
+    }
+}
+
+impl Pixel for u8 {
+    #[inline(always)]
+    fn argb(self) -> u32 {
+        u32::from(self) << 8
+    }
+
+    fn bytes(pic: &[u8]) -> Option<&[u8]> {
+        Some(pic)
+    }
+
+    fn store_argb(pic: Cow<'_, [u8]>, argb: &mut Vec<u32>) {
+        argb.clear();
+        argb.extend(pic.iter().map(|&a| a.argb()));
+    }
+}
+
 #[inline]
 fn hash_pix_palette(pix: u32) -> u8 {
     (((u64::from(pix) + u64::from(pix >> 19)).wrapping_mul(0x39c5fba7) & 0xffffffff) >> 24) as u8
 }
 
 /// `AnalyzeEntropy`: the cheapest transform mode and whether red and blue are always 0.
-fn analyze_entropy(
-    argb: &[u32],
+fn analyze_entropy<P: Pixel>(
+    argb: &[P],
     width: u32,
     height: u32,
     use_palette: bool,
@@ -134,14 +185,14 @@ fn analyze_entropy(
     const PAL: usize = 12;
     let mut histo = vec![[0u32; 256]; 13];
     let w = width as usize;
-    let mut pix_prev = argb[0];
+    let mut pix_prev = argb[0].argb();
     for y in 0..height as usize {
         let row = &argb[y * w..(y + 1) * w];
         for x in 0..w {
-            let pix = row[x];
+            let pix = row[x].argb();
             let pix_diff = sub_pixels(pix, pix_prev);
             pix_prev = pix;
-            if pix_diff == 0 || (y > 0 && pix == argb[(y - 1) * w + x]) {
+            if pix_diff == 0 || (y > 0 && pix == argb[(y - 1) * w + x].argb()) {
                 continue;
             }
             for (p, [a, r, g, b]) in [(pix, [A, R, G, B]), (pix_diff, [AP, RP, GP, BP])] {
@@ -269,7 +320,7 @@ struct Encoder {
 
 impl Encoder {
     /// `EncoderAnalyze`: the configurations to try and whether red and blue are always 0.
-    fn analyze(&mut self, argb: &[u32]) -> (Vec<CrunchConfig>, bool) {
+    fn analyze<P: Pixel>(&mut self, argb: &[P]) -> (Vec<CrunchConfig>, bool) {
         let (width, height) = (self.width, self.height);
         let method = self.config.method;
         let quality = self.config.quality;
@@ -370,8 +421,8 @@ impl Encoder {
 
     /// `EncodeStreamHook` for all configurations: appends the smallest stream to `bw`.
     /// Takes `pic` to drop or reuse it once the last configuration no longer needs it.
-    fn encode_stream(&mut self, mut pic: Vec<u32>, bw: &mut BitWriter) {
-        let (configs, red_and_blue_always_zero) = self.analyze(&pic);
+    fn encode_stream<P: Pixel>(&mut self, mut pic: Cow<'_, [P]>, bw: &mut BitWriter) {
+        let (configs, red_and_blue_always_zero) = self.analyze(&pic[..]);
         let quality = self.config.quality as i32;
         let low_effort = self.config.method == 0;
         let height = self.height;
@@ -403,25 +454,24 @@ impl Encoder {
             if use_palette {
                 let palette = palette_sort(
                     config.palette_sorting.unwrap(),
-                    &pic,
+                    &pic[..],
                     self.width as usize,
                     &self.palette_sorted,
                 );
                 self.encode_palette(&mut w, low_effort, &palette);
-                self.map_image_from_palette(&pic, &palette);
+                self.map_image_from_palette(&pic[..], &palette);
                 if last {
-                    pic = Vec::new();
+                    pic = Cow::Borrowed(&[]);
                 }
                 if palette.len() < (1 << MAX_COLOR_CACHE_BITS) {
                     cache_bits = bits_log2_floor(palette.len() as u32) + 1;
                 }
             } else {
-                if last {
-                    self.argb = std::mem::take(&mut pic);
-                } else {
-                    self.argb.clear();
-                    self.argb.extend_from_slice(&pic);
-                }
+                let pic = match last {
+                    true => std::mem::take(&mut pic),
+                    false => Cow::Borrowed(&*pic),
+                };
+                P::store_argb(pic, &mut self.argb);
                 self.current_width = self.width;
                 if self.config.near_lossless < 100 && !use_predict {
                     near_lossless::NearLossless::apply(
@@ -622,7 +672,7 @@ impl Encoder {
         );
     }
 
-    fn map_image_from_palette(&mut self, pic: &[u32], palette: &[u32]) {
+    fn map_image_from_palette<P: Pixel>(&mut self, pic: &[P], palette: &[u32]) {
         let palette_size = palette.len();
         let xbits = if palette_size <= 4 {
             if palette_size <= 2 {
@@ -1044,7 +1094,13 @@ fn encode_image_internal(
 }
 
 /// `VP8LEncodeStream`: the transforms and entropy-coded image of `argb`, appended to `bw`.
-fn encode_stream(config: Config, argb: Vec<u32>, width: u32, height: u32, bw: &mut BitWriter) {
+fn encode_stream<P: Pixel>(
+    config: Config,
+    pic: Cow<'_, [P]>,
+    width: u32,
+    height: u32,
+    bw: &mut BitWriter,
+) {
     let mut enc = Encoder {
         config,
         width,
@@ -1061,7 +1117,7 @@ fn encode_stream(config: Config, argb: Vec<u32>, width: u32, height: u32, bw: &m
         refs_side: RefsSet::default(),
     };
     let _ = MAX_PALETTE_SIZE;
-    enc.encode_stream(argb, bw);
+    enc.encode_stream(pic, bw);
 }
 
 /// `VP8LEncodeImage` minus the RIFF header: the `VP8L` chunk payload of an ARGB image.
@@ -1079,7 +1135,7 @@ pub(crate) fn encode_argb(config: Config, mut argb: Vec<u32>, width: u32, height
     bw.put_bits(height - 1, 14);
     bw.put_bits(u32::from(has_alpha), 1);
     bw.put_bits(0, 3);
-    encode_stream(config, argb, width, height, &mut bw);
+    encode_stream(config, Cow::Owned(argb), width, height, &mut bw);
     let mut out = vec![0x2f];
     out.extend_from_slice(&bw.finish());
     out
@@ -1128,7 +1184,16 @@ fn encode_alpha_plane(
     effort_level: i32,
     use_quality_100: bool,
 ) -> Vec<u8> {
-    let argb: Vec<u32> = alpha.iter().map(|&a| u32::from(a) << 8).collect();
+    encode_green(Cow::Borrowed(alpha), width, height, effort_level, use_quality_100)
+}
+
+fn encode_green<P: Pixel>(
+    pic: Cow<'_, [P]>,
+    width: u32,
+    height: u32,
+    effort_level: i32,
+    use_quality_100: bool,
+) -> Vec<u8> {
     let config = Config {
         quality: if use_quality_100 && effort_level == 6 {
             100.
@@ -1140,8 +1205,8 @@ fn encode_alpha_plane(
         use_predictor: true,
         near_lossless: 100,
     };
-    let mut bw = BitWriter::with_capacity(alpha.len() >> 3);
-    encode_stream(config, argb, width, height, &mut bw);
+    let mut bw = BitWriter::with_capacity(pic.len() >> 3);
+    encode_stream(config, pic, width, height, &mut bw);
     bw.finish()
 }
 
@@ -1159,6 +1224,43 @@ mod tests {
     /// of the row above and four-pixel copies from half a million to a million pixels back,
     /// whose length and distance symbols get 15-bit codes from a geometric histogram, so the
     /// distance's 18 extra bits follow two long codes, past one fill of the decoder's window.
+    /// The alpha plane coded from its bytes is the stream coded from the green-only ARGB
+    /// image libwebp builds, at every effort, for planes that take each transform choice.
+    #[test]
+    fn alpha_plane_from_bytes_matches_green_argb() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let (w, h) = (67usize, 41usize);
+        let mut planes: Vec<Vec<u8>> = vec![
+            vec![0; w * h],
+            (0..w * h).map(|i| if (i % w) * 3 > w + (i / w) { 255 } else { 0 }).collect(),
+            (0..w * h).map(|i| [0, 64, 128, 255][(i / 7 + i % w / 9) % 4]).collect(),
+            (0..w * h).map(|i| ((i % w) * 255 / w) as u8).collect(),
+            (0..w * h).map(|i| ((i % w) * 2 + (i / w) * 3) as u8).collect(),
+            (0..w * h).map(|_| rng.gen()).collect(),
+            (0..w * h).map(|_| rng.gen_range(0..12u8) * 20).collect(),
+            (0..w * h).map(|_| rng.gen_range(100..=255u8)).collect(),
+        ];
+        let blobs: Vec<u8> = (0..w * h)
+            .map(|i| {
+                let (x, y) = ((i % w) as i32 - 30, (i / w) as i32 - 20);
+                (255 - (x * x + y * y).min(255)) as u8
+            })
+            .collect();
+        planes.push(blobs);
+        for (k, plane) in planes.iter().enumerate() {
+            for (pw, ph) in [(w, h), (1, w * h), (w * h, 1)] {
+                for effort in 0..=6 {
+                    for q100 in [true, false] {
+                        let green: Vec<u32> = plane.iter().map(|&a| u32::from(a) << 8).collect();
+                        let want = encode_green(Cow::Owned(green), pw as u32, ph as u32, effort, q100);
+                        let got = encode_alpha_plane(plane, pw as u32, ph as u32, effort, q100);
+                        assert!(got == want, "plane {k} {pw}x{ph} effort {effort} q100 {q100}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn far_copies_after_long_codes_decode() {
         let (width, height) = (2048u32, 600u32);
