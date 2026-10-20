@@ -1116,63 +1116,89 @@ impl<'a, const BPP: usize> BandDecoder<'a, BPP> {
     /// Decodes macroblock rows until a band of rows is final and returns its first row and
     /// pixels, or `None` after the last band.
     pub(crate) fn next_band(&mut self) -> Result<Option<(u32, &mut [u8])>, DecodingError> {
-        let dec = &mut self.dec;
-        let mbheight = usize::from(dec.mbheight);
+        let Some((first, end)) = self.next_rows()? else {
+            return Ok(None);
+        };
+        let len = (end - first) * usize::from(self.dec.frame.width) * BPP;
+        let mut rgb = std::mem::take(&mut self.rgb);
+        self.convert_rows(first, end, &mut rgb[..len]);
+        self.rgb = rgb;
+        Ok(Some((first as u32, &mut self.rgb[..len])))
+    }
+
+    /// [`next_band`](Self::next_band) straight into its rows of `frame`, the whole frame's
+    /// rows: the first row and the row past the band, or `None` after the last band.
+    pub(crate) fn next_band_into(&mut self, frame: &mut [u8]) -> Result<Option<(usize, usize)>, DecodingError> {
+        let Some((first, end)) = self.next_rows()? else {
+            return Ok(None);
+        };
+        let stride = usize::from(self.dec.frame.width) * BPP;
+        self.convert_rows(first, end, &mut frame[first * stride..end * stride]);
+        Ok(Some((first, end)))
+    }
+
+    /// Decodes macroblock rows until a band of rows is final: its first row and the row past
+    /// it, or `None` after the last band.
+    fn next_rows(&mut self) -> Result<Option<(usize, usize)>, DecodingError> {
+        let mbheight = usize::from(self.dec.mbheight);
+        let height = usize::from(self.dec.frame.height);
+        while self.mby < mbheight {
+            let mby = self.mby;
+            self.mby += 1;
+            self.decode_row(mby)?;
+            let end = if mby + 1 == mbheight {
+                height
+            } else {
+                (mby * 16 + 16 - BAND_KEEP_Y).min(height)
+            };
+            if end > self.emitted {
+                let first = self.emitted;
+                self.emitted = end;
+                return Ok(Some((first, end)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Converts rows `first..end`, still held in the planes, to RGB(A) in `out`.
+    fn convert_rows(&mut self, first: usize, end: usize, out: &mut [u8]) {
+        let dec = &self.dec;
         let width = usize::from(dec.frame.width);
         let height = usize::from(dec.frame.height);
         let luma_w = usize::from(dec.mbwidth) * 16;
         let chroma_w = luma_w / 2;
         let chroma_width = width.div_ceil(2);
         let chroma_height = height.div_ceil(2);
-        while self.mby < mbheight {
-            let mby = self.mby;
-            self.mby += 1;
-            self.decode_row(mby)?;
-            let dec = &self.dec;
-            let end = if mby + 1 == mbheight {
-                height
-            } else {
-                (mby * 16 + 16 - BAND_KEEP_Y).min(height)
-            };
-            if end <= self.emitted {
-                continue;
-            }
-            let (y_base, uv_base) = (dec.y_base, dec.uv_base);
-            let (ybuf, ubuf, vbuf) = (&dec.frame.ybuf, &dec.frame.ubuf, &dec.frame.vbuf);
-            let y_row = |y: usize| &ybuf[y.wrapping_sub(y_base) * luma_w..][..width];
-            let u_row = |c: usize| &ubuf[c.wrapping_sub(uv_base) * chroma_w..][..chroma_width];
-            let v_row = |c: usize| &vbuf[c.wrapping_sub(uv_base) * chroma_w..][..chroma_width];
-            let rgb = &mut self.rgb[..(end - self.emitted) * width * BPP];
-            for (y, out) in (self.emitted..end).zip(rgb.chunks_exact_mut(width * BPP)) {
-                let (near, far) = match self.upsampling {
-                    UpsamplingMethod::Simple => {
-                        yuv::fill_rgba_row_simple::<BPP>(y_row(y), u_row(y / 2), v_row(y / 2), out);
-                        continue;
-                    }
-                    UpsamplingMethod::Bilinear => {
-                        if y == 0 {
-                            (0, 0)
-                        } else if y + 1 == height && height % 2 == 0 {
-                            (chroma_height - 1, chroma_height - 1)
+        let (y_base, uv_base) = (dec.y_base, dec.uv_base);
+        let (ybuf, ubuf, vbuf) = (&dec.frame.ybuf, &dec.frame.ubuf, &dec.frame.vbuf);
+        let y_row = |y: usize| &ybuf[y.wrapping_sub(y_base) * luma_w..][..width];
+        let u_row = |c: usize| &ubuf[c.wrapping_sub(uv_base) * chroma_w..][..chroma_width];
+        let v_row = |c: usize| &vbuf[c.wrapping_sub(uv_base) * chroma_w..][..chroma_width];
+        for (y, out) in (first..end).zip(out.chunks_exact_mut(width * BPP)) {
+            let (near, far) = match self.upsampling {
+                UpsamplingMethod::Simple => {
+                    yuv::fill_rgba_row_simple::<BPP>(y_row(y), u_row(y / 2), v_row(y / 2), out);
+                    continue;
+                }
+                UpsamplingMethod::Bilinear => {
+                    if y == 0 {
+                        (0, 0)
+                    } else if y + 1 == height && height % 2 == 0 {
+                        (chroma_height - 1, chroma_height - 1)
+                    } else {
+                        let k = y.div_ceil(2);
+                        if y % 2 == 1 {
+                            (k - 1, k)
                         } else {
-                            let k = y.div_ceil(2);
-                            if y % 2 == 1 {
-                                (k - 1, k)
-                            } else {
-                                (k, k - 1)
-                            }
+                            (k, k - 1)
                         }
                     }
-                };
-                yuv::upsample_chroma_row(u_row(near), u_row(far), &mut self.u_full);
-                yuv::upsample_chroma_row(v_row(near), v_row(far), &mut self.v_full);
-                yuv::fill_row_yuv::<BPP>(out, y_row(y), &self.u_full, &self.v_full);
-            }
-            let first = self.emitted as u32;
-            self.emitted = end;
-            return Ok(Some((first, rgb)));
+                }
+            };
+            yuv::upsample_chroma_row(u_row(near), u_row(far), &mut self.u_full);
+            yuv::upsample_chroma_row(v_row(near), v_row(far), &mut self.v_full);
+            yuv::fill_row_yuv::<BPP>(out, y_row(y), &self.u_full, &self.v_full);
         }
-        Ok(None)
     }
 }
 

@@ -409,16 +409,25 @@ impl<R: BufRead> LosslessDecoder<R> {
         Ok(code_lengths)
     }
 
-    /// Decodes the image data using the huffman trees and either of the 3 methods of decoding
     /// Decodes pixels into `window` until pixel `until` is decoded, as libwebp's
     /// `DecodeImageData` does, a backward reference or a run reaching past it.
     fn decode_pixels(&mut self, st: &mut PixelState, window: &mut Window, until: usize) -> Result<(), DecodingError> {
+        window.make_room(st.index, (until + MAX_COPY).min(st.num_values));
+        let (base, last) = (window.base, window.base + window.cap);
+        self.decode_pixels_into(st, &mut window.data, base, last, until)
+    }
+
+    /// [`decode_pixels`](Self::decode_pixels) into `data`, which holds pixels `base..last`.
+    fn decode_pixels_into(
+        &mut self,
+        st: &mut PixelState,
+        data: &mut [u8],
+        base: usize,
+        last: usize,
+        until: usize,
+    ) -> Result<(), DecodingError> {
         let width = usize::from(st.width);
         let num_values = st.num_values;
-        window.make_room(st.index, (until + MAX_COPY).min(num_values));
-        let base = window.base;
-        let last = window.base + window.cap;
-        let data = &mut window.data[..];
         let huffman_info = &mut st.huffman;
         let mut tree = &huffman_info.huffman_code_groups[st.huff_index];
         let mut index = st.index;
@@ -689,12 +698,16 @@ const WINDOW: usize = 1 << 20;
 const MAX_COPY: usize = 4096;
 
 impl<const B: usize> Window<B> {
+    /// Allocated by the first [`make_room`](Self::make_room), which a whole-frame decode never calls.
     fn new(num_values: usize, band: usize) -> Self {
         let cap = num_values.min(WINDOW + WINDOW.max(band + MAX_COPY));
-        Self { data: vec![0; cap * B], base: 0, cap }
+        Self { data: Vec::new(), base: 0, cap }
     }
 
     fn make_room(&mut self, index: usize, need: usize) {
+        if self.data.is_empty() {
+            self.data = vec![0; self.cap * B];
+        }
         if need <= self.base + self.cap || index < WINDOW {
             return;
         }
@@ -769,6 +782,48 @@ impl<R: BufRead> LosslessBands<R> {
         self.transform(y0, rows);
         self.row += rows as u16;
         Ok(Some((y0 as u16, &self.cache[head..head + rows * width * 4])))
+    }
+
+    /// Whether no band has been decoded yet.
+    pub(crate) fn at_start(&self) -> bool {
+        self.row == 0
+    }
+
+    /// Decodes the whole frame into `out`, its `width`×`height` RGBA pixels, and undoes the
+    /// transforms in place there, as upstream image-webp does: no window and no band copies.
+    /// Only before the first band.
+    pub(crate) fn read_into(&mut self, out: &mut [u8]) -> Result<(), DecodingError> {
+        debug_assert_eq!(self.row, 0);
+        let (full, height) = (usize::from(self.decoder.width), usize::from(self.decoder.height));
+        let pixels = self.state.num_values;
+        self.decoder.decode_pixels_into(&mut self.state, &mut out[..pixels * 4], 0, pixels, pixels)?;
+        let mut width = usize::from(self.state.width);
+        for &t in self.decoder.transform_order.iter().rev() {
+            let stride = width * 4;
+            let image = &mut out[..height * stride];
+            match self.decoder.transforms[usize::from(t)].as_ref().unwrap() {
+                TransformType::PredictorTransform { size_bits, predictor_data } => {
+                    // Row 0 has no row above it in `out`; it goes through the cache behind one.
+                    let first = &mut self.cache[..2 * stride];
+                    first[stride..].copy_from_slice(&image[..stride]);
+                    apply_predictor_transform(first, width as u16, 0, 1, *size_bits, predictor_data);
+                    image[..stride].copy_from_slice(&first[stride..]);
+                    if height > 1 {
+                        apply_predictor_transform(image, width as u16, 1, height - 1, *size_bits, predictor_data);
+                    }
+                }
+                TransformType::ColorTransform { size_bits, transform_data } => {
+                    apply_color_transform(image, width as u16, 0, *size_bits, transform_data);
+                }
+                TransformType::SubtractGreen => apply_subtract_green_transform(image),
+                TransformType::ColorIndexingTransform { table_size, table_data } => {
+                    width = full;
+                    apply_color_indexing_transform(&mut out[..height * full * 4], full as u16, height as u16, *table_size, table_data);
+                }
+            }
+        }
+        self.row = height as u16;
+        Ok(())
     }
 
     fn transform(&mut self, y0: usize, rows: usize) {

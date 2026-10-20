@@ -36,6 +36,8 @@ fn ours(data: &[u8], size: Option<(u32, u32)>, alpha: bool) -> Option<Vec<u8>> {
     }
     let h = headers::decoding(data).ok()?;
     let from_slice = bands(FrameDecoder::new(data, &h, size, alpha));
+    let whole = whole(FrameDecoder::new(data, &h, size, alpha));
+    assert_eq!(from_slice, whole, "band and whole-frame decodes differ");
     // The same bytes behind others, read in small pieces.
     let prefixed = [&[0x55; 13][..], data].concat();
     let mut r = BufReader::with_capacity(61, Cursor::new(prefixed));
@@ -55,6 +57,15 @@ fn bands(d: Result<FrameDecoder, image_webp::DecodingError>) -> Option<Vec<u8>> 
             Err(_) => return None,
         }
     }
+}
+
+/// The frame decoded with `read_into`, straight into one buffer.
+fn whole(d: Result<FrameDecoder, image_webp::DecodingError>) -> Option<Vec<u8>> {
+    let mut d = d.ok()?;
+    let (w, h) = d.dimensions();
+    let mut out = vec![0; w as usize * h as usize * d.bytes_per_pixel()];
+    d.read_into(&mut out).ok()?;
+    Some(out)
 }
 
 fn sizes(data: &[u8]) -> Vec<Option<(u32, u32)>> {

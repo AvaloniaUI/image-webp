@@ -15,6 +15,9 @@ use crate::rescaler::{self, Rescaler};
 use crate::{ReadSeek, UpsamplingMethod};
 
 const BUFFERED_BAND_ROWS: usize = 16;
+/// The most pixels a lossless RGB frame is decoded whole: its RGBA then takes no more than the
+/// window of a band decode.
+const LOSSLESS_WHOLE_RGB: usize = 2 << 20;
 
 /// Decodes the bitstream [`Headers`] found in some data, top to bottom, reading the data as
 /// it goes: a lossy bitstream a window of each partition at a time.
@@ -154,6 +157,68 @@ impl<'a> FrameDecoder<'a> {
     /// 4 for RGBA, 3 for RGB.
     pub fn bytes_per_pixel(&self) -> usize {
         self.bpp
+    }
+
+    /// Decodes the whole frame into `buf`, `width × height × bytes_per_pixel` bytes in the
+    /// layout of the bands, straight into it instead of through a band: for a caller that
+    /// holds the whole frame anyway. A lossless frame is decoded whole and its transforms
+    /// undone in place, unless it is RGB and larger than the window a band decode holds;
+    /// scaled frames and frames whose bands have started go through bands.
+    pub fn read_into(&mut self, buf: &mut [u8]) -> Result<(), DecodingError> {
+        let (w, h) = (self.width as usize, self.height as usize);
+        if buf.len() != w * h * self.bpp {
+            return Err(DecodingError::ImageTooLarge);
+        }
+        let direct = match &mut self.source {
+            Source::Rgb(bands, alpha) => {
+                while let Some((first, end)) = bands.next_band_into(buf)? {
+                    // libwebp decodes the alpha plane of an RGB decode too, for its errors.
+                    if let Some(alpha) = alpha {
+                        for _ in first..end {
+                            alpha.next_row()?;
+                        }
+                    }
+                }
+                true
+            }
+            Source::Rgba(bands, alpha) => {
+                while let Some((first, end)) = bands.next_band_into(buf)? {
+                    let rows = &mut buf[first * w * 4..end * w * 4];
+                    match alpha {
+                        Some(alpha) => {
+                            for row in rows.chunks_exact_mut(w * 4) {
+                                for (px, &a) in row.chunks_exact_mut(4).zip(alpha.next_row()?) {
+                                    px[3] = a;
+                                }
+                            }
+                        }
+                        None => rows.chunks_exact_mut(4).for_each(|px| px[3] = 255),
+                    }
+                }
+                true
+            }
+            Source::Lossless { bands, .. } if bands.at_start() && self.bpp == 4 => {
+                bands.read_into(buf)?;
+                true
+            }
+            Source::Lossless { bands, .. } if bands.at_start() && w * h <= LOSSLESS_WHOLE_RGB => {
+                let mut rgba = vec![0; w * h * 4];
+                bands.read_into(&mut rgba)?;
+                for (px, p) in buf.chunks_exact_mut(3).zip(rgba.chunks_exact(4)) {
+                    px.copy_from_slice(&p[..3]);
+                }
+                true
+            }
+            _ => false,
+        };
+        if !direct {
+            let mut at = 0;
+            while let Some((_, rows)) = self.next_band()? {
+                buf[at..at + rows.len()].copy_from_slice(rows);
+                at += rows.len();
+            }
+        }
+        Ok(())
     }
 
     /// The next band: its first row and its whole rows, or `None` after the last.

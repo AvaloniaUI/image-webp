@@ -502,13 +502,8 @@ impl<R: BufRead + Seek + Send> WebPDecoder<R> {
             result?;
             return Ok(());
         }
-        let mut at = 0;
-        let mut bands = self.band_reader()?;
-        while let Some((_, rows)) = bands.next_band()? {
-            buf[at..at + rows.len()].copy_from_slice(rows);
-            at += rows.len();
-        }
-        Ok(())
+        let alpha = self.has_alpha();
+        self.frame_decoder(0, alpha)?.read_into(buf)
     }
 
     /// Decodes the image a band of rows at a time, top to bottom, calling `f(first_row, rows)`
