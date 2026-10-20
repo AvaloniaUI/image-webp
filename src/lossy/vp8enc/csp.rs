@@ -90,6 +90,16 @@ pub(crate) struct Source<'a> {
     has_alpha: bool,
     /// Rows whose alpha has been looked at.
     alpha_rows: usize,
+    cache: Option<StripCache>,
+}
+
+/// The converted rows of the strips loaded so far, for the passes after the first.
+#[derive(Default)]
+struct StripCache {
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
+    strips: usize,
 }
 
 impl<'a> Source<'a> {
@@ -119,7 +129,14 @@ impl<'a> Source<'a> {
             keep_alpha: true,
             has_alpha: false,
             alpha_rows: 0,
+            cache: None,
         }
+    }
+
+    /// Keeps the converted picture (1.5 bytes a pixel) so that later passes copy strips
+    /// instead of reading and converting the rows again.
+    pub(crate) fn keep_strips(&mut self) {
+        self.cache = Some(StripCache::default());
     }
 
     /// Whether some pixel is not opaque, and then the alpha plane if `keep_alpha`. Valid once
@@ -145,6 +162,15 @@ impl<'a> Source<'a> {
         }
         let y0 = mb_y * 16;
         let y1 = (y0 + 16).min(self.height);
+        let (ys, uvs) = (self.y_stride, self.uv_stride);
+        let (y_len, uv_len) = ((y1 - y0) * ys, (y1 - y0).div_ceil(2) * uvs);
+        if let Some(c) = self.cache.as_ref().filter(|c| mb_y < c.strips) {
+            self.y[ys..][..y_len].copy_from_slice(&c.y[y0 * ys..][..y_len]);
+            self.u[uvs..][..uv_len].copy_from_slice(&c.u[y0 / 2 * uvs..][..uv_len]);
+            self.v[uvs..][..uv_len].copy_from_slice(&c.v[y0 / 2 * uvs..][..uv_len]);
+            self.strip = Some(mb_y);
+            return;
+        }
         self.read_rows(y0, y1);
         self.convert_rows(y0, y1);
         if self.step == 4 {
@@ -152,6 +178,12 @@ impl<'a> Source<'a> {
             for band in (y0..y1).step_by(8) {
                 self.cleanup_band(y0, band, (y1 - band).min(8));
             }
+        }
+        if let Some(c) = self.cache.as_mut().filter(|c| mb_y == c.strips) {
+            c.y.extend_from_slice(&self.y[ys..][..y_len]);
+            c.u.extend_from_slice(&self.u[uvs..][..uv_len]);
+            c.v.extend_from_slice(&self.v[uvs..][..uv_len]);
+            c.strips += 1;
         }
         self.strip = Some(mb_y);
     }

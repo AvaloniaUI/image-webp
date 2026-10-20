@@ -63,6 +63,8 @@ pub(crate) struct Config {
     pub(crate) segments: i32,
     pub(crate) partition_limit: i32,
     pub(crate) preprocessing: i32,
+    /// Keep the converted picture between passes instead of converting it in each.
+    pub(crate) keep_strips: bool,
 }
 
 impl Config {
@@ -78,6 +80,7 @@ impl Config {
             segments: 4,
             partition_limit: 0,
             preprocessing: 0,
+            keep_strips: false,
         }
     }
 }
@@ -2490,6 +2493,9 @@ pub(crate) fn encode(
     mut config: Config,
 ) -> Result<EncodedFrame, crate::EncodingError> {
     let (width, height) = (src.width, src.height);
+    if config.keep_strips {
+        src.keep_strips();
+    }
     let (mut enc, part0, tokens) = loop {
         let mut enc = Encoder::new(config, src);
         enc.analyze();

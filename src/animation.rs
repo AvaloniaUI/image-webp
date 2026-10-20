@@ -1062,6 +1062,7 @@ fn encode_lossy(
         f32::from(params.lossy_quality.min(100)),
         i32::from(params.lossy_method.min(6)),
     );
+    config.keep_strips = true;
     if blended {
         config.filter_strength = 0;
     }
