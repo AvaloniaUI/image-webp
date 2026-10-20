@@ -90,6 +90,10 @@ pub(crate) struct Source<'a> {
     has_alpha: bool,
     /// Rows whose alpha has been looked at.
     alpha_rows: usize,
+    /// The alpha of the band `cleanup_band` works on.
+    band_alpha: Vec<u8>,
+    /// Whether each row of the strip in `rgb` is opaque.
+    opaque_rows: [bool; 16],
     cache: Option<StripCache>,
 }
 
@@ -129,6 +133,8 @@ impl<'a> Source<'a> {
             keep_alpha: true,
             has_alpha: false,
             alpha_rows: 0,
+            band_alpha: Vec::new(),
+            opaque_rows: [true; 16],
             cache: None,
         }
     }
@@ -193,8 +199,10 @@ impl<'a> Source<'a> {
         for row in y0..y1 {
             let line = &mut self.rgb[(row - y0) * stride..][..stride];
             (self.read_row)(row, line);
+            let is_opaque = self.step == 3 || opaque(line);
+            self.opaque_rows[row - y0] = is_opaque;
             if self.step == 4 && row == self.alpha_rows {
-                if !self.has_alpha && !opaque(line) {
+                if !self.has_alpha && !is_opaque {
                     self.has_alpha = true;
                     if self.keep_alpha {
                         self.alpha = Some(vec![0xff; self.width * self.height]);
@@ -229,8 +237,9 @@ impl<'a> Source<'a> {
                     convert_y::<4>(line, out);
                 }
             }
-            let rows_have_alpha = step == 4
-                && (0..if two { 2 } else { 1 }).any(|dy| !opaque(&src[dy * stride..][..stride]));
+            let rows_have_alpha = !self.opaque_rows[row - y0..][..if two { 2 } else { 1 }]
+                .iter()
+                .all(|&o| o);
             if rows_have_alpha {
                 accumulate_rgba(gt, src, rgb_stride, width, &mut self.tmp);
             } else {
@@ -250,11 +259,12 @@ impl<'a> Source<'a> {
         const SIZE: usize = 8;
         let width = self.width;
         let strip_row = band - y0 + 1;
-        let rows = &self.rgb[(band - y0) * width * 4..][..height * width * 4];
-        if opaque(rows) {
+        if self.opaque_rows[band - y0..][..height].iter().all(|&o| o) {
             return;
         }
-        let mut alpha = vec![0u8; rows.len() / 4];
+        let rows = &self.rgb[(band - y0) * width * 4..][..height * width * 4];
+        let mut alpha = std::mem::take(&mut self.band_alpha);
+        alpha.resize(rows.len() / 4, 0);
         alpha_of(rows, &mut alpha);
         let (ys, uvs) = (self.y_stride, self.uv_stride);
         let luma = &mut self.y[strip_row * ys..];
@@ -300,6 +310,7 @@ impl<'a> Source<'a> {
         if x < width {
             smoothen_block(&alpha[x..], width, &mut luma[x..], ys, width - x, height);
         }
+        self.band_alpha = alpha;
     }
 }
 
@@ -422,6 +433,17 @@ fn accumulate_rows<const STEP: usize>(
     }
 }
 
+/// The alpha-weighted average of channel `c` over the 2x2 pixels `a` (top) and `b` (bottom)
+/// whose alpha sums to `total_a`.
+#[inline(always)]
+fn weighted4(gt: &GammaTables, a: &[u8], b: &[u8], c: usize, total_a: u32) -> u16 {
+    let sum = u32::from(a[3]) * gt.linear(a[c])
+        + u32::from(a[7]) * gt.linear(a[c + 4])
+        + u32::from(b[3]) * gt.linear(b[c])
+        + u32::from(b[7]) * gt.linear(b[c + 4]);
+    gt.gamma((sum * INV_ALPHA[total_a as usize]) >> (ALPHA_FIX - 2), 0) as u16
+}
+
 fn accumulate_rgba(
     gt: &GammaTables,
     src: &[u8],
@@ -429,51 +451,39 @@ fn accumulate_rgba(
     width: usize,
     dst: &mut [[u16; 4]],
 ) {
-    let weighted = |p: usize, a: usize, total_a: u32, step: usize| {
-        let sum = u32::from(src[a]) * gt.linear(src[p])
-            + u32::from(src[a + step]) * gt.linear(src[p + step])
-            + u32::from(src[a + rgb_stride]) * gt.linear(src[p + rgb_stride])
-            + u32::from(src[a + rgb_stride + step]) * gt.linear(src[p + rgb_stride + step]);
-        gt.gamma((sum * INV_ALPHA[total_a as usize]) >> (ALPHA_FIX - 2), 0) as u16
-    };
-    let sum4 = |p: usize| {
-        let sum = gt.linear(src[p])
-            + gt.linear(src[p + 4])
-            + gt.linear(src[p + rgb_stride])
-            + gt.linear(src[p + rgb_stride + 4]);
-        gt.sum4_to_gamma[sum as usize & (SUM4_SIZE - 1)]
-    };
-    let sum2 = |p: usize| gt.gamma(gt.linear(src[p]) + gt.linear(src[p + rgb_stride]), 1) as u16;
-    for i in 0..width / 2 {
-        let j = i * 8;
-        let a = u32::from(src[j + 3])
-            + u32::from(src[j + 3 + rgb_stride])
-            + u32::from(src[j + 7])
-            + u32::from(src[j + 7 + rgb_stride]);
-        dst[i] = if a == 4 * 0xff || a == 0 {
-            [sum4(j), sum4(j + 1), sum4(j + 2), a as u16]
+    let r0 = &src[..width * 4];
+    let r1 = &src[rgb_stride..][..width * 4];
+    let pairs = r0.chunks_exact(8).zip(r1.chunks_exact(8));
+    for (d, (a, b)) in dst.iter_mut().zip(pairs) {
+        let total = u32::from(a[3]) + u32::from(a[7]) + u32::from(b[3]) + u32::from(b[7]);
+        *d = if total == 4 * 0xff || total == 0 {
+            [
+                sum4::<4>(gt, a, b, 0),
+                sum4::<4>(gt, a, b, 1),
+                sum4::<4>(gt, a, b, 2),
+                total as u16,
+            ]
         } else {
             [
-                weighted(j, j + 3, a, 4),
-                weighted(j + 1, j + 3, a, 4),
-                weighted(j + 2, j + 3, a, 4),
-                a as u16,
+                weighted4(gt, a, b, 0, total),
+                weighted4(gt, a, b, 1, total),
+                weighted4(gt, a, b, 2, total),
+                total as u16,
             ]
         };
     }
     if width & 1 != 0 {
-        let j = (width / 2) * 8;
-        let a = 2 * (u32::from(src[j + 3]) + u32::from(src[j + 3 + rgb_stride]));
-        dst[width / 2] = if a == 4 * 0xff || a == 0 {
-            [sum2(j), sum2(j + 1), sum2(j + 2), a as u16]
-        } else {
-            [
-                weighted(j, j + 3, a, 0),
-                weighted(j + 1, j + 3, a, 0),
-                weighted(j + 2, j + 3, a, 0),
-                a as u16,
-            ]
+        let (a, b) = (&r0[r0.len() - 4..], &r1[r1.len() - 4..]);
+        let total = 2 * (u32::from(a[3]) + u32::from(b[3]));
+        let s = |c: usize| match total {
+            0 | 0x3fc => gt.gamma(gt.linear(a[c]) + gt.linear(b[c]), 1) as u16,
+            _ => {
+                let sum =
+                    2 * (u32::from(a[3]) * gt.linear(a[c]) + u32::from(b[3]) * gt.linear(b[c]));
+                gt.gamma((sum * INV_ALPHA[total as usize]) >> (ALPHA_FIX - 2), 0) as u16
+            }
         };
+        dst[width / 2] = [s(0), s(1), s(2), total as u16];
     }
 }
 
@@ -485,6 +495,21 @@ fn smoothen_block(
     width: usize,
     height: usize,
 ) -> bool {
+    if width == 8 {
+        // Fully transparent or fully visible blocks, told from eight alpha bytes at a time.
+        let (mut any, mut zero_byte) = (0u64, 0u64);
+        for y in 0..height {
+            let r = u64::from_le_bytes(a[y * a_stride..][..8].try_into().unwrap());
+            any |= r;
+            zero_byte |= r.wrapping_sub(0x0101_0101_0101_0101) & !r & 0x8080_8080_8080_8080;
+        }
+        if any == 0 {
+            return true;
+        }
+        if zero_byte == 0 {
+            return false;
+        }
+    }
     let (mut sum, mut count) = (0u32, 0u32);
     for y in 0..height {
         let (a, luma) = (&a[y * a_stride..][..width], &luma[y * y_stride..][..width]);
