@@ -1017,7 +1017,8 @@ impl<R: BufRead> BitReader<R> {
             buf: Vec::new(),
             at: 0,
             val: 0,
-            bit_pos: 0,
+            // An empty window: the first fill goes the slow way, which starts the stream.
+            bit_pos: LBITS,
             eos: false,
             started: false,
         }
@@ -1051,6 +1052,7 @@ impl<R: BufRead> BitReader<R> {
 
     fn start(&mut self) -> Result<(), DecodingError> {
         self.started = true;
+        self.bit_pos = 0;
         for i in 0..8 {
             let Some(&b) = self.bytes()?.first() else { break };
             self.val |= u64::from(b) << (8 * i);
@@ -1082,8 +1084,28 @@ impl<R: BufRead> BitReader<R> {
         Ok(())
     }
 
-    /// `VP8LFillBitWindow`.
+    /// `VP8LFillBitWindow`. Short of the end of the read-ahead it shifts in every whole byte read
+    /// with one load: `val` holds the eight bytes before `at` either way, so the bits read and
+    /// the state at the end of the stream come out as libwebp's.
+    #[inline(always)]
     pub(crate) fn fill(&mut self) -> Result<(), DecodingError> {
+        if self.bit_pos < WBITS {
+            return Ok(());
+        }
+        if self.bit_pos < LBITS && self.buf.len() - self.at > 8 {
+            let w = u64::from_le_bytes(self.buf[self.at..self.at + 8].try_into().unwrap());
+            let shift = self.bit_pos & !7;
+            self.val = (self.val >> shift) | w << (LBITS - shift);
+            self.at += (shift / 8) as usize;
+            self.bit_pos &= 7;
+            return Ok(());
+        }
+        self.fill_slow()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn fill_slow(&mut self) -> Result<(), DecodingError> {
         if !self.started {
             self.start()?;
         }
@@ -1129,8 +1151,18 @@ impl<R: BufRead> BitReader<R> {
     }
 
     /// Advances, failing where that runs past the end of the stream.
+    #[inline(always)]
     pub(crate) fn consume(&mut self, num: u8) -> Result<(), DecodingError> {
         self.advance(num);
+        if self.eos || self.bit_pos > LBITS {
+            return self.check_end();
+        }
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn check_end(&mut self) -> Result<(), DecodingError> {
         if self.is_eos()? {
             return Err(DecodingError::BitStreamError);
         }
