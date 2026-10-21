@@ -204,9 +204,7 @@ impl<'a> FrameDecoder<'a> {
             Source::Lossless { bands, .. } if bands.at_start() && w * h <= LOSSLESS_WHOLE_RGB => {
                 let mut rgba = vec![0; w * h * 4];
                 bands.read_into(&mut rgba)?;
-                for (px, p) in buf.chunks_exact_mut(3).zip(rgba.chunks_exact(4)) {
-                    px.copy_from_slice(&p[..3]);
-                }
+                rgb_from_rgba(&rgba, buf);
                 true
             }
             _ => false,
@@ -257,14 +255,30 @@ impl<'a> FrameDecoder<'a> {
                 if self.bpp == 4 {
                     return Ok(Some((u32::from(y), rows)));
                 }
-                band.clear();
-                band.extend(rows.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
+                band.resize(rows.len() / 4 * 3, 0);
+                rgb_from_rgba(rows, band);
                 Ok(Some((u32::from(y), band)))
             }
             Source::ScaledLossless(s) => s.next_band(),
         }
     }
 
+}
+
+/// Drops the alpha of the RGBA pixels `rgba` into `rgb`, four pixels a step as three words.
+fn rgb_from_rgba(rgba: &[u8], rgb: &mut [u8]) {
+    let (quads, rest) = rgba.as_chunks::<16>();
+    let (triples, tail) = rgb.as_chunks_mut::<12>();
+    for (q, t) in quads.iter().zip(triples) {
+        let w = |i: usize| u32::from_le_bytes(q[4 * i..4 * i + 4].try_into().unwrap());
+        let (a, b, c, d) = (w(0), w(1), w(2), w(3));
+        t[..4].copy_from_slice(&(a & 0xff_ffff | b << 24).to_le_bytes());
+        t[4..8].copy_from_slice(&(b >> 8 & 0xffff | c << 16).to_le_bytes());
+        t[8..].copy_from_slice(&(c >> 16 & 0xff | d << 8).to_le_bytes());
+    }
+    for (px, p) in tail.chunks_exact_mut(3).zip(rest.chunks_exact(4)) {
+        px.copy_from_slice(&p[..3]);
+    }
 }
 
 /// The ALPH payload of `size` bytes at `at`, with libwebp's header checks.
@@ -382,7 +396,11 @@ impl<'a> ScaledLossless<'a> {
             premultiply(dst_row, true);
             match bpp {
                 4 => out.extend_from_slice(dst_row),
-                _ => out.extend(dst_row.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]])),
+                _ => {
+                    let at = out.len();
+                    out.resize(at + dst_row.len() / 4 * 3, 0);
+                    rgb_from_rgba(dst_row, &mut out[at..]);
+                }
             }
         }
     }
