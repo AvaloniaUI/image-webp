@@ -887,8 +887,6 @@ impl<'a> Vp8Decoder<'a> {
             }
         }
 
-        filter_level = filter_level.clamp(0, 63);
-
         if self.loop_filter_adjustments_enabled {
             filter_level += self.ref_delta[0];
             if macroblock.luma_mode == LumaMode::B {
@@ -1270,5 +1268,29 @@ fn filter_macroblock(p: &mut PlaneRefs, mbx: usize, mby: usize, f: MbFilter) {
             loop_filter::v16i(p.y, y, lw, limit, ilevel, hev);
             loop_filter::v8i(p.u, p.v, uv, cw, limit, ilevel, hev);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filter_level_clamps_once_after_the_deltas() {
+        let mut d = Vp8Decoder::new();
+        d.frame.filter_level = 60;
+        d.segments_enabled = true;
+        d.segment[0].delta_values = true;
+        d.segment[0].loopfilter_level = 20;
+        d.loop_filter_adjustments_enabled = true;
+        d.ref_delta[0] = -30;
+        d.mode_delta[0] = -8;
+        let mut mb = MacroBlock::default();
+        assert_eq!(d.calculate_filter_parameters(&mb).0, 50);
+        mb.luma_mode = LumaMode::B;
+        assert_eq!(d.calculate_filter_parameters(&mb).0, 42);
+        d.segment[0].loopfilter_level = -63;
+        d.ref_delta[0] = 10;
+        assert_eq!(d.calculate_filter_parameters(&mb).0, 0);
     }
 }
