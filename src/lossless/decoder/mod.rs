@@ -4,6 +4,8 @@
 
 mod huffman;
 mod reverse_transform;
+#[cfg(target_arch = "x86_64")]
+mod sse2;
 
 use std::io::{self, BufRead};
 use std::mem;

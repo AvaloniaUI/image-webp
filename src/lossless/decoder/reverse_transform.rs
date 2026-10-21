@@ -38,6 +38,9 @@ pub(crate) fn apply_predictor_transform(
     if y0 == 0 {
         let row = &mut image_data[width * 4..];
         row[3] = row[3].wrapping_add(255);
+        #[cfg(target_arch = "x86_64")]
+        super::sse2::predict_left(row, 4..width * 4);
+        #[cfg(not(target_arch = "x86_64"))]
         apply_predictor_transform_1(row, 4..width * 4, width);
     }
     for r in 1..=rows {
@@ -56,26 +59,36 @@ pub(crate) fn apply_predictor_transform(
             let start_index = (r * width + (block_x << size_bits).max(1)) * 4;
             let end_index = (r * width + ((block_x + 1) << size_bits).min(width)) * 4;
 
-            match predictor {
-                0 => apply_predictor_transform_0(image_data, start_index..end_index, width),
-                1 => apply_predictor_transform_1(image_data, start_index..end_index, width),
-                2 => apply_predictor_transform_2(image_data, start_index..end_index, width),
-                3 => apply_predictor_transform_3(image_data, start_index..end_index, width),
-                4 => apply_predictor_transform_4(image_data, start_index..end_index, width),
-                5 => apply_predictor_transform_5(image_data, start_index..end_index, width),
-                6 => apply_predictor_transform_6(image_data, start_index..end_index, width),
-                7 => apply_predictor_transform_7(image_data, start_index..end_index, width),
-                8 => apply_predictor_transform_8(image_data, start_index..end_index, width),
-                9 => apply_predictor_transform_9(image_data, start_index..end_index, width),
-                10 => apply_predictor_transform_10(image_data, start_index..end_index, width),
-                11 => apply_predictor_transform_11(image_data, start_index..end_index, width),
-                12 => apply_predictor_transform_12(image_data, start_index..end_index, width),
-                13 => apply_predictor_transform_13(image_data, start_index..end_index, width),
-                _ => apply_predictor_transform_0(image_data, start_index..end_index, width),
-            }
+            #[cfg(target_arch = "x86_64")]
+            super::sse2::predict(predictor, image_data, start_index..end_index, width);
+            #[cfg(not(target_arch = "x86_64"))]
+            predict_portable(predictor, image_data, start_index..end_index, width);
         }
     }
 }
+
+/// Undoes predictor `mode` over `image_data[range]` as [`apply_predictor_transform`] does per block.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+fn predict_portable(mode: u8, image_data: &mut [u8], range: Range<usize>, width: usize) {
+    match mode {
+        0 => apply_predictor_transform_0(image_data, range, width),
+        1 => apply_predictor_transform_1(image_data, range, width),
+        2 => apply_predictor_transform_2(image_data, range, width),
+        3 => apply_predictor_transform_3(image_data, range, width),
+        4 => apply_predictor_transform_4(image_data, range, width),
+        5 => apply_predictor_transform_5(image_data, range, width),
+        6 => apply_predictor_transform_6(image_data, range, width),
+        7 => apply_predictor_transform_7(image_data, range, width),
+        8 => apply_predictor_transform_8(image_data, range, width),
+        9 => apply_predictor_transform_9(image_data, range, width),
+        10 => apply_predictor_transform_10(image_data, range, width),
+        11 => apply_predictor_transform_11(image_data, range, width),
+        12 => apply_predictor_transform_12(image_data, range, width),
+        13 => apply_predictor_transform_13(image_data, range, width),
+        _ => apply_predictor_transform_0(image_data, range, width),
+    }
+}
+
 pub fn apply_predictor_transform_0(image_data: &mut [u8], range: Range<usize>, _width: usize) {
     assert!(range.end <= image_data.len());
     let mut i = range.start + 3;
@@ -361,6 +374,26 @@ pub(crate) fn apply_color_transform(
     size_bits: u8,
     transform_data: &[u8],
 ) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let block_xsize = usize::from(subsample_size(width, size_bits));
+        for (y, row) in (y0..).zip(image_data.chunks_exact_mut(usize::from(width) * 4)) {
+            let start = (y >> size_bits) * block_xsize * 4;
+            super::sse2::color_transform_row(row, 1 << size_bits, &transform_data[start..start + block_xsize * 4]);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    apply_color_transform_portable(image_data, width, y0, size_bits, transform_data);
+}
+
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+pub(crate) fn apply_color_transform_portable(
+    image_data: &mut [u8],
+    width: u16,
+    y0: usize,
+    size_bits: u8,
+    transform_data: &[u8],
+) {
     let block_xsize = usize::from(subsample_size(width, size_bits));
     let width = usize::from(width);
 
@@ -396,6 +429,14 @@ pub(crate) fn apply_color_transform(
 }
 
 pub(crate) fn apply_subtract_green_transform(image_data: &mut [u8]) {
+    #[cfg(target_arch = "x86_64")]
+    super::sse2::add_green(image_data);
+    #[cfg(not(target_arch = "x86_64"))]
+    apply_subtract_green_portable(image_data);
+}
+
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+pub(crate) fn apply_subtract_green_portable(image_data: &mut [u8]) {
     for pixel in image_data.chunks_exact_mut(4) {
         pixel[0] = pixel[0].wrapping_add(pixel[1]);
         pixel[2] = pixel[2].wrapping_add(pixel[1]);
