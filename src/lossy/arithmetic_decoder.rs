@@ -44,7 +44,7 @@ impl Bits for ColdBits<'_> {
     }
 
     fn sign(&mut self) -> bool {
-        self.bit(128)
+        self.decoder.cold_read_sign().or_accumulate(self.res)
     }
 }
 
@@ -156,39 +156,81 @@ const WINDOW: usize = 64 * 1024;
 /// data, are 6650 bytes, and the reader looks 8 bytes ahead.
 const MARGIN: usize = 16 * 1024;
 
-/// A partition's bits, read four bytes at a time from a window of the partition that
-/// [`top_up`](Self::top_up) refills from the data.
+/// A partition's bits from a window of the partition that [`top_up`](Self::top_up) refills
+/// from the data, read as libwebp's 64-bit reader reads them: seven bytes at a time while
+/// eight are left, then one at a time. A corrupt stream can carry bits past the top of
+/// `value`, which the load sizes then decide.
 #[cfg_attr(test, derive(Debug))]
 pub(crate) struct ArithmeticDecoder {
-    chunks: Vec<[u8; 4]>,
+    /// The window's `len` bytes and [`PAD`] zeros, which loads past the end read.
+    bytes: Vec<u8>,
+    len: usize,
     state: State,
-    final_bytes: [u8; 3],
-    final_bytes_remaining: i8,
+    /// Whether a read went past the end of the data.
+    eof: bool,
     /// Where the bytes not yet in the window start, and where the partition ends.
     next: u64,
     end: u64,
 }
 
+const PAD: usize = 8;
+
 #[cfg_attr(test, derive(Debug))]
 #[derive(Clone, Copy)]
 struct State {
-    chunk_index: usize,
+    /// Where the bytes not yet in `value` start.
+    pos: usize,
     value: u64,
     /// The range minus one, as libwebp keeps it.
     range: u32,
     bit_count: i32,
 }
 
+impl State {
+    /// `VP8GetBit` once `bit_count` is not negative. libwebp compares the low 32 bits of the
+    /// value at the bit position, which a corrupt stream carries bits above.
+    #[inline(always)]
+    fn bit(&mut self, probability: u8) -> bool {
+        let split = (self.range * u32::from(probability)) >> 8;
+        let bit = (self.value >> self.bit_count) as u32 > split;
+        let range = if bit {
+            self.value -= u64::from(split + 1) << self.bit_count;
+            self.range - split
+        } else {
+            split + 1
+        };
+        // `range` fits a byte, so its leading zeros there are the shift back to 128..=254.
+        let shift = (range as u8).leading_zeros();
+        self.bit_count -= shift as i32;
+        self.range = (range << shift) - 1;
+        bit
+    }
+
+    /// `VP8GetSigned` once `bit_count` is not negative: a bit of probability one half whose
+    /// renormalization is always one bit.
+    #[inline(always)]
+    fn sign(&mut self) -> bool {
+        let split = self.range >> 1;
+        let value = (self.value >> self.bit_count) as u32;
+        let mask = ((split.wrapping_sub(value) as i32) >> 31) as u32;
+        self.value -= u64::from((split + 1) & mask) << self.bit_count;
+        self.range = self.range.wrapping_add(mask) | 1;
+        self.bit_count -= 1;
+        mask != 0
+    }
+}
+
 #[cfg_attr(test, derive(Debug))]
 struct FastDecoder<'a> {
-    chunks: &'a [[u8; 4]],
+    bytes: &'a [u8],
+    len: usize,
     uncommitted_state: State,
     save_state: &'a mut State,
 }
 
 impl ArithmeticDecoder {
     const START: State = State {
-        chunk_index: 0,
+        pos: 0,
         value: 0,
         range: 254,
         bit_count: -8,
@@ -196,25 +238,25 @@ impl ArithmeticDecoder {
 
     pub(crate) fn new() -> Self {
         ArithmeticDecoder {
-            chunks: Vec::new(),
+            bytes: vec![0; PAD],
+            len: 0,
             state: Self::START,
-            final_bytes: [0; 3],
-            final_bytes_remaining: Self::FINAL_BYTES_REMAINING_EOF,
+            eof: true,
             next: 0,
             end: 0,
         }
     }
 
-    /// Reads `data`, four bytes at a time and its last 0 to 3 bytes one by one.
+    /// Reads `data`.
     pub(crate) fn init(&mut self, data: &[u8]) {
-        let (chunks, tail) = data.as_chunks::<4>();
-        let mut final_bytes = [0; 3];
-        final_bytes[..tail.len()].copy_from_slice(tail);
+        let mut bytes = Vec::with_capacity(data.len() + PAD);
+        bytes.extend_from_slice(data);
+        bytes.resize(data.len() + PAD, 0);
         *self = Self {
-            chunks: chunks.to_vec(),
+            bytes,
+            len: data.len(),
             state: Self::START,
-            final_bytes,
-            final_bytes_remaining: tail.len() as i8,
+            eof: false,
             next: 0,
             end: 0,
         };
@@ -224,10 +266,10 @@ impl ArithmeticDecoder {
     /// [`top_up`](Self::top_up).
     pub(crate) fn init_window(&mut self, r: &mut dyn ReadSeek, start: u64, end: u64) -> Result<(), DecodingError> {
         *self = Self {
-            chunks: Vec::with_capacity(WINDOW.min((end - start) as usize).div_ceil(4)),
+            bytes: Vec::with_capacity(WINDOW.min((end - start) as usize) + PAD),
+            len: 0,
             state: Self::START,
-            final_bytes: [0; 3],
-            final_bytes_remaining: 0,
+            eof: false,
             next: start,
             end,
         };
@@ -237,24 +279,21 @@ impl ArithmeticDecoder {
     /// Refills the window from `r` unless it holds what a macroblock may read or the rest of
     /// the partition.
     pub(crate) fn top_up(&mut self, r: &mut dyn ReadSeek) -> Result<(), DecodingError> {
-        let held = (self.chunks.len() - self.state.chunk_index) * 4;
+        let held = self.len - self.state.pos;
         if held >= MARGIN || self.next == self.end {
             return Ok(());
         }
-        self.chunks.drain(..self.state.chunk_index);
-        self.state.chunk_index = 0;
+        self.bytes.truncate(self.len);
+        self.bytes.drain(..self.state.pos);
+        self.state.pos = 0;
         let left = self.end - self.next;
         let last = left <= (WINDOW - held) as u64;
         let read = if last { left as usize } else { (WINDOW - held) & !3 };
-        let at = self.chunks.len();
-        self.chunks.resize(at + read / 4, [0; 4]);
+        self.bytes.resize(held + read, 0);
         r.seek(SeekFrom::Start(self.next))?;
-        r.read_exact(self.chunks[at..].as_flattened_mut())?;
-        if last {
-            let tail = read % 4;
-            r.read_exact(&mut self.final_bytes[..tail])?;
-            self.final_bytes_remaining = tail as i8;
-        }
+        r.read_exact(&mut self.bytes[held..])?;
+        self.len = held + read;
+        self.bytes.resize(self.len + PAD, 0);
         self.next += read as u64;
         Ok(())
     }
@@ -415,9 +454,9 @@ impl ArithmeticDecoder {
     // bits under an assumption and validates it at the end.
     //
     // The idea here is that for normal-sized webp images, the vast majority
-    // of bits are somewhere other than in the last four bytes. Therefore we
+    // of bits are somewhere other than in the last seven bytes. Therefore we
     // can pretend the buffer has infinite size. After we are done reading,
-    // we check if we actually read past the end of `self.chunks`.
+    // we check if we actually read past the end of `self.bytes`.
     // If so, we backtrack (or rather we discard `uncommitted_state`)
     // and try again with the slow approach. This might result in doing double
     // work for those last few bytes -- in fact we even keep retrying the fast
@@ -425,78 +464,50 @@ impl ArithmeticDecoder {
     // speeding up reading from the other thousands or millions of bytes.
     fn fast(&mut self) -> FastDecoder<'_> {
         FastDecoder {
-            chunks: &self.chunks,
+            bytes: &self.bytes,
+            len: self.len,
             uncommitted_state: self.state,
             save_state: &mut self.state,
         }
     }
 
-    const FINAL_BYTES_REMAINING_EOF: i8 = -0xE;
-
-    fn load_from_final_bytes(&mut self) {
-        match self.final_bytes_remaining {
-            1.. => {
-                self.final_bytes_remaining -= 1;
-                let byte = self.final_bytes[0];
-                self.final_bytes.rotate_left(1);
-                self.state.value <<= 8;
-                self.state.value |= u64::from(byte);
-                self.state.bit_count += 8;
-            }
-            _ => {
-                self.final_bytes_remaining = Self::FINAL_BYTES_REMAINING_EOF;
-            }
-        }
-    }
-
     fn is_past_eof(&self) -> bool {
-        self.final_bytes_remaining == Self::FINAL_BYTES_REMAINING_EOF
+        self.eof
     }
 
     fn cold_read_bit(&mut self, probability: u8) -> BitResult<bool> {
+        if !self.cold_load() {
+            return BitResult::err();
+        }
+        BitResult::ok(self.state.bit(probability))
+    }
+
+    fn cold_read_sign(&mut self) -> BitResult<bool> {
+        if !self.cold_load() {
+            return BitResult::err();
+        }
+        BitResult::ok(self.state.sign())
+    }
+
+    /// `VP8LoadNewBytes` where `bit_count` is negative, false past the end of the data.
+    fn cold_load(&mut self) -> bool {
         if self.state.bit_count < 0 {
-            if let Some(chunk) = self.chunks.get(self.state.chunk_index).copied() {
-                let v = u32::from_be_bytes(chunk);
-                self.state.chunk_index += 1;
-                self.state.value <<= 32;
-                self.state.value |= u64::from(v);
-                self.state.bit_count += 32;
+            let pos = self.state.pos;
+            if pos + 8 <= self.len {
+                let w = u64::from_be_bytes(self.bytes[pos..pos + 8].try_into().unwrap());
+                self.state.pos += 7;
+                self.state.value = self.state.value << 56 | w >> 8;
+                self.state.bit_count += 56;
+            } else if pos < self.len {
+                self.state.pos += 1;
+                self.state.value = self.state.value << 8 | u64::from(self.bytes[pos]);
+                self.state.bit_count += 8;
             } else {
-                self.load_from_final_bytes();
-                if self.is_past_eof() {
-                    return BitResult::err();
-                }
+                self.eof = true;
+                return false;
             }
         }
-        debug_assert!(self.state.bit_count >= 0);
-
-        let probability = u32::from(probability);
-        let mut range = self.state.range + 1;
-        let split = 1 + (((range - 1) * probability) >> 8);
-        let bigsplit = u64::from(split) << self.state.bit_count;
-
-        let retval = if let Some(new_value) = self.state.value.checked_sub(bigsplit) {
-            range -= split;
-            self.state.value = new_value;
-            true
-        } else {
-            range = split;
-            false
-        };
-        debug_assert!(range > 0);
-
-        // Compute shift required to satisfy `range >= 128`.
-        // Apply that shift to `range` and `self.state.bitcount`.
-        //
-        // Subtract 24 because we only care about leading zeros in the
-        // lowest byte of `range` which is a `u32`.
-        let shift = range.leading_zeros().saturating_sub(24);
-        range <<= shift;
-        self.state.bit_count -= shift as i32;
-        debug_assert!(range >= 128);
-        self.state.range = range - 1;
-
-        BitResult::ok(retval)
+        true
     }
 
     #[cold]
@@ -569,9 +580,10 @@ impl ArithmeticDecoder {
 
 impl FastDecoder<'_> {
     fn commit_if_valid<T>(self, value_if_not_past_eof: T) -> Option<T> {
-        // If `chunk_index > self.chunks.len()`, it means we used zeroes
-        // instead of an actual chunk and `value_if_not_past_eof` is nonsense.
-        if self.uncommitted_state.chunk_index <= self.chunks.len() {
+        // libwebp loads seven bytes while eight are left and then one at a time: a load
+        // short of that read the padding, and `value_if_not_past_eof` is nonsense.
+        let pos = self.uncommitted_state.pos;
+        if pos < self.len || pos == self.save_state.pos {
             *self.save_state = self.uncommitted_state;
             Some(value_if_not_past_eof)
         } else {
@@ -615,146 +627,36 @@ impl FastDecoder<'_> {
         self.commit_if_valid(value)
     }
 
+    /// Seven more bytes into `value`, as `VP8LoadNewBytes` with eight bytes left; with fewer
+    /// it reads the padding, and `commit_if_valid` turns down what was read then.
+    #[inline(always)]
+    fn load(&mut self) {
+        let st = &mut self.uncommitted_state;
+        let at = st.pos.min(self.len);
+        let w = u64::from_be_bytes(self.bytes[at..at + 8].try_into().unwrap());
+        st.pos += 7;
+        st.value = st.value << 56 | w >> 8;
+        st.bit_count += 56;
+    }
+
     #[inline(always)]
     fn fast_read_bit(&mut self, probability: u8) -> bool {
-        let State {
-            mut chunk_index,
-            mut value,
-            range,
-            mut bit_count,
-        } = self.uncommitted_state;
-
-        if bit_count < 0 {
-            let chunk = self.chunks.get(chunk_index).copied();
-            // We ignore invalid data inside the `fast_` functions,
-            // but we increase `chunk_index` below, so we can check
-            // whether we read invalid data in `commit_if_valid`.
-            let chunk = chunk.unwrap_or_default();
-
-            let v = u32::from_be_bytes(chunk);
-            chunk_index += 1;
-            value <<= 32;
-            value |= u64::from(v);
-            bit_count += 32;
+        if self.uncommitted_state.bit_count < 0 {
+            self.load();
         }
-        debug_assert!(bit_count >= 0);
-
-        // libwebp's `VP8GetBit`: `range` is the range minus one, `new_range` the range.
-        debug_assert!((127..=254).contains(&range));
-        let split = (range * u32::from(probability)) >> 8;
-        let retval = (value >> bit_count) > u64::from(split);
-        let new_range = if retval {
-            value -= u64::from(split + 1) << bit_count;
-            range - split
-        } else {
-            split + 1
-        };
-
-        // `new_range` fits a byte, so its leading zeros there are the shift back to 128..=254.
-        debug_assert!((1..=254).contains(&new_range));
-        let shift = (new_range as u8).leading_zeros();
-        bit_count -= shift as i32;
-        self.uncommitted_state = State {
-            chunk_index,
-            value,
-            range: (new_range << shift) - 1,
-            bit_count,
-        };
-        retval
+        self.uncommitted_state.bit(probability)
     }
 
     fn fast_read_flag(&mut self) -> bool {
-        let State {
-            mut chunk_index,
-            mut value,
-            mut range,
-            mut bit_count,
-        } = self.uncommitted_state;
-
-        if bit_count < 0 {
-            let chunk = self.chunks.get(chunk_index).copied();
-            // We ignore invalid data inside the `fast_` functions,
-            // but we increase `chunk_index` below, so we can check
-            // whether we read invalid data in `commit_if_valid`.
-            let chunk = chunk.unwrap_or_default();
-
-            let v = u32::from_be_bytes(chunk);
-            chunk_index += 1;
-            value <<= 32;
-            value |= u64::from(v);
-            bit_count += 32;
-        }
-        debug_assert!(bit_count >= 0);
-
-        range += 1;
-        debug_assert!((128..=255).contains(&range));
-        let half_range = range / 2;
-        let split = range - half_range;
-        let bigsplit = u64::from(split) << bit_count;
-
-        let retval = if let Some(new_value) = value.checked_sub(bigsplit) {
-            range = half_range;
-            value = new_value;
-            true
-        } else {
-            range = split;
-            false
-        };
-
-        // Compute shift required to satisfy `range >= 128`.
-        // A `range` of 64..127 requires a shift of 1. No shift if `range` is 128.
-        // Apply that shift to `range` and `self.bitcount`.
-        debug_assert!((64..=128).contains(&range));
-        let shift = if range == 0x80 { 0 } else { 1 };
-        range <<= shift;
-        bit_count -= shift;
-
-        debug_assert!((128..=254).contains(&range));
-        self.uncommitted_state = State {
-            chunk_index,
-            value,
-            range: range - 1,
-            bit_count,
-        };
-        retval
+        self.fast_read_bit(128)
     }
 
-    /// `fast_read_flag` for a sign: never the first bit of a stream, so the range is at
-    /// most 254 and the renormalization always shifts by one.
     #[inline(always)]
     fn fast_read_sign(&mut self) -> bool {
-        let State {
-            mut chunk_index,
-            mut value,
-            range,
-            mut bit_count,
-        } = self.uncommitted_state;
-
-        if bit_count < 0 {
-            let chunk = self.chunks.get(chunk_index).copied().unwrap_or_default();
-            chunk_index += 1;
-            value <<= 32;
-            value |= u64::from(u32::from_be_bytes(chunk));
-            bit_count += 32;
+        if self.uncommitted_state.bit_count < 0 {
+            self.load();
         }
-
-        // libwebp's `VP8GetSigned`, with `range` the range minus one.
-        debug_assert!((127..=253).contains(&range));
-        let split = range >> 1;
-        let retval = (value >> bit_count) > u64::from(split);
-        let new_range = if retval {
-            value -= u64::from(split + 1) << bit_count;
-            range - split
-        } else {
-            split + 1
-        };
-        self.uncommitted_state = State {
-            chunk_index,
-            value,
-            range: (new_range << 1) - 1,
-            bit_count: bit_count - 1,
-        };
-        retval
+        self.uncommitted_state.sign()
     }
 
     fn fast_read_literal(&mut self, n: u8) -> u8 {

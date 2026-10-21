@@ -287,6 +287,19 @@ fn decodes_as_libwebp() {
             }
             add(compare(&format!("{name} variant {k}"), &d, false, &mut shown));
         }
+        // A partition starting with 0xff carries bits past the top of the reader's value,
+        // where libwebp's load sizes decide what comes out.
+        if data.len() > 40 && &data[12..16] == b"VP8 " && data[23..26] == [0x9d, 0x01, 0x2a] {
+            let size0 = (u32::from_le_bytes([data[20], data[21], data[22], 0]) >> 5) as usize;
+            for at in [30, 30 + size0] {
+                for run in [1, 2, 9] {
+                    let mut d = data.clone();
+                    let end = (at + run).min(d.len());
+                    d[at.min(end)..end].fill(0xff);
+                    add(compare(&format!("{name} 0xff x{run} at {at}"), &d, false, &mut shown));
+                }
+            }
+        }
     }
     eprintln!("{n} decodes, {diff} differences");
     assert_eq!(diff, 0);
