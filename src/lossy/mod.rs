@@ -687,26 +687,9 @@ impl<'a> Vp8Decoder<'a> {
             }
         }
 
-        for y in 0usize..2 {
-            for x in 0usize..2 {
-                let i = x + y * 2;
-                let pos = (1 + y * 4) * stride + 1 + x * 4;
-                transform::add_coeffs(
-                    uws,
-                    &resdata[(16 + i) * 16..][..16],
-                    kinds[16 + i],
-                    pos,
-                    stride,
-                );
-                transform::add_coeffs(
-                    vws,
-                    &resdata[(20 + i) * 16..][..16],
-                    kinds[20 + i],
-                    pos,
-                    stride,
-                );
-            }
-        }
+        let pos = stride + 1;
+        transform::add_coeffs_uv(uws, &resdata[16 * 16..][..64], &kinds[16..20], pos, stride);
+        transform::add_coeffs_uv(vws, &resdata[20 * 16..][..64], &kinds[20..24], pos, stride);
 
         self.top_border_u[mbx * 8..][..8].copy_from_slice(&uws[8 * stride + 1..][..8]);
         self.top_border_v[mbx * 8..][..8].copy_from_slice(&vws[8 * stride + 1..][..8]);
@@ -781,15 +764,6 @@ impl<'a> Vp8Decoder<'a> {
             plane = Plane::YCoeff1;
         }
         let first = usize::from(plane == Plane::YCoeff1);
-        let kind = |n: usize, dc: i32| {
-            if n > 1 {
-                transform::FULL
-            } else if dc != 0 {
-                transform::DC_ONLY
-            } else {
-                transform::NO_COEFFS
-            }
-        };
 
         for y in 0usize..4 {
             let mut left = self.left.complexity[y + 1];
@@ -802,7 +776,7 @@ impl<'a> Vp8Decoder<'a> {
                 let acq = self.segment[sindex].yac;
 
                 let n = self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
-                kinds[i] = kind(n, block[0]);
+                kinds[i] = transform::luma_kind(n, block);
 
                 left = u8::from(n > first);
                 self.top[mbx].complexity[x + 1] = left;
@@ -827,7 +801,7 @@ impl<'a> Vp8Decoder<'a> {
 
                     let n =
                         self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
-                    kinds[i] = kind(n, block[0]);
+                    kinds[i] = transform::kind(n, block[0]);
 
                     left = u8::from(n > 0);
                     self.top[mbx].complexity[x + j] = left;

@@ -50,31 +50,121 @@ pub(crate) fn idct4x4(block: &mut [i32]) {
     }
 }
 
+// The kinds of inverse transform a block needs, after libwebp's `NzCodeBits` classes.
 /// A block without coefficients to add.
 pub(crate) const NO_COEFFS: u8 = 0;
 /// A block with only a DC coefficient (libwebp's `TransformDC`).
 pub(crate) const DC_ONLY: u8 = 1;
+/// A luma block with coefficients only among the first three in zigzag order, large enough that
+/// libwebp's `TransformAC3` gives other pixels than the 16-bit full transform.
+pub(crate) const AC3: u8 = 2;
 /// A block that needs the full inverse transform.
-pub(crate) const FULL: u8 = 2;
+pub(crate) const FULL: u8 = 3;
 
-/// Adds the inverse transform of `block` (16 coefficients), of kind [`NO_COEFFS`],
-/// [`DC_ONLY`] or [`FULL`], to the 4x4 pixels at `pos` of `dst`.
+/// The kind of transform of a chroma block, from the end `n` of its coefficients as libwebp's
+/// `GetCoeffs` returns it and its DC.
+#[inline(always)]
+pub(crate) fn kind(n: usize, dc: i32) -> u8 {
+    if n > 1 {
+        FULL
+    } else if dc != 0 {
+        DC_ONLY
+    } else {
+        NO_COEFFS
+    }
+}
+
+/// The kind of transform of a luma block, as [`kind`].
+#[inline(always)]
+pub(crate) fn luma_kind(n: usize, block: &[i32; 16]) -> u8 {
+    if n > 1 {
+        // libwebp has no SIMD TransformAC3 on x86: its C version computes in 32 bits. The 16-bit
+        // full transform gives the same pixels while the coefficients cannot wrap.
+        if cfg!(target_arch = "x86_64")
+            && n <= 3
+            && ((block[0] + 8192) | (block[1] + 8192) | (block[4] + 8192)) as u32 >= 16384
+        {
+            AC3
+        } else {
+            FULL
+        }
+    } else if block[0] != 0 {
+        DC_ONLY
+    } else {
+        NO_COEFFS
+    }
+}
+
+/// Adds the inverse transform of luma `block` (16 coefficients), of `kind`, to the 4x4 pixels
+/// at `pos` of `dst`, as libwebp's `DoTransform`.
 #[inline]
 pub(crate) fn add_coeffs(dst: &mut [u8], block: &[i32], kind: u8, pos: usize, stride: usize) {
     match kind {
         NO_COEFFS => {}
-        DC_ONLY => {
-            let dc = (block[0] + 4) >> 3;
-            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-            super::simd::add_dc(dc, dst, pos, stride);
-            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-            add_dc_portable(dc, dst, pos, stride);
+        DC_ONLY => add_dc((block[0] + 4) >> 3, dst, pos, stride),
+        AC3 => transform_ac3_add(block, dst, pos, stride),
+        _ => transform_add(block, dst, pos, stride),
+    }
+}
+
+/// Adds the inverse transforms of the four `blocks` of a chroma plane, of `kinds`, to its 8x8
+/// pixels at `pos` of `dst`. As libwebp's `DoUVTransform` on x86, a plane with AC coefficients
+/// in any block takes the full transform on all four, two at a time.
+#[inline(always)]
+pub(crate) fn add_coeffs_uv(
+    dst: &mut [u8],
+    blocks: &[i32],
+    kinds: &[u8],
+    pos: usize,
+    stride: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if kinds[..4].contains(&FULL) {
+        super::simd::transform_add_two(&blocks[..32], dst, pos, stride);
+        super::simd::transform_add_two(&blocks[32..64], dst, pos + 4 * stride, stride);
+        return;
+    }
+    for (i, &kind) in kinds[..4].iter().enumerate() {
+        let block = &blocks[i * 16..][..16];
+        let pos = pos + (i / 2) * 4 * stride + (i % 2) * 4;
+        match kind {
+            NO_COEFFS => {}
+            DC_ONLY => add_dc((block[0] + 4) >> 3, dst, pos, stride),
+            _ => transform_add(block, dst, pos, stride),
         }
-        _ => {
-            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-            super::simd::transform_add(block, dst, pos, stride);
-            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-            transform_add_portable(block, dst, pos, stride);
+    }
+}
+
+#[inline(always)]
+fn add_dc(dc: i32, dst: &mut [u8], pos: usize, stride: usize) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    super::simd::add_dc(dc, dst, pos, stride);
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    add_dc_portable(dc, dst, pos, stride);
+}
+
+#[inline(always)]
+fn transform_add(block: &[i32], dst: &mut [u8], pos: usize, stride: usize) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    super::simd::transform_add(block, dst, pos, stride);
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    transform_add_portable(block, dst, pos, stride);
+}
+
+/// libwebp's `TransformAC3_C`: the inverse transform of `block`, whose only coefficients are
+/// 0, 1 and 4, added to the 4x4 pixels at `pos` of `dst`.
+#[cold]
+#[inline(never)]
+fn transform_ac3_add(block: &[i32], dst: &mut [u8], pos: usize, stride: usize) {
+    let mul1 = |a: i32| ((a * 20091) >> 16) + a;
+    let mul2 = |a: i32| (a * 35468) >> 16;
+    let a = block[0] + 4;
+    let (c4, d4) = (mul2(block[4]), mul1(block[4]));
+    let (c1, d1) = (mul2(block[1]), mul1(block[1]));
+    for (y, dc) in [a + d4, a + c4, a - c4, a - d4].into_iter().enumerate() {
+        let row = &mut dst[pos + y * stride..][..4];
+        for (p, v) in row.iter_mut().zip([dc + d1, dc + c1, dc - c1, dc - d1]) {
+            *p = (i32::from(*p) + (v >> 3)).clamp(0, 255) as u8;
         }
     }
 }
@@ -206,6 +296,68 @@ mod tests {
             let dc = (block[0] * 4 + 4) >> 3;
             add_dc_portable(dc, &mut a, 1, stride);
             crate::lossy::simd::add_dc(dc, &mut b, 1, stride);
+            assert_eq!(a, b, "dc {dc}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn two_blocks_match_one_at_a_time() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let stride = 13;
+        for round in 0..20000 {
+            let range = [8, 1000, 32767][round % 3];
+            let blocks: [i32; 32] = core::array::from_fn(|_| rng.gen_range(-range..=range));
+            let dst: Vec<u8> = (0..4 * stride).map(|_| rng.gen()).collect();
+            let (mut a, mut b) = (dst.clone(), dst);
+            crate::lossy::simd::transform_add(&blocks[..16], &mut a, 1, stride);
+            crate::lossy::simd::transform_add(&blocks[16..], &mut a, 5, stride);
+            crate::lossy::simd::transform_add_two(&blocks, &mut b, 1, stride);
+            assert_eq!(a, b, "{blocks:?}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ac3_matches_the_32_bit_transform() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(10);
+        let stride = 9;
+        for round in 0..30000 {
+            let range = [100, 2048, 8192, 32767][round % 4];
+            let mut block = [0i32; 16];
+            for k in [0, 1, 4] {
+                block[k] = rng.gen_range(-range..=range);
+            }
+            if round < 8 {
+                block[0] = [32767, -32768][round & 1];
+                block[1] = [32767, -32768][(round >> 1) & 1];
+                block[4] = [32767, -32768][(round >> 2) & 1];
+            }
+            let dst: Vec<u8> = (0..4 * stride).map(|_| rng.gen()).collect();
+            let (mut a, mut b, mut c) = (dst.clone(), dst.clone(), dst);
+            transform_add_portable(&block, &mut a, 1, stride);
+            transform_ac3_add(&block, &mut b, 1, stride);
+            assert_eq!(a, b, "{block:?}");
+            add_coeffs(&mut c, &block, luma_kind(3, &block), 1, stride);
+            assert_eq!(a, c, "{block:?}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn chroma_planes_with_ac_take_the_full_transform_on_every_block() {
+        let stride = 9;
+        for dc in i32::from(i16::MIN)..=i32::from(i16::MAX) {
+            let mut blocks = [0i32; 64];
+            blocks[0] = dc;
+            blocks[16 + 1] = 1;
+            let dst: Vec<u8> = (0..8 * stride).map(|i| (i * 37) as u8).collect();
+            let (mut a, mut b) = (dst.clone(), dst);
+            add_coeffs_uv(&mut a, &blocks, &[DC_ONLY, FULL, 0, 0], 1, stride);
+            crate::lossy::simd::transform_add(&blocks[..16], &mut b, 1, stride);
+            crate::lossy::simd::transform_add(&blocks[16..32], &mut b, 5, stride);
             assert_eq!(a, b, "dc {dc}");
         }
     }

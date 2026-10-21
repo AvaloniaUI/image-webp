@@ -623,6 +623,42 @@ unsafe fn transpose_2_4x4(i0: __m128i, i1: __m128i, i2: __m128i, i3: __m128i) ->
     ]
 }
 
+/// The two passes of libwebp's `Transform_SSE2` on the coefficient rows of one or two blocks,
+/// side by side: the rows of pixel differences.
+#[inline(always)]
+unsafe fn transform_rows(rows: [__m128i; 4]) -> [__m128i; 4] {
+    let k1 = _mm_set1_epi16(20091);
+    let k2 = _mm_set1_epi16(-30068);
+    let pass = |i0: __m128i, i1: __m128i, i2: __m128i, i3: __m128i| {
+        let a = _mm_add_epi16(i0, i2);
+        let b = _mm_sub_epi16(i0, i2);
+        let c = _mm_add_epi16(
+            _mm_sub_epi16(i1, i3),
+            _mm_sub_epi16(_mm_mulhi_epi16(i1, k2), _mm_mulhi_epi16(i3, k1)),
+        );
+        let d = _mm_add_epi16(
+            _mm_add_epi16(i1, i3),
+            _mm_add_epi16(_mm_mulhi_epi16(i1, k1), _mm_mulhi_epi16(i3, k2)),
+        );
+        [
+            _mm_add_epi16(a, d),
+            _mm_add_epi16(b, c),
+            _mm_sub_epi16(b, c),
+            _mm_sub_epi16(a, d),
+        ]
+    };
+    let [r0, r1, r2, r3] = rows;
+    let [t0, t1, t2, t3] = pass(r0, r1, r2, r3);
+    let [t0, t1, t2, t3] = transpose_2_4x4(t0, t1, t2, t3);
+    let [s0, s1, s2, s3] = pass(_mm_add_epi16(t0, _mm_set1_epi16(4)), t1, t2, t3);
+    transpose_2_4x4(
+        _mm_srai_epi16::<3>(s0),
+        _mm_srai_epi16::<3>(s1),
+        _mm_srai_epi16::<3>(s2),
+        _mm_srai_epi16::<3>(s3),
+    )
+}
+
 /// libwebp's `Transform_SSE2` for one block: the inverse transform of `block` (16
 /// coefficients that fit 16 bits) added to the 4x4 pixels at `pos` of `dst`.
 pub(crate) fn transform_add(block: &[i32], dst: &mut [u8], pos: usize, stride: usize) {
@@ -633,35 +669,7 @@ pub(crate) fn transform_add(block: &[i32], dst: &mut [u8], pos: usize, stride: u
             let v = _mm_loadu_si128(block.as_ptr().add(4 * r).cast());
             _mm_packs_epi32(v, v)
         };
-        let k1 = _mm_set1_epi16(20091);
-        let k2 = _mm_set1_epi16(-30068);
-        let pass = |i0: __m128i, i1: __m128i, i2: __m128i, i3: __m128i| {
-            let a = _mm_add_epi16(i0, i2);
-            let b = _mm_sub_epi16(i0, i2);
-            let c = _mm_add_epi16(
-                _mm_sub_epi16(i1, i3),
-                _mm_sub_epi16(_mm_mulhi_epi16(i1, k2), _mm_mulhi_epi16(i3, k1)),
-            );
-            let d = _mm_add_epi16(
-                _mm_add_epi16(i1, i3),
-                _mm_add_epi16(_mm_mulhi_epi16(i1, k1), _mm_mulhi_epi16(i3, k2)),
-            );
-            [
-                _mm_add_epi16(a, d),
-                _mm_add_epi16(b, c),
-                _mm_sub_epi16(b, c),
-                _mm_sub_epi16(a, d),
-            ]
-        };
-        let [t0, t1, t2, t3] = pass(row(0), row(1), row(2), row(3));
-        let [t0, t1, t2, t3] = transpose_2_4x4(t0, t1, t2, t3);
-        let [s0, s1, s2, s3] = pass(_mm_add_epi16(t0, _mm_set1_epi16(4)), t1, t2, t3);
-        let t = transpose_2_4x4(
-            _mm_srai_epi16::<3>(s0),
-            _mm_srai_epi16::<3>(s1),
-            _mm_srai_epi16::<3>(s2),
-            _mm_srai_epi16::<3>(s3),
-        );
+        let t = transform_rows([row(0), row(1), row(2), row(3)]);
         let zero = _mm_setzero_si128();
         let mut p = dst.as_mut_ptr().add(pos);
         for t in t {
@@ -669,6 +677,29 @@ pub(crate) fn transform_add(block: &[i32], dst: &mut [u8], pos: usize, stride: u
             let d = _mm_add_epi16(d, t);
             p.cast::<i32>()
                 .write_unaligned(_mm_cvtsi128_si32(_mm_packus_epi16(d, d)));
+            p = p.add(stride);
+        }
+    }
+}
+
+/// libwebp's `Transform_SSE2` for two blocks side by side (`do_two`): the inverse transforms of
+/// `blocks` (32 coefficients that fit 16 bits) added to the 8x4 pixels at `pos` of `dst`.
+pub(crate) fn transform_add_two(blocks: &[i32], dst: &mut [u8], pos: usize, stride: usize) {
+    let blocks = &blocks[..32];
+    check(dst.len(), pos, 0, 3 * stride + 8);
+    unsafe {
+        let row = |r: usize| {
+            let a = _mm_loadu_si128(blocks.as_ptr().add(4 * r).cast());
+            let b = _mm_loadu_si128(blocks.as_ptr().add(16 + 4 * r).cast());
+            _mm_packs_epi32(a, b)
+        };
+        let t = transform_rows([row(0), row(1), row(2), row(3)]);
+        let zero = _mm_setzero_si128();
+        let mut p = dst.as_mut_ptr().add(pos);
+        for t in t {
+            let d = _mm_unpacklo_epi8(_mm_loadl_epi64(p.cast()), zero);
+            let d = _mm_add_epi16(d, t);
+            _mm_storel_epi64(p.cast(), _mm_packus_epi16(d, d));
             p = p.add(stride);
         }
     }
