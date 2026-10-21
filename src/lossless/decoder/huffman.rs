@@ -194,14 +194,14 @@ impl HuffmanTree {
         v: u16,
         primary_table_entry: u16,
         bit_reader: &mut BitReader<R>,
-    ) -> Result<u16, DecodingError> {
+    ) -> u16 {
         let length = primary_table_entry >> 12;
         let mask = (1 << (length - MAX_TABLE_BITS as u16)) - 1;
         let secondary_index = ((primary_table_entry & 0xfff) as usize)
             + ((v >> MAX_TABLE_BITS) as usize & mask as usize);
         let secondary_entry = secondary_table[secondary_index];
-        bit_reader.consume((secondary_entry & 0xf) as u8)?;
-        Ok(secondary_entry >> 4)
+        bit_reader.advance((secondary_entry & 0xf) as u8);
+        secondary_entry >> 4
     }
 
     /// Reads a symbol using the bit reader.
@@ -213,41 +213,26 @@ impl HuffmanTree {
         &self,
         bit_reader: &mut BitReader<R>,
     ) -> Result<u16, DecodingError> {
-        match &self.0 {
-            HuffmanTreeInner::Tree {
-                primary_table,
-                secondary_table,
-                table_mask,
-            } => {
-                let v = bit_reader.peek_code() as u16;
-                let entry = primary_table[(v & table_mask) as usize];
-                if (entry >> 12) <= MAX_TABLE_BITS as u16 {
-                    bit_reader.consume((entry >> 12) as u8)?;
-                    return Ok(entry & 0xfff);
-                }
-
-                Self::read_symbol_slowpath(secondary_table, v, entry, bit_reader)
-            }
-            HuffmanTreeInner::Single(symbol) => Ok(*symbol),
+        if let HuffmanTreeInner::Single(symbol) = self.0 {
+            return Ok(symbol);
         }
+        let symbol = self.read_symbol_unchecked(bit_reader);
+        bit_reader.check()?;
+        Ok(symbol)
     }
 
     /// libwebp's `ReadSymbol`: the code's bits are consumed without checking for the end.
+    #[inline(always)]
     pub(crate) fn read_symbol_unchecked<R: BufRead>(&self, bit_reader: &mut BitReader<R>) -> u16 {
         match &self.0 {
             HuffmanTreeInner::Tree { primary_table, secondary_table, table_mask } => {
                 let v = bit_reader.peek_code() as u16;
                 let entry = primary_table[(v & table_mask) as usize];
-                let length = entry >> 12;
-                if length <= MAX_TABLE_BITS as u16 {
-                    bit_reader.advance(length as u8);
+                if (entry >> 12) <= MAX_TABLE_BITS as u16 {
+                    bit_reader.advance((entry >> 12) as u8);
                     return entry & 0xfff;
                 }
-                let mask = (1 << (length - MAX_TABLE_BITS as u16)) - 1;
-                let index = (entry & 0xfff) as usize + ((v >> MAX_TABLE_BITS) as usize & mask as usize);
-                let secondary = secondary_table[index];
-                bit_reader.advance((secondary & 0xf) as u8);
-                secondary >> 4
+                Self::read_symbol_slowpath(secondary_table, v, entry, bit_reader)
             }
             HuffmanTreeInner::Single(symbol) => *symbol,
         }

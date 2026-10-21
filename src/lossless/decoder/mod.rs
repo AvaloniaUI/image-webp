@@ -464,10 +464,10 @@ impl<R: BufRead> LosslessDecoder<R> {
                         let red = tree[RED].read_symbol(&mut self.bit_reader)?;
                         let blue = tree[BLUE].read_symbol(&mut self.bit_reader)?;
                         let alpha = tree[ALPHA].read_symbol(&mut self.bit_reader)?;
-                        let value = [red as u8, code as u8, blue as u8, alpha as u8];
+                        let value = u32::from_le_bytes([red as u8, code as u8, blue as u8, alpha as u8]);
 
                         for px in data[at..at + n * 4].chunks_exact_mut(4) {
-                            px.copy_from_slice(&value);
+                            px.copy_from_slice(&value.to_le_bytes());
                         }
 
                         if let Some(color_cache) = huffman_info.color_cache.as_mut() {
@@ -485,23 +485,22 @@ impl<R: BufRead> LosslessDecoder<R> {
             //check code
             if code < 256 {
                 //literal, so just use huffman codes and read as argb
-                let green = code as u8;
-                let red = tree[RED].read_symbol(&mut self.bit_reader)? as u8;
+                // The end of the stream is checked once for red, blue and alpha: past it the
+                // reads give garbage and the check fails as the first read past it would.
+                let red = tree[RED].read_symbol_unchecked(&mut self.bit_reader) as u8;
                 // Blue and alpha take up to 30 bits, which the window still holds below this; a
                 // fill there cannot reach the end of the stream, so skipping it changes nothing.
                 if self.bit_reader.bit_pos > LBITS - 30 {
                     self.bit_reader.fill()?;
                 }
-                let blue = tree[BLUE].read_symbol(&mut self.bit_reader)? as u8;
-                let alpha = tree[ALPHA].read_symbol(&mut self.bit_reader)? as u8;
+                let blue = tree[BLUE].read_symbol_unchecked(&mut self.bit_reader) as u8;
+                let alpha = tree[ALPHA].read_symbol_unchecked(&mut self.bit_reader) as u8;
+                self.bit_reader.check()?;
 
-                data[at] = red;
-                data[at + 1] = green;
-                data[at + 2] = blue;
-                data[at + 3] = alpha;
-
+                let pixel = u32::from_le_bytes([red, code as u8, blue, alpha]);
+                data[at..at + 4].copy_from_slice(&pixel.to_le_bytes());
                 if let Some(color_cache) = huffman_info.color_cache.as_mut() {
-                    color_cache.insert([red, green, blue, alpha]);
+                    color_cache.insert(pixel);
                 }
                 index += 1;
             } else if code < 256 + 24 {
@@ -542,7 +541,7 @@ impl<R: BufRead> LosslessDecoder<R> {
 
                     if let Some(color_cache) = huffman_info.color_cache.as_mut() {
                         for pixel in data[at..][..length * 4].chunks_exact(4) {
-                            color_cache.insert(pixel.try_into().unwrap());
+                            color_cache.insert(u32::from_le_bytes(pixel.try_into().unwrap()));
                         }
                     }
                 }
@@ -554,7 +553,7 @@ impl<R: BufRead> LosslessDecoder<R> {
                     .as_mut()
                     .ok_or(DecodingError::BitStreamError)?;
                 let color = color_cache.lookup((code - 280).into());
-                data[at..][..4].copy_from_slice(&color);
+                data[at..][..4].copy_from_slice(&color.to_le_bytes());
                 color_cache.insert(color);
                 index += 1;
 
@@ -564,7 +563,7 @@ impl<R: BufRead> LosslessDecoder<R> {
                         if code >= 280 {
                             self.bit_reader.consume(bits)?;
                             let color = color_cache.lookup((code - 280).into());
-                            data[at + 4..][..4].copy_from_slice(&color);
+                            data[at + 4..][..4].copy_from_slice(&color.to_le_bytes());
                             color_cache.insert(color);
                             index += 1;
                         }
@@ -1024,29 +1023,29 @@ impl HuffmanInfo {
     }
 }
 
+/// The colours of a colour cache as RGBA words, hashed as libwebp hashes its ARGB words; held
+/// at the largest size, 11 bits, so an index masked to it needs no bounds check.
 #[derive(Debug, Clone)]
 struct ColorCache {
     color_cache_bits: u8,
-    color_cache: Vec<[u8; 4]>,
+    color_cache: Box<[u32; 1 << 11]>,
 }
 
 impl ColorCache {
     fn new(bits: u8) -> Self {
-        Self { color_cache_bits: bits, color_cache: vec![[0; 4]; 1 << bits] }
+        Self { color_cache_bits: bits, color_cache: Box::new([0; 1 << 11]) }
     }
 
     #[inline(always)]
-    fn insert(&mut self, color: [u8; 4]) {
-        let [r, g, b, a] = color;
-        let color_u32 =
-            (u32::from(r) << 16) | (u32::from(g) << 8) | (u32::from(b)) | (u32::from(a) << 24);
-        let index = (0x1e35a7bdu32.wrapping_mul(color_u32)) >> (32 - self.color_cache_bits);
-        self.color_cache[index as usize] = color;
+    fn insert(&mut self, rgba: u32) {
+        let argb = rgba.swap_bytes().rotate_right(8);
+        let index = (0x1e35a7bdu32.wrapping_mul(argb)) >> (32 - self.color_cache_bits);
+        self.color_cache[index as usize & ((1 << 11) - 1)] = rgba;
     }
 
     #[inline(always)]
-    fn lookup(&self, index: usize) -> [u8; 4] {
-        self.color_cache[index]
+    fn lookup(&self, index: usize) -> u32 {
+        self.color_cache[index & ((1 << 11) - 1)]
     }
 }
 
@@ -1212,6 +1211,12 @@ impl<R: BufRead> BitReader<R> {
     #[inline(always)]
     pub(crate) fn consume(&mut self, num: u8) -> Result<(), DecodingError> {
         self.advance(num);
+        self.check()
+    }
+
+    /// Fails where the bits read so far run past the end of the stream.
+    #[inline(always)]
+    pub(crate) fn check(&mut self) -> Result<(), DecodingError> {
         if self.eos || self.bit_pos > LBITS {
             return self.check_end();
         }
