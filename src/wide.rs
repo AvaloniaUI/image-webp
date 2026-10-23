@@ -10,19 +10,13 @@ use std::sync::atomic::{AtomicU8, Ordering};
 static AVX2: AtomicU8 = AtomicU8::new(0);
 
 /// Whether the 256-bit kernels may run: the CPU has AVX2 and `IMAGE_WEBP_NO_AVX2` is unset.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub(crate) fn has_avx2() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        match AVX2.load(Ordering::Relaxed) {
-            1 => false,
-            2 => true,
-            _ => detect(),
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
+    match AVX2.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => detect(),
     }
 }
 
