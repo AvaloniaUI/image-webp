@@ -177,6 +177,31 @@ unsafe fn extract_green32(rgba: &[u8], green: &mut [u8]) -> usize {
     i
 }
 
+/// libwebp's `WebPDispatchAlpha` over the first whole eights of `alpha` into the alpha of the
+/// RGBA pixels `rgba`, where the CPU has AVX2: the number of pixels done.
+pub(crate) fn dispatch_alpha(alpha: &[u8], rgba: &mut [u8]) -> usize {
+    if !crate::wide::has_avx2() {
+        return 0;
+    }
+    // SAFETY: the CPU supports AVX2.
+    unsafe { dispatch_alpha8(alpha, rgba) }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn dispatch_alpha8(alpha: &[u8], rgba: &mut [u8]) -> usize {
+    let n = alpha.len().min(rgba.len() / 4);
+    let (src, dst) = (alpha.as_ptr(), rgba.as_mut_ptr());
+    let rgb = _mm256_set1_epi32(0x00ff_ffff);
+    let mut i = 0;
+    while i + 8 <= n {
+        let a = _mm256_slli_epi32::<24>(_mm256_cvtepu8_epi32(_mm_loadl_epi64(src.add(i).cast())));
+        let p = dst.add(4 * i);
+        store8(p, _mm256_or_si256(_mm256_and_si256(load8(p), rgb), a));
+        i += 8;
+    }
+    i
+}
+
 /// The eight-pixel kernel alone, for the tests.
 #[cfg(test)]
 #[target_feature(enable = "avx2")]
@@ -250,6 +275,20 @@ mod tests {
             assert_eq!(done, if crate::wide::has_avx2() { n / 32 * 32 } else { 0 });
             assert!(green[..done].iter().zip(rgba.chunks_exact(4)).all(|(&g, p)| g == p[1]), "n {n}");
             assert!(green[done..].iter().all(|&b| b == 0xa5));
+        }
+    }
+
+    #[test]
+    fn dispatch_alpha_matches_the_scalar_one() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(18);
+        for n in [0, 1, 7, 8, 9, 31, 32, 33, 64, 95, 200] {
+            let (rgba, alpha) = (random(&mut rng, n * 4), random(&mut rng, n + 2));
+            let mut got = rgba.clone();
+            let done = super::dispatch_alpha(&alpha, &mut got);
+            assert_eq!(done, if crate::wide::has_avx2() { n / 8 * 8 } else { 0 });
+            let mut want = rgba;
+            want.chunks_exact_mut(4).zip(&alpha).take(done).for_each(|(px, &a)| px[3] = a);
+            assert_eq!(got, want, "n {n}");
         }
     }
 

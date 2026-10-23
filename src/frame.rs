@@ -187,9 +187,7 @@ impl<'a> FrameDecoder<'a> {
                     match alpha {
                         Some(alpha) => {
                             for row in rows.chunks_exact_mut(w * 4) {
-                                for (px, &a) in row.chunks_exact_mut(4).zip(alpha.next_row()?) {
-                                    px[3] = a;
-                                }
+                                put_alpha(row, alpha.next_row()?);
                             }
                         }
                         None => rows.chunks_exact_mut(4).for_each(|px| px[3] = 255),
@@ -240,9 +238,7 @@ impl<'a> FrameDecoder<'a> {
                 };
                 if let Some(alpha) = alpha {
                     for row in rows.chunks_exact_mut(w * 4) {
-                        for (px, &a) in row.chunks_exact_mut(4).zip(alpha.next_row()?) {
-                            px[3] = a;
-                        }
+                        put_alpha(row, alpha.next_row()?);
                     }
                 }
                 Ok(Some((y0, rows)))
@@ -263,6 +259,18 @@ impl<'a> FrameDecoder<'a> {
         }
     }
 
+}
+
+/// Sets the alpha of the RGBA pixels `row` to `alpha`.
+fn put_alpha(row: &mut [u8], alpha: &[u8]) {
+    #[cfg(target_arch = "x86_64")]
+    let (row, alpha) = {
+        let done = crate::lossless::dispatch_alpha(alpha, row);
+        (&mut row[done * 4..], &alpha[done..])
+    };
+    for (px, &a) in row.as_chunks_mut::<4>().0.iter_mut().zip(alpha) {
+        px[3] = a;
+    }
 }
 
 /// Drops the alpha of the RGBA pixels `rgba` into `rgb`, four pixels a step as three words.

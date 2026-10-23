@@ -5,7 +5,7 @@
 #[cfg(target_arch = "x86_64")]
 mod avx2;
 #[cfg(target_arch = "x86_64")]
-pub(crate) use avx2::rgb_from_rgba;
+pub(crate) use avx2::{dispatch_alpha, rgb_from_rgba};
 mod huffman;
 #[cfg(target_arch = "aarch64")]
 mod neon;
