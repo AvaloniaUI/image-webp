@@ -83,12 +83,12 @@ fn avg2(this: u8, right: u8) -> u8 {
 }
 
 pub(crate) fn predict_4x4(
-    ws: &mut [u8],
-    stride: usize,
-    modes: &[IntraMode],
-    resdata: &[i32],
-    kinds: &[u8],
+    ws: &mut [u8; LUMA_BLOCK_SIZE],
+    modes: &[IntraMode; 16],
+    resdata: &[i32; 384],
+    kinds: &[u8; 24],
 ) {
+    let stride = LUMA_STRIDE;
     for sby in 0usize..4 {
         for sbx in 0usize..4 {
             let i = sbx + sby * 4;
@@ -250,6 +250,7 @@ pub(crate) fn predict_tmpred(a: &mut [u8], size: usize, x0: usize, y0: usize, st
     }
 }
 
+#[inline(always)]
 pub(crate) fn predict_bdcpred(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     let mut v = 4;
 
@@ -274,10 +275,12 @@ fn put_rows(a: &mut [u8], x0: usize, y0: usize, stride: usize, rows: [[u8; 4]; 4
     }
 }
 
+#[inline(always)]
 fn topleft_pixel(a: &[u8], x0: usize, y0: usize, stride: usize) -> u8 {
     a[(y0 - 1) * stride + x0 - 1]
 }
 
+#[inline(always)]
 fn top_pixels(a: &[u8], x0: usize, y0: usize, stride: usize) -> (u8, u8, u8, u8, u8, u8, u8, u8) {
     let pos = (y0 - 1) * stride + x0;
     let a_slice = &a[pos..pos + 8];
@@ -293,6 +296,7 @@ fn top_pixels(a: &[u8], x0: usize, y0: usize, stride: usize) -> (u8, u8, u8, u8,
     (a0, a1, a2, a3, a4, a5, a6, a7)
 }
 
+#[inline(always)]
 fn left_pixels(a: &[u8], x0: usize, y0: usize, stride: usize) -> (u8, u8, u8, u8) {
     let l0 = a[y0 * stride + x0 - 1];
     let l1 = a[(y0 + 1) * stride + x0 - 1];
@@ -302,6 +306,7 @@ fn left_pixels(a: &[u8], x0: usize, y0: usize, stride: usize) -> (u8, u8, u8, u8
     (l0, l1, l2, l3)
 }
 
+#[inline(always)]
 fn edge_pixels(
     a: &[u8],
     x0: usize,
@@ -341,6 +346,7 @@ pub(crate) fn predict_bvepred(a: &mut [u8], x0: usize, y0: usize, stride: usize)
     }
 }
 
+#[inline(always)]
 pub(crate) fn predict_bhepred(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     let p = topleft_pixel(a, x0, y0, stride);
     let (l0, l1, l2, l3) = left_pixels(a, x0, y0, stride);
@@ -440,6 +446,7 @@ pub(crate) fn predict_bvlpred(a: &mut [u8], x0: usize, y0: usize, stride: usize)
     a[(y0 + 3) * stride + x0 + 3] = avg3(a5, a6, a7);
 }
 
+#[inline(always)]
 pub(crate) fn predict_bhdpred(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     let (e0, e1, e2, e3, e4, e5, e6, e7, _) = edge_pixels(a, x0, y0, stride);
     let (h0, h1, h2, h3) = (avg2(e3, e4), avg2(e2, e3), avg2(e1, e2), avg2(e0, e1));
@@ -463,6 +470,7 @@ pub(crate) fn predict_bhdpred(a: &mut [u8], x0: usize, y0: usize, stride: usize)
     );
 }
 
+#[inline(always)]
 pub(crate) fn predict_bhupred(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     let (l0, l1, l2, l3) = left_pixels(a, x0, y0, stride);
     let (h0, h1, h2) = (avg2(l0, l1), avg2(l1, l2), avg2(l2, l3));

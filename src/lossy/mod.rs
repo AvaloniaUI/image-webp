@@ -520,7 +520,7 @@ impl<'a> Vp8Decoder<'a> {
         mbx: usize,
         mby: usize,
         mb: &MacroBlock,
-        resdata: &[i32],
+        resdata: &[i32; 384],
         kinds: &[u8; 24],
     ) {
         let stride = 1usize + 16 + 4;
@@ -533,7 +533,7 @@ impl<'a> Vp8Decoder<'a> {
             LumaMode::H => predict_hpred(ws, 16, 1, 1, stride),
             LumaMode::TM => predict_tm::<16>(ws, 1, 1, stride),
             LumaMode::DC => predict_dc::<16>(ws, stride, mby != 0, mbx != 0),
-            LumaMode::B => predict_4x4(ws, stride, &mb.bpred, resdata, kinds),
+            LumaMode::B => predict_4x4(ws, &mb.bpred, resdata, kinds),
         }
 
         if mb.luma_mode != LumaMode::B {
