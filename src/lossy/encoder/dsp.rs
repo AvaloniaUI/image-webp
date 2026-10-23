@@ -949,13 +949,7 @@ fn tdisto4x4_portable(a: &[u8], b: &[u8], w: &[u16; 16]) -> i32 {
     (sb - sa).abs() >> 5
 }
 
-#[allow(unsafe_code)]
 pub(crate) fn tdisto16x16(a: &[u8], b: &[u8], w: &[u16; 16]) -> i32 {
-    #[cfg(target_arch = "x86_64")]
-    if crate::wide::has_avx2() {
-        // SAFETY: the CPU supports AVX2.
-        return unsafe { super::avx2::tdisto16x16(a, b, w) };
-    }
     let mut d = 0;
     for y in (0..16 * BPS).step_by(4 * BPS) {
         for x in (0..16).step_by(4) {
@@ -963,6 +957,38 @@ pub(crate) fn tdisto16x16(a: &[u8], b: &[u8], w: &[u16; 16]) -> i32 {
         }
     }
     d
+}
+
+/// `tdisto16x16` against one source macroblock, with AVX2 its half of the transform done
+/// once.
+pub(crate) struct TDisto16 {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    sums: Option<[[i32; 8]; 4]>,
+}
+
+impl TDisto16 {
+    #[allow(unsafe_code)]
+    pub(crate) fn new(src: &[u8], w: &[u16; 16]) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        if crate::wide::has_avx2() {
+            // SAFETY: the CPU supports AVX2.
+            let sums = unsafe { super::avx2::tsums16x16(src, w) };
+            return Self { sums: Some(sums) };
+        }
+        let _ = (src, w);
+        Self { sums: None }
+    }
+
+    /// `tdisto16x16(src, b, w)`, `src` and `w` those of `new`.
+    #[allow(unsafe_code)]
+    pub(crate) fn disto(&self, src: &[u8], b: &[u8], w: &[u16; 16]) -> i32 {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(sums) = &self.sums {
+            // SAFETY: `sums` exists only when the CPU supports AVX2.
+            return unsafe { super::avx2::tdisto16x16(sums, b, w) };
+        }
+        tdisto16x16(src, b, w)
+    }
 }
 
 pub(crate) const MAX_COEFF_THRESH: usize = 31;

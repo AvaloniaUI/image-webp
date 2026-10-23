@@ -1439,6 +1439,7 @@ impl<'a> Encoder<'a> {
         let lambda = self.dqm[seg].lambda_i16;
         let tlambda = self.dqm[seg].tlambda;
         let mut is_flat = is_flat_source16(&self.it.yuv_in[Y_OFF..]);
+        let tdisto = (tlambda != 0).then(|| TDisto16::new(&self.it.yuv_in[Y_OFF..], &WEIGHT_Y));
         // Candidate levels in two slots: the best so far and the one being tried.
         let mut levels = [([0i16; 16], [[0i16; 16]; 16]); 2];
         let mut best = 0;
@@ -1452,11 +1453,9 @@ impl<'a> Encoder<'a> {
             let src = &self.it.yuv_in[Y_OFF..];
             let out = &self.it.yuv_out2[Y_OFF..];
             cur.d = i64::from(sse16x16(src, out));
-            cur.sd = if tlambda != 0 {
-                i64::from(mult_8b(tlambda, tdisto16x16(src, out, &WEIGHT_Y)))
-            } else {
-                0
-            };
+            cur.sd = tdisto.as_ref().map_or(0, |t| {
+                i64::from(mult_8b(tlambda, t.disto(src, out, &WEIGHT_Y)))
+            });
             cur.h = i64::from(FIXED_COSTS_I16[mode]);
             let (dc, ac) = &levels[slot];
             cur.r = self.cost_luma16(dc, ac);

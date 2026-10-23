@@ -262,10 +262,11 @@ unsafe fn hadamard4(t0: __m256i, t1: __m256i, t2: __m256i, t3: __m256i) -> [__m2
     ]
 }
 
-/// `sse2::ttransform_rows` of one pair of blocks per lane, before the horizontal sum.
+/// The weighted Hadamard sums of the two blocks per lane in `sse2::ttransform_rows`'
+/// layout, the low halves' then the high halves', each still spread over four lanes.
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn ttransform_rows([t0, t1, t2, t3]: [__m256i; 4], w: &[u16; 16]) -> __m256i {
+unsafe fn ttransform_sums([t0, t1, t2, t3]: [__m256i; 4], w: &[u16; 16]) -> [__m256i; 2] {
     let b4 = hadamard4(t0, t1, t2, t3);
     let t = transpose_2_4x4(b4[0], b4[1], b4[2], b4[3]);
     let b4 = hadamard4(t[0], t[1], t[2], t[3]);
@@ -277,10 +278,47 @@ unsafe fn ttransform_rows([t0, t1, t2, t3]: [__m256i; 4], w: &[u16; 16]) -> __m2
     let b_b2 = _mm256_abs_epi16(_mm256_unpackhi_epi64(b4[2], b4[3]));
     let sa = _mm256_add_epi32(_mm256_madd_epi16(a_b0, w_0), _mm256_madd_epi16(a_b2, w_8));
     let sb = _mm256_add_epi32(_mm256_madd_epi16(b_b0, w_0), _mm256_madd_epi16(b_b2, w_8));
-    _mm256_sub_epi32(sa, sb)
+    [sa, sb]
 }
 
-/// `reconstruct4x4_disto_x2` of the ten 4x4 predictions in `preds`; `None` without AVX2.
+/// `ttransform_sums` of the blocks whose 16-bit rows 0-1 and 2-3 are `p` and `q`: per lane
+/// `[sum(p), sum(q), sum(p), sum(q)]`.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn ttransform_pair(p: [__m256i; 2], q: [__m256i; 2], w: &[u16; 16]) -> [i32; 8] {
+    let [sa, sb] = ttransform_sums(
+        [
+            _mm256_unpacklo_epi64(p[0], q[0]),
+            _mm256_unpackhi_epi64(p[0], q[0]),
+            _mm256_unpacklo_epi64(p[1], q[1]),
+            _mm256_unpackhi_epi64(p[1], q[1]),
+        ],
+        w,
+    );
+    let h = _mm256_hadd_epi32(sa, sb);
+    core::mem::transmute(_mm256_hadd_epi32(h, h))
+}
+
+/// The raw TDisto of `src` against the ten reconstructions `o` (rows as `itransform_sse_x2`
+/// returns them, modes `2m` and `2m + 1` in `o[m]`), the source transformed once: it rides
+/// along with the last pair.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn disto_modes(src: &[u8], o: &[[__m256i; 2]; 5], w: &[u16; 16], out: &mut [I4Recon; 10]) {
+    let s = [rows2(src, src, 0), rows2(src, src, 2)];
+    let g0 = ttransform_pair(o[0], o[1], w);
+    let g1 = ttransform_pair(o[2], o[3], w);
+    let g2 = ttransform_pair(o[4], s, w);
+    let sums = [
+        g0[0], g0[4], g0[1], g0[5], g1[0], g1[4], g1[1], g1[5], g2[0], g2[4],
+    ];
+    for (o, sum) in out.iter_mut().zip(sums) {
+        o.disto = g2[1] - sum;
+    }
+}
+
+/// `reconstruct4x4_disto_x2` of the ten 4x4 predictions in `preds`, then their raw TDisto;
+/// `None` without AVX2.
 #[inline]
 pub(crate) fn reconstruct4x4_disto_modes(
     src: &[u8],
@@ -292,28 +330,39 @@ pub(crate) fn reconstruct4x4_disto_modes(
         return None;
     }
     let mut out = [I4Recon::default(); 10];
-    for (m, out) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
-        let r = [
-            &preds[I4_MODE_OFFSETS[2 * m]..],
-            &preds[I4_MODE_OFFSETS[2 * m + 1]..],
-        ];
-        // SAFETY: the CPU supports AVX2.
-        unsafe { reconstruct4x4_disto_x2(src, r, mtx, w, out) };
+    // SAFETY: the CPU supports AVX2.
+    unsafe {
+        let mut o = [[_mm256_setzero_si256(); 2]; 5];
+        for (m, (out, o)) in out
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(&mut o)
+            .enumerate()
+        {
+            let r = [
+                &preds[I4_MODE_OFFSETS[2 * m]..],
+                &preds[I4_MODE_OFFSETS[2 * m + 1]..],
+            ];
+            *o = reconstruct4x4_disto_x2(src, r, mtx, out);
+        }
+        if let Some(w) = w {
+            disto_modes(src, &o, w, &mut out);
+        }
     }
     Some(out)
 }
 
 /// `sse2::reconstruct4x4_disto` of the 4x4 block `src` against the predictions `r[0]` and
-/// `r[1]`, one per lane, the reconstructions packed into `I4Recon::pixels`. `disto` is the
-/// raw `ttransform` sum.
+/// `r[1]`, one per lane, the reconstructions packed into `I4Recon::pixels`, without
+/// `disto`. Returns the reconstructions' rows as `itransform_sse_x2` does.
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn reconstruct4x4_disto_x2(
     src: &[u8],
     r: [&[u8]; 2],
     mtx: &Matrix,
-    w: Option<&[u16; 16]>,
     out: &mut [I4Recon],
-) {
+) -> [__m256i; 2] {
     let (r0, r1) = (&r[0][..3 * BPS + 4], &r[1][..3 * BPS + 4]);
     let out = &mut out[..2];
     let [c0, c8] = ftransform_x2(src, r0, r1);
@@ -331,7 +380,7 @@ pub(crate) unsafe fn reconstruct4x4_disto_x2(
         let swapped = ((nz >> 3) ^ (nz >> 12)) & 1;
         o.nz = nz ^ (swapped << 3 | swapped << 12);
     }
-    itransform_disto_x2(src, r0, r1, dequant, w, out);
+    itransform_sse_x2(src, r0, r1, dequant, out)
 }
 
 /// `sse2::ftransform_regs` of `src - r0` (low lane) and `src - r1` (high lane).
@@ -346,50 +395,36 @@ unsafe fn ftransform_x2(src: &[u8], r0: &[u8], r1: &[u8]) -> [__m256i; 2] {
 }
 
 /// The inverse transforms of `coeffs` (coefficients 0..8 and 8..16, a block per lane) added
-/// to `r0` and `r1`, packed into `out[..2].pixels` with their SSE and raw TDisto against
-/// `src`.
+/// to `r0` and `r1`, packed into `out[..2].pixels` with their SSE against `src`. Returns the
+/// reconstructions' rows 0-1 and 2-3 as 16-bit.
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn itransform_disto_x2(
+unsafe fn itransform_sse_x2(
     src: &[u8],
     r0: &[u8],
     r1: &[u8],
     coeffs: [__m256i; 2],
-    w: Option<&[u16; 16]>,
     out: &mut [I4Recon],
-) {
+) -> [__m256i; 2] {
     let src = &src[..3 * BPS + 4];
     let zero = _mm256_setzero_si256();
     let packed = itransform_one_rows(coeffs, rows2(r0, r1, 0), rows2(r0, r1, 2));
-    let s01 = rows2(src, src, 0);
-    let s23 = rows2(src, src, 2);
     let o01 = _mm256_unpacklo_epi8(packed, zero);
     let o23 = _mm256_unpackhi_epi8(packed, zero);
-    let d01 = _mm256_sub_epi16(s01, o01);
-    let d23 = _mm256_sub_epi16(s23, o23);
+    let d01 = _mm256_sub_epi16(rows2(src, src, 0), o01);
+    let d23 = _mm256_sub_epi16(rows2(src, src, 2), o23);
     let sse = _mm256_add_epi32(_mm256_madd_epi16(d01, d01), _mm256_madd_epi16(d23, d23));
-    let disto = match w {
-        Some(w) => ttransform_rows(
-            [
-                _mm256_unpacklo_epi64(s01, o01),
-                _mm256_unpackhi_epi64(s01, o01),
-                _mm256_unpacklo_epi64(s23, o23),
-                _mm256_unpackhi_epi64(s23, o23),
-            ],
-            w,
-        ),
-        None => zero,
-    };
-    let sums = _mm256_hadd_epi32(sse, disto);
-    let sums = _mm256_hadd_epi32(sums, sums);
+    let sums = _mm256_hadd_epi32(sse, zero);
+    let sums = _mm256_hadd_epi32(sums, zero);
     let mut px = [[0u8; 16]; 2];
     _mm256_storeu_si256(px.as_mut_ptr().cast(), packed);
     let sums: [i32; 8] = core::mem::transmute(sums);
     for (k, o) in out[..2].iter_mut().enumerate() {
         o.pixels = px[k];
         o.d = sums[4 * k];
-        o.disto = sums[4 * k + 1];
+        o.disto = 0;
     }
+    [o01, o23]
 }
 
 /// `sse2::ftransform` of `src` against each of the ten 4x4 predictions in `preds`, two per
@@ -415,7 +450,14 @@ pub(crate) unsafe fn itransform_disto_modes(
     w: Option<&[u16; 16]>,
     out: &mut [I4Recon; 10],
 ) {
-    for (m, out) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+    let mut o = [[_mm256_setzero_si256(); 2]; 5];
+    for (m, (out, o)) in out
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip(&mut o)
+        .enumerate()
+    {
         let r0 = &preds[I4_MODE_OFFSETS[2 * m]..][..3 * BPS + 4];
         let r1 = &preds[I4_MODE_OFFSETS[2 * m + 1]..][..3 * BPS + 4];
         let a = load_i16x16(&coeffs[2 * m]);
@@ -424,7 +466,10 @@ pub(crate) unsafe fn itransform_disto_modes(
             _mm256_permute2x128_si256::<0x20>(a, b),
             _mm256_permute2x128_si256::<0x31>(a, b),
         ];
-        itransform_disto_x2(src, r0, r1, c, w, out);
+        *o = itransform_sse_x2(src, r0, r1, c, out);
+    }
+    if let Some(w) = w {
+        disto_modes(src, &o, w, out);
     }
 }
 
@@ -570,26 +615,43 @@ pub(crate) unsafe fn itransform4(r: &[u8], lo: &[i16], hi: &[i16], dst: &mut [u8
     }
 }
 
-/// `dsp::tdisto16x16`: the 4x4 blocks two per register, each lane `sse2::ttransform`.
+/// `ttransform_sums` of the four 4x4 blocks in rows `y..y + 4` of `a`, per lane
+/// `[blk0, blk1, blk0, blk1]` then `[blk2, blk3, blk2, blk3]`.
+#[inline]
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn tdisto16x16(a: &[u8], b: &[u8], w: &[u16; 16]) -> i32 {
+unsafe fn tsums_band(a: &[u8], y: usize, w: &[u16; 16]) -> __m256i {
+    let mut t = [_mm256_setzero_si256(); 4];
+    for (i, t) in t.iter_mut().enumerate() {
+        let off = (y + i) * BPS;
+        *t = _mm256_cvtepu8_epi16(_mm_loadu_si128(a[off..off + 16].as_ptr().cast()));
+    }
+    let [sa, sb] = ttransform_sums(t, w);
+    let h = _mm256_hadd_epi32(sa, sb);
+    _mm256_hadd_epi32(h, h)
+}
+
+/// The source half of `tdisto16x16`: `tsums_band` of each band of `a`.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn tsums16x16(a: &[u8], w: &[u16; 16]) -> [[i32; 8]; 4] {
     let a = &a[..15 * BPS + 16];
+    let mut out = [[0; 8]; 4];
+    for (y, o) in out.iter_mut().enumerate() {
+        *o = core::mem::transmute(tsums_band(a, 4 * y, w));
+    }
+    out
+}
+
+/// `dsp::tdisto16x16` of `b` against the source whose `tsums16x16` are `src`.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn tdisto16x16(src: &[[i32; 8]; 4], b: &[u8], w: &[u16; 16]) -> i32 {
     let b = &b[..15 * BPS + 16];
     let mut acc = _mm256_setzero_si256();
-    for y in (0..16).step_by(4) {
-        let (mut left, mut right) = ([_mm256_setzero_si256(); 4], [_mm256_setzero_si256(); 4]);
-        for (i, (l, r)) in left.iter_mut().zip(&mut right).enumerate() {
-            let off = (y + i) * BPS;
-            let va = _mm_loadu_si128(a[off..off + 16].as_ptr().cast());
-            let vb = _mm_loadu_si128(b[off..off + 16].as_ptr().cast());
-            *l = _mm256_cvtepu8_epi16(_mm_unpacklo_epi32(va, vb));
-            *r = _mm256_cvtepu8_epi16(_mm_unpackhi_epi32(va, vb));
-        }
-        let t01 = ttransform_rows(left, w);
-        let t23 = ttransform_rows(right, w);
-        let h = _mm256_hadd_epi32(t01, t23);
-        let h = _mm256_hadd_epi32(h, h);
-        acc = _mm256_add_epi32(acc, _mm256_srai_epi32::<5>(_mm256_abs_epi32(h)));
+    for (y, s) in src.iter().enumerate() {
+        let d = _mm256_sub_epi32(
+            _mm256_loadu_si256(s.as_ptr().cast()),
+            tsums_band(b, 4 * y, w),
+        );
+        acc = _mm256_add_epi32(acc, _mm256_srai_epi32::<5>(_mm256_abs_epi32(d)));
     }
     let acc: [i32; 8] = core::mem::transmute(acc);
     acc[0] + acc[1] + acc[4] + acc[5]
@@ -904,31 +966,22 @@ mod tests {
     }
 
     #[test]
-    fn reconstruct4x4_disto_x2_matches_sse2() {
+    fn reconstruct4x4_disto_modes_match_sse2() {
         if !crate::wide::has_avx2() {
             return;
         }
+        use super::super::dsp::{I4_MODE_OFFSETS, PRED_SIZE};
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         let w = [38u16, 32, 20, 9, 32, 28, 17, 7, 20, 17, 10, 4, 9, 7, 4, 2];
-        for round in 0..20000 {
+        let mut preds = vec![0u8; PRED_SIZE];
+        for round in 0..4000 {
             let mut src = [0u8; 4 * BPS];
-            let mut preds = [0u8; 4 * BPS + 40];
             random_pixels(&mut rng, round, &mut src);
             random_pixels(&mut rng, round + 1, &mut preds);
             let mtx = random_matrix(&mut rng, round);
-            let (o0, o1) = (rng.gen_range(0..40), rng.gen_range(0..40));
             for w in [None, Some(&w)] {
-                let mut got = [I4Recon::default(); 2];
-                unsafe {
-                    super::reconstruct4x4_disto_x2(
-                        &src,
-                        [&preds[o0..], &preds[o1..]],
-                        &mtx,
-                        w,
-                        &mut got,
-                    )
-                };
-                for (g, off) in got.iter().zip([o0, o1]) {
+                let got = super::reconstruct4x4_disto_modes(&src, &preds, &mtx, w).unwrap();
+                for (g, off) in got.iter().zip(I4_MODE_OFFSETS) {
                     let mut levels = [0i16; 16];
                     let mut dst = [0u8; 4 * BPS];
                     let (nz, d, disto) = super::super::sse2::reconstruct4x4_disto(
@@ -1054,7 +1107,8 @@ mod tests {
                     t += sse2::ttransform(&a[x + y..], &b[x + y..], &w).abs() >> 5;
                 }
             }
-            assert_eq!(unsafe { super::tdisto16x16(&a, &b, &w) }, t);
+            let sums = unsafe { super::tsums16x16(&a, &w) };
+            assert_eq!(unsafe { super::tdisto16x16(&sums, &b, &w) }, t);
 
             let mut h1 = [[0u16; 32]; 4];
             unsafe { super::histogram_rows(&a, &b, &[0, 4 * BPS, 8 * BPS, 12 * BPS], &mut h1) };
