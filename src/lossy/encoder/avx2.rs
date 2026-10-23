@@ -641,6 +641,120 @@ pub(crate) unsafe fn trellis_last(input: &[i16; 16], first: usize, thresh: i32) 
     }
 }
 
+/// Four Y in each lane's 32-bit words from the 16-bit `rb` (r, b pairs) and `g0` (g, 0 pairs).
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn luma4(rb: __m256i, g0: __m256i) -> __m256i {
+    let k_rb = _mm256_set1_epi32(6420 << 16 | 16839);
+    let k_g0 = _mm256_set1_epi32(33059 - 16384);
+    let k_g1 = _mm256_set1_epi32(16384);
+    let rounder = _mm256_set1_epi32((16 << 16) + (1 << 15));
+    let y = _mm256_add_epi32(
+        _mm256_madd_epi16(rb, k_rb),
+        _mm256_add_epi32(_mm256_madd_epi16(g0, k_g0), _mm256_madd_epi16(g0, k_g1)),
+    );
+    _mm256_srli_epi32::<16>(_mm256_add_epi32(y, rounder))
+}
+
+/// `sse2::rgba_to_y_row`, 32 pixels at a time. Returns how many it did.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn rgba_to_y_row(line: &[u8], out: &mut [u8]) -> usize {
+    let n = out.len().min(line.len() / 4) & !31;
+    let line = &line[..n * 4];
+    let out = &mut out[..n];
+    let mask = _mm256_set1_epi32(0x00ff_00ff);
+    let order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+    for (px, out) in line
+        .as_chunks::<128>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<32>().0)
+    {
+        let mut y = [_mm256_setzero_si256(); 4];
+        for (k, y) in y.iter_mut().enumerate() {
+            let v = _mm256_loadu_si256(px[32 * k..32 * k + 32].as_ptr().cast());
+            let rb = _mm256_and_si256(v, mask);
+            let ga = _mm256_and_si256(_mm256_srli_epi32::<8>(v), mask);
+            *y = luma4(rb, ga);
+        }
+        let packed = _mm256_packus_epi16(
+            _mm256_packs_epi32(y[0], y[1]),
+            _mm256_packs_epi32(y[2], y[3]),
+        );
+        let packed = _mm256_permutevar8x32_epi32(packed, order);
+        _mm256_storeu_si256(out.as_mut_ptr().cast(), packed);
+    }
+    n
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn split6(v: [__m256i; 6]) -> [__m256i; 6] {
+    [
+        _mm256_unpacklo_epi8(v[0], v[3]),
+        _mm256_unpackhi_epi8(v[0], v[3]),
+        _mm256_unpacklo_epi8(v[1], v[4]),
+        _mm256_unpackhi_epi8(v[1], v[4]),
+        _mm256_unpacklo_epi8(v[2], v[5]),
+        _mm256_unpackhi_epi8(v[2], v[5]),
+    ]
+}
+
+/// Eight Y as 16-bit from the 16-bit `r`, `g` and `b` of each lane.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn luma8(r: __m256i, g: __m256i, b: __m256i) -> __m256i {
+    let zero = _mm256_setzero_si256();
+    let lo = luma4(_mm256_unpacklo_epi16(r, b), _mm256_unpacklo_epi16(g, zero));
+    let hi = luma4(_mm256_unpackhi_epi16(r, b), _mm256_unpackhi_epi16(g, zero));
+    _mm256_packs_epi32(lo, hi)
+}
+
+/// `sse2::rgb_to_y_row`, 64 pixels at a time: each lane deinterleaves 32 of them as the
+/// SSE2 kernel does. Returns how many pixels it converted.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn rgb_to_y_row(line: &[u8], out: &mut [u8]) -> usize {
+    let n = out.len().min(line.len() / 3) & !63;
+    let line = &line[..n * 3];
+    let out = &mut out[..n];
+    let zero = _mm256_setzero_si256();
+    for (px, out) in line
+        .as_chunks::<192>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<64>().0)
+    {
+        let mut v = [zero; 6];
+        for (k, v) in v.iter_mut().enumerate() {
+            let lo = _mm_loadu_si128(px[16 * k..16 * k + 16].as_ptr().cast());
+            let hi = _mm_loadu_si128(px[96 + 16 * k..112 + 16 * k].as_ptr().cast());
+            *v = _mm256_set_m128i(hi, lo);
+        }
+        let planes = split6(split6(split6(split6(split6(v)))));
+        let mut y = [zero; 2];
+        for (j, y) in y.iter_mut().enumerate() {
+            let (r, g, b) = (planes[j], planes[2 + j], planes[4 + j]);
+            let y0 = luma8(
+                _mm256_unpacklo_epi8(r, zero),
+                _mm256_unpacklo_epi8(g, zero),
+                _mm256_unpacklo_epi8(b, zero),
+            );
+            let y1 = luma8(
+                _mm256_unpackhi_epi8(r, zero),
+                _mm256_unpackhi_epi8(g, zero),
+                _mm256_unpackhi_epi8(b, zero),
+            );
+            *y = _mm256_packus_epi16(y0, y1);
+        }
+        // y[j] holds pixels 16j.. of the first 32 in its low lane, of the second in its high.
+        let first = _mm256_permute2x128_si256::<0x20>(y[0], y[1]);
+        let second = _mm256_permute2x128_si256::<0x31>(y[0], y[1]);
+        _mm256_storeu_si256(out.as_mut_ptr().cast(), first);
+        _mm256_storeu_si256(out.as_mut_ptr().add(32).cast(), second);
+    }
+    n
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::dsp::{bias, I4Recon, Matrix, BPS, QFIX};

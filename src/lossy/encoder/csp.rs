@@ -366,6 +366,7 @@ fn rgb_to_y_f32(r: u8, g: u8, b: u8) -> u8 {
     (y.to_bits() - MAGIC.to_bits() - rounded_up) as u8
 }
 
+#[allow(unsafe_code)]
 fn convert_y<const STEP: usize>(line: &[u8], out: &mut [u8]) {
     #[cfg(target_arch = "aarch64")]
     let (line, out) = {
@@ -374,6 +375,18 @@ fn convert_y<const STEP: usize>(line: &[u8], out: &mut [u8]) {
     };
     #[cfg(target_arch = "x86_64")]
     let (line, out) = {
+        let done = if crate::wide::has_avx2() {
+            // SAFETY: the CPU supports AVX2.
+            unsafe {
+                match STEP {
+                    4 => super::avx2::rgba_to_y_row(line, out),
+                    _ => super::avx2::rgb_to_y_row(line, out),
+                }
+            }
+        } else {
+            0
+        };
+        let (line, out) = (&line[done * STEP..], &mut out[done..]);
         let done = match STEP {
             4 => super::sse2::rgba_to_y_row(line, out),
             _ => super::sse2::rgb_to_y_row(line, out),
@@ -558,13 +571,13 @@ mod tests {
     #[test]
     fn convert_y_matches_reference() {
         let mut seed = 1u32;
-        let line: Vec<u8> = (0..4 * 140)
+        let line: Vec<u8> = (0..4 * 200)
             .map(|_| {
                 seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
                 (seed >> 23) as u8
             })
             .collect();
-        for width in 0..140 {
+        for width in 0..200 {
             let mut out = vec![0u8; width];
             convert_y::<3>(&line, &mut out);
             for (i, &y) in out.iter().enumerate() {
