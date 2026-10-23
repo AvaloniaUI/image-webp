@@ -292,17 +292,28 @@ fn get_residual(
     }
 }
 
-fn prediction_cost_bias(counts: &[u32], weight_0: u64, mut exp_val: u64) -> i64 {
-    let significant_symbols = 256 >> 4;
-    let exp_decay_factor = 6u64;
+/// The 15 decaying weights of `PredictionCostBias` from `exp_val`: each is the previous one
+/// times 6/10, rounded.
+const fn bias_weights(exp_val: u64) -> [u64; 16] {
+    let mut w = [0u64; 16];
+    w[1] = exp_val << LOG_2_PRECISION_BITS;
+    let mut i = 2;
+    while i < 16 {
+        w[i] = (6 * w[i - 1] + 5) / 10;
+        i += 1;
+    }
+    w
+}
+
+const SPATIAL_BIAS_WEIGHTS: [u64; 16] = bias_weights(94);
+const CROSS_COLOR_BIAS_WEIGHTS: [u64; 16] = bias_weights(240);
+
+/// `PredictionCostBias`, with its weights precomputed.
+fn prediction_cost_bias(counts: &[u32], weight_0: u64, weights: &[u64; 16]) -> i64 {
     let mut bits = (weight_0 * u64::from(counts[0])) << LOG_2_PRECISION_BITS;
-    exp_val <<= LOG_2_PRECISION_BITS;
-    for i in 1..significant_symbols {
-        bits = bits.wrapping_add(div_round(
-            (exp_val * u64::from(counts[i].wrapping_add(counts[256 - i]))) as i64,
-            100,
-        ) as u64);
-        exp_val = div_round((exp_decay_factor * exp_val) as i64, 10) as u64;
+    for i in 1..16 {
+        let c = u64::from(counts[i].wrapping_add(counts[256 - i]));
+        bits = bits.wrapping_add(div_round(weights[i].wrapping_mul(c) as i64, 100) as u64);
     }
     -div_round(bits as i64, 10)
 }
@@ -320,7 +331,7 @@ fn prediction_cost_spatial_histogram(
 ) -> i64 {
     let mut retval = 0i64;
     for i in 0..4 {
-        retval += prediction_cost_bias(&tile[i * 256..], 1, 94);
+        retval += prediction_cost_bias(&tile[i * 256..], 1, &SPATIAL_BIAS_WEIGHTS);
         retval = retval.wrapping_add(combined_shannon_entropy(
             as256(&tile[i * 256..]),
             as256(&accumulated[i * 256..]),
@@ -907,7 +918,7 @@ fn transform_color(m: Multipliers, data: &mut [u32]) {
 
 fn prediction_cost_cross_color(accumulated: &[u32; 256], counts: &[u32; 256]) -> i64 {
     (combined_shannon_entropy(counts, accumulated) as i64)
-        .wrapping_add(prediction_cost_bias(counts, 3, 240))
+        .wrapping_add(prediction_cost_bias(counts, 3, &CROSS_COLOR_BIAS_WEIGHTS))
 }
 
 /// The tile's green, red and blue channels, one byte per pixel.
@@ -1308,6 +1319,41 @@ mod tests {
             crate::wide::wide(|| update_histo(&mut wide, &argb));
             update_histo(&mut narrow, &argb);
             assert_eq!(wide, narrow, "update_histo {n}");
+        }
+    }
+
+    #[test]
+    fn prediction_cost_bias_matches_libwebp() {
+        fn reference(counts: &[u32], weight_0: u64, mut exp_val: u64) -> i64 {
+            let mut bits = (weight_0 * u64::from(counts[0])) << LOG_2_PRECISION_BITS;
+            exp_val <<= LOG_2_PRECISION_BITS;
+            for i in 1..16 {
+                bits = bits.wrapping_add(div_round(
+                    exp_val.wrapping_mul(u64::from(counts[i].wrapping_add(counts[256 - i]))) as i64,
+                    100,
+                ) as u64);
+                exp_val = div_round((6 * exp_val) as i64, 10) as u64;
+            }
+            -div_round(bits as i64, 10)
+        }
+        let mut seed = 0xa54f_f53au32;
+        for round in 0..2000 {
+            let counts: Vec<u32> = (0..256)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    seed >> (seed % 32).max(round % 32)
+                })
+                .collect();
+            assert_eq!(
+                prediction_cost_bias(&counts, 1, &SPATIAL_BIAS_WEIGHTS),
+                reference(&counts, 1, 94)
+            );
+            assert_eq!(
+                prediction_cost_bias(&counts, 3, &CROSS_COLOR_BIAS_WEIGHTS),
+                reference(&counts, 3, 240)
+            );
         }
     }
 
