@@ -13,6 +13,7 @@ pub use decoder::{
     BandReader, ChunkData, ChunkInfo, DecodingError, FrameInfo, LoopCount, UpsamplingMethod,
     WebPDecodeOptions, WebPDecoder, ALPHA_FLAG, ANIMATION_FLAG, EXIF_FLAG, ICCP_FLAG, XMP_FLAG,
 };
+pub use ahead::Runner;
 pub use frame::FrameDecoder;
 pub use animation::{AnimationEncoder, AnimationParams};
 pub use encoder::{encode_alpha_chunk, ColorType, EncodingError, WebPEncoder};
@@ -23,6 +24,7 @@ pub use wide::detect_cpu;
 pub(crate) trait ReadSeek: std::io::Read + std::io::Seek {}
 impl<R: std::io::Read + std::io::Seek> ReadSeek for R {}
 
+mod ahead;
 mod alpha_blending;
 mod animation;
 mod decoder;

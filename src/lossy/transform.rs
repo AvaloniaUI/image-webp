@@ -212,6 +212,7 @@ pub(crate) fn transform_add_portable(block: &[i16], dst: &mut [u8], pos: usize, 
 }
 
 // 14.3 inverse walsh-hadamard transform, used in decoding
+#[inline(always)]
 pub(crate) fn iwht4x4(block: &mut [i32]) {
     // Perform one length check up front to avoid subsequent bounds checks in this function
     assert!(block.len() >= 16);

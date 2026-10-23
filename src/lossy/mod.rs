@@ -2,6 +2,7 @@ use byteorder_lite::{LittleEndian, ReadBytesExt};
 use std::default::Default;
 use std::io::{self, Read, Seek, SeekFrom};
 
+use crate::ahead::{Ahead, Produce, Runner};
 use crate::decoder::{DecodingError, UpsamplingMethod};
 use crate::ReadSeek;
 use common::*;
@@ -489,6 +490,7 @@ impl<'a> Vp8Decoder<'a> {
         Ok(())
     }
 
+    #[inline(always)]
     fn read_macroblock_header(&mut self, mbx: usize) -> Result<MacroBlock, DecodingError> {
         if mbx == 0 {
             self.read_mode_row()?;
@@ -622,6 +624,7 @@ impl<'a> Vp8Decoder<'a> {
 
     /// Reads the coefficients of a macroblock into `blocks` (zero on entry) and the kind of
     /// inverse transform each block needs into `kinds`.
+    #[inline(always)]
     fn read_residual_data(
         &mut self,
         mb: &mut MacroBlock,
@@ -803,7 +806,7 @@ impl<'a> Vp8Decoder<'a> {
     fn decode_frame_(mut self) -> Result<Frame, DecodingError> {
         let mut row = Vec::with_capacity(usize::from(self.mbwidth));
         for mby in 0..self.mbheight as usize {
-            self.decode_mb_row(mby, &mut row)?;
+            self.decode_mb_row(mby, &mut row, None)?;
             self.macroblocks.extend_from_slice(&row);
         }
         for mby in 0..self.mbheight as usize {
@@ -815,38 +818,329 @@ impl<'a> Vp8Decoder<'a> {
         Ok(self.frame)
     }
 
-    /// Reconstructs macroblock row `mby` without loop filtering, its macroblocks into `row`.
+    /// Reconstructs macroblock row `mby` without loop filtering, its macroblocks into `row`, read
+    /// here or taken from `parsed`, which read them ahead.
     fn decode_mb_row(
         &mut self,
         mby: usize,
         row: &mut Vec<MacroBlock>,
+        mut parsed: Option<&mut ParsedAhead>,
     ) -> Result<(), DecodingError> {
         let p = mby % self.num_partitions as usize;
         self.left = PreviousMacroBlock::default();
         row.clear();
         let mut blocks = [0i16; 384];
         for mbx in 0..self.mbwidth as usize {
-            let mut mb = self.read_macroblock_header(mbx)?;
             let mut kinds = [transform::NO_COEFFS; 24];
-            if !mb.coeffs_skipped {
-                self.partitions[p].top_up(&mut *self.source)?;
-                self.read_residual_data(&mut mb, mbx, p, &mut blocks, &mut kinds)?;
-            } else {
-                let top = &mut self.top[mbx].complexity;
-                if mb.luma_mode != LumaMode::B {
-                    self.left.complexity[0] = 0;
-                    top[0] = 0;
-                }
-                self.left.complexity[1..].fill(0);
-                top[1..].fill(0);
-            }
-
+            let mb = match parsed.as_deref_mut() {
+                Some(parsed) => parsed.next(&mut blocks, &mut kinds)?,
+                None => self.parse_mb(mbx, p, &mut blocks, &mut kinds)?,
+            };
             self.intra_predict_luma(mbx, mby, &mb, &mut blocks, &kinds);
             self.intra_predict_chroma(mbx, mby, &mb, &mut blocks, &kinds);
             self.store_luma(mbx, mby);
             row.push(mb);
         }
         Ok(())
+    }
+
+    /// Reads the modes of macroblock `mbx` of the row partition `p` codes, and its coefficients
+    /// into `blocks` (zero on entry) and the kind of transform each block needs into `kinds`.
+    #[inline(always)]
+    fn parse_mb(
+        &mut self,
+        mbx: usize,
+        p: usize,
+        blocks: &mut [i16; 384],
+        kinds: &mut [u8; 24],
+    ) -> Result<MacroBlock, DecodingError> {
+        let mb = self.read_macroblock_header(mbx)?;
+        self.parse_residuals(mb, mbx, p, blocks, kinds)
+    }
+
+    /// [`parse_mb`](Self::parse_mb) of a macroblock whose modes are read.
+    #[inline(always)]
+    fn parse_residuals(
+        &mut self,
+        mut mb: MacroBlock,
+        mbx: usize,
+        p: usize,
+        blocks: &mut [i16; 384],
+        kinds: &mut [u8; 24],
+    ) -> Result<MacroBlock, DecodingError> {
+        if !mb.coeffs_skipped {
+            self.partitions[p].top_up(&mut *self.source)?;
+            self.read_residual_data(&mut mb, mbx, p, blocks, kinds)?;
+        } else {
+            let top = &mut self.top[mbx].complexity;
+            if mb.luma_mode != LumaMode::B {
+                self.left.complexity[0] = 0;
+                top[0] = 0;
+            }
+            self.left.complexity[1..].fill(0);
+            top[1..].fill(0);
+        }
+        Ok(mb)
+    }
+
+    /// Moves what reading the macroblocks needs into a decoder of its own, which reads them
+    /// ahead while this one reconstructs them.
+    fn split_parser(&mut self) -> Vp8Decoder<'a> {
+        let mut p = Vp8Decoder::new();
+        std::mem::swap(&mut p.source, &mut self.source);
+        std::mem::swap(&mut p.b, &mut self.b);
+        std::mem::swap(&mut p.partitions, &mut self.partitions);
+        std::mem::swap(&mut p.pos_probs, &mut self.pos_probs);
+        std::mem::swap(&mut p.top, &mut self.top);
+        p.mbwidth = self.mbwidth;
+        p.mbheight = self.mbheight;
+        p.num_partitions = self.num_partitions;
+        p.segments_enabled = self.segments_enabled;
+        p.segments_update_map = self.segments_update_map;
+        p.segment = self.segment;
+        p.segment_probs = self.segment_probs;
+        p.prob_skip_false = self.prob_skip_false;
+        p.left = self.left;
+        p
+    }
+
+    /// Moves what reading the modes of the macroblocks needs into a decoder of its own, which
+    /// reads them ahead of their residuals.
+    fn split_modes(&mut self) -> Vp8Decoder<'a> {
+        let mut m = Vp8Decoder::new();
+        std::mem::swap(&mut m.b, &mut self.b);
+        m.top = self.top.clone();
+        m.mbwidth = self.mbwidth;
+        m.mbheight = self.mbheight;
+        m.segments_enabled = self.segments_enabled;
+        m.segments_update_map = self.segments_update_map;
+        m.segment_probs = self.segment_probs;
+        m.prob_skip_false = self.prob_skip_false;
+        m
+    }
+}
+
+/// Macroblocks read ahead, in raster order: their modes and kinds of transform, the coefficients
+/// of their blocks with any (only the DC of a DC-only block), and the error the read stopped at.
+#[derive(Default)]
+struct Parsed {
+    mbs: Vec<(MacroBlock, [u8; 24])>,
+    coeffs: Vec<i16>,
+    error: Option<DecodingError>,
+}
+
+/// The bytes a [`Parsed`] unit holds: half of them for macroblocks, half for coefficients.
+const PARSED_UNIT_BYTES: usize = 16 << 10;
+const PARSED_MBS: usize = PARSED_UNIT_BYTES / 2 / std::mem::size_of::<(MacroBlock, [u8; 24])>();
+const PARSED_COEFFS: usize = PARSED_UNIT_BYTES / 2 / 2;
+
+impl Parsed {
+    /// Empties the unit, sized for [`PARSED_UNIT_BYTES`] so that it never grows.
+    fn reset(&mut self) {
+        self.mbs.clear();
+        self.coeffs.clear();
+        self.error = None;
+        self.mbs.reserve_exact(PARSED_MBS);
+        self.coeffs.reserve_exact(PARSED_COEFFS);
+    }
+
+    /// Whether the unit holds another macroblock whatever its coefficients.
+    fn has_room(&self) -> bool {
+        self.mbs.len() < PARSED_MBS && self.coeffs.len() + 384 <= PARSED_COEFFS
+    }
+
+    /// Adds a macroblock, moving its coefficients out of `blocks`, which it clears as the
+    /// reconstruction does.
+    fn push(&mut self, mb: MacroBlock, kinds: &[u8; 24], blocks: &mut [i16; 384]) {
+        for (block, &kind) in blocks.as_chunks_mut::<16>().0.iter_mut().zip(kinds) {
+            match kind {
+                transform::NO_COEFFS => {}
+                transform::DC_ONLY => {
+                    self.coeffs.push(block[0]);
+                    block[0] = 0;
+                }
+                _ => {
+                    self.coeffs.extend_from_slice(block);
+                    block.fill(0);
+                }
+            }
+        }
+        self.mbs.push((mb, *kinds));
+    }
+}
+
+/// Reads the macroblocks of a frame ahead of their reconstruction, a [`Parsed`] unit at a time.
+struct Parser {
+    dec: Vp8Decoder<'static>,
+    /// The runner and units ahead a [`ModeRows`] reads the modes with once the parser starts,
+    /// after the parser has its helper.
+    modes_on: Option<(Runner, usize)>,
+    modes: Option<Box<ModesAhead>>,
+    mbx: usize,
+    mby: usize,
+    done: bool,
+}
+
+impl Produce for Parser {
+    type Unit = Parsed;
+
+    fn produce(&mut self, spare: Option<Parsed>) -> Option<Parsed> {
+        let (mbwidth, mbheight) = (usize::from(self.dec.mbwidth), usize::from(self.dec.mbheight));
+        if self.done || self.mby == mbheight {
+            return None;
+        }
+        if let Some((runner, ahead)) = self.modes_on.take() {
+            let modes = ModeRows { dec: self.dec.split_modes(), mby: 0, rows: mode_unit_rows(mbwidth), done: false };
+            let ahead = Ahead::new(modes, runner, ahead);
+            self.modes = Some(Box::new(ModesAhead { ahead, unit: ModeUnit::default(), at: 0, width: mbwidth }));
+        }
+        let modes = self.modes.as_deref_mut()?;
+        let mut unit = spare.unwrap_or_default();
+        unit.reset();
+        let mut blocks = [0i16; 384];
+        while self.mby < mbheight && unit.has_room() {
+            if self.mbx == 0 {
+                self.dec.left = PreviousMacroBlock::default();
+                if let Err(e) = modes.next_row(&mut self.dec.mode_row) {
+                    unit.error = Some(e);
+                    self.done = true;
+                    break;
+                }
+            }
+            let p = self.mby % usize::from(self.dec.num_partitions);
+            let mut kinds = [transform::NO_COEFFS; 24];
+            let mb = self.dec.mode_row[self.mbx];
+            match self.dec.parse_residuals(mb, self.mbx, p, &mut blocks, &mut kinds) {
+                Ok(mb) => unit.push(mb, &kinds, &mut blocks),
+                Err(e) => {
+                    unit.error = Some(e);
+                    self.done = true;
+                    break;
+                }
+            }
+            self.mbx += 1;
+            if self.mbx == mbwidth {
+                self.mbx = 0;
+                self.mby += 1;
+            }
+        }
+        Some(unit)
+    }
+}
+
+/// Reads the modes of macroblock rows ahead of their residuals, `rows` at a time.
+struct ModeRows {
+    dec: Vp8Decoder<'static>,
+    mby: usize,
+    rows: usize,
+    done: bool,
+}
+
+/// The modes of macroblock rows, and the error the read stopped at.
+#[derive(Default)]
+struct ModeUnit {
+    mbs: Vec<MacroBlock>,
+    error: Option<DecodingError>,
+}
+
+/// About how many bytes of modes a [`ModeUnit`] holds: at least one row.
+const MODE_BYTES: usize = 8 << 10;
+
+fn mode_unit_rows(mbwidth: usize) -> usize {
+    (MODE_BYTES / (mbwidth * std::mem::size_of::<MacroBlock>())).max(1)
+}
+
+impl Produce for ModeRows {
+    type Unit = ModeUnit;
+
+    fn produce(&mut self, spare: Option<ModeUnit>) -> Option<ModeUnit> {
+        let mbheight = usize::from(self.dec.mbheight);
+        if self.done || self.mby == mbheight {
+            return None;
+        }
+        let mut unit = spare.unwrap_or_default();
+        unit.mbs.clear();
+        unit.mbs.reserve_exact(self.rows * usize::from(self.dec.mbwidth));
+        unit.error = None;
+        for _ in 0..self.rows.min(mbheight - self.mby) {
+            self.dec.left = PreviousMacroBlock::default();
+            if let Err(e) = self.dec.read_mode_row() {
+                unit.error = Some(e);
+                self.done = true;
+                break;
+            }
+            unit.mbs.extend_from_slice(&self.dec.mode_row);
+            self.mby += 1;
+        }
+        Some(unit)
+    }
+}
+
+/// The mode rows a [`ModeRows`] reads ahead, handed out one at a time.
+struct ModesAhead {
+    ahead: Ahead<ModeRows>,
+    unit: ModeUnit,
+    at: usize,
+    width: usize,
+}
+
+impl ModesAhead {
+    /// The modes of the next row into `row`; the error the read stopped at once it gets there.
+    fn next_row(&mut self, row: &mut Vec<MacroBlock>) -> Result<(), DecodingError> {
+        while self.at == self.unit.mbs.len() {
+            if let Some(e) = self.unit.error.take() {
+                return Err(e);
+            }
+            let spent = std::mem::take(&mut self.unit);
+            self.unit = self.ahead.next(Some(spent)).ok_or(DecodingError::BitStreamError)?;
+            self.at = 0;
+        }
+        row.clear();
+        row.extend_from_slice(&self.unit.mbs[self.at..][..self.width]);
+        self.at += self.width;
+        Ok(())
+    }
+}
+
+/// The macroblocks a [`Parser`] reads ahead, handed out one at a time.
+struct ParsedAhead {
+    ahead: Ahead<Parser>,
+    unit: Parsed,
+    at: usize,
+    pos: usize,
+}
+
+impl ParsedAhead {
+    /// The next macroblock, its coefficients into `blocks` (zero on entry) and kinds of
+    /// transform into `kinds`; the error the read stopped at once it gets there.
+    fn next(&mut self, blocks: &mut [i16; 384], kinds: &mut [u8; 24]) -> Result<MacroBlock, DecodingError> {
+        while self.at == self.unit.mbs.len() {
+            if let Some(e) = self.unit.error.take() {
+                return Err(e);
+            }
+            let spent = std::mem::take(&mut self.unit);
+            self.unit = self.ahead.next(Some(spent)).ok_or(DecodingError::BitStreamError)?;
+            self.at = 0;
+            self.pos = 0;
+        }
+        let (mb, k) = self.unit.mbs[self.at];
+        self.at += 1;
+        *kinds = k;
+        let coeffs = &self.unit.coeffs;
+        for (block, &kind) in blocks.as_chunks_mut::<16>().0.iter_mut().zip(&k) {
+            match kind {
+                transform::NO_COEFFS => {}
+                transform::DC_ONLY => {
+                    block[0] = coeffs[self.pos];
+                    self.pos += 1;
+                }
+                _ => {
+                    block.copy_from_slice(&coeffs[self.pos..self.pos + 16]);
+                    self.pos += 16;
+                }
+            }
+        }
+        Ok(mb)
     }
 }
 
@@ -864,6 +1158,8 @@ pub(crate) struct BandDecoder<'a, const BPP: usize> {
     v_full: Vec<u8>,
     uv_emitted: usize,
     bypass_filter: bool,
+    /// The macroblocks read ahead on helpers, where they are.
+    parsed: Option<Box<ParsedAhead>>,
 }
 
 /// A plane of a frame's pixels.
@@ -900,6 +1196,7 @@ impl<'a, const BPP: usize> BandDecoder<'a, BPP> {
             v_full: vec![0; width],
             uv_emitted: 0,
             bypass_filter: false,
+            parsed: None,
         })
     }
 
@@ -957,7 +1254,7 @@ impl<'a, const BPP: usize> BandDecoder<'a, BPP> {
         }
         dec.y_base = (mby * 16).wrapping_sub(BAND_KEEP_Y);
         dec.uv_base = (mby * 8).wrapping_sub(BAND_KEEP_UV);
-        dec.decode_mb_row(mby, &mut self.row)?;
+        dec.decode_mb_row(mby, &mut self.row, self.parsed.as_deref_mut())?;
         if !self.bypass_filter {
             for (mbx, mb) in self.row.iter().enumerate() {
                 dec.loop_filter(mbx, mby, mb);
@@ -970,6 +1267,22 @@ impl<'a, const BPP: usize> BandDecoder<'a, BPP> {
         (self.dec.frame.width, self.dec.frame.height)
     }
 
+    /// Whether the frame has macroblocks enough to read ahead.
+    fn reads_ahead(&self) -> bool {
+        usize::from(self.dec.mbwidth) * usize::from(self.dec.mbheight) >= MIN_AHEAD_MBS
+    }
+
+    /// What reading `ahead` units of macroblocks and of their modes ahead holds beyond decoding
+    /// them in place, 0 where the frame is too small to: per part the units ahead, the one being
+    /// read and the one taken.
+    pub(crate) fn ahead_bytes(&self, ahead: usize) -> usize {
+        if !self.reads_ahead() {
+            return 0;
+        }
+        let mbwidth = usize::from(self.dec.mbwidth);
+        let modes = mode_unit_rows(mbwidth) * mbwidth * std::mem::size_of::<MacroBlock>();
+        (ahead.max(1) + 2) * (PARSED_UNIT_BYTES + modes)
+    }
 
     /// Decodes macroblock rows until a band of rows is final and returns its first row and
     /// pixels, or `None` after the last band.
@@ -1059,6 +1372,27 @@ impl<'a, const BPP: usize> BandDecoder<'a, BPP> {
         }
     }
 }
+
+impl<const BPP: usize> BandDecoder<'static, BPP> {
+    /// Reads the macroblocks ahead on `runner`'s helpers, at most `ahead` units of
+    /// [`PARSED_UNIT_BYTES`] past the one taken; before the first row.
+    pub(crate) fn run_ahead(&mut self, runner: Runner, ahead: usize) {
+        if self.mby > 0 || self.parsed.is_some() || !self.reads_ahead() {
+            return;
+        }
+        let modes_on = Some((runner.clone(), ahead));
+        let parser = Parser { dec: self.dec.split_parser(), modes_on, modes: None, mbx: 0, mby: 0, done: false };
+        self.parsed = Some(Box::new(ParsedAhead {
+            ahead: Ahead::new(parser, runner, ahead),
+            unit: Parsed::default(),
+            at: 0,
+            pos: 0,
+        }));
+    }
+}
+
+/// The fewest macroblocks a frame reads ahead: about a millisecond of work.
+const MIN_AHEAD_MBS: usize = 256;
 
 /// Rows of the previous macroblock row a band keeps: the luma rows the next row's loop
 /// filter changes plus those whose fancy upsampling needs the next chroma rows, and the

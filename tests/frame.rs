@@ -304,3 +304,131 @@ fn decodes_as_libwebp() {
     eprintln!("{n} decodes, {diff} differences");
     assert_eq!(diff, 0);
 }
+
+/// A runner with `threads` helpers, a thread each while it works, that turns work down at
+/// random (seeded) as a busy pool does.
+fn helpers(threads: usize, seed: u64) -> image_webp::Runner {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    let idle = Arc::new(AtomicUsize::new(threads));
+    let rng = Mutex::new(StdRng::seed_from_u64(seed));
+    Arc::new(move |work: Box<dyn FnOnce() + Send>| {
+        if rng.lock().unwrap().gen_ratio(1, 5) {
+            return false;
+        }
+        let mut n = idle.load(Ordering::Acquire);
+        loop {
+            if n == 0 {
+                return false;
+            }
+            match idle.compare_exchange_weak(n, n - 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(now) => n = now,
+            }
+        }
+        let idle = idle.clone();
+        std::thread::spawn(move || {
+            work();
+            idle.fetch_add(1, Ordering::AcqRel);
+        });
+        true
+    })
+}
+
+/// The bands of a decode from a reader and the error it stops at, with its parts run ahead on
+/// `helpers` helpers, `ahead` units ahead, where given.
+fn banded(data: &[u8], size: Option<(u32, u32)>, alpha: bool, ahead: Option<(usize, usize, u64)>) -> (Vec<(u32, Vec<u8>)>, Option<String>) {
+    let mut r = BufReader::with_capacity(61, Cursor::new(data.to_vec()));
+    let mut out = Vec::new();
+    let h = match headers::read_decoding(&mut r, 0, data.len() as u64) {
+        Ok(h) => h,
+        Err(e) => return (out, Some(format!("{e:?}"))),
+    };
+    let mut d = match FrameDecoder::from_reader(r, 0, data.len() as u64, &h, size, alpha) {
+        Ok(d) => d,
+        Err(e) => return (out, Some(format!("{e:?}"))),
+    };
+    if let Some((threads, ahead, seed)) = ahead {
+        d.run_ahead(helpers(threads, seed), ahead);
+    }
+    loop {
+        match d.next_band() {
+            Ok(Some((first, rows))) => out.push((first, rows.to_vec())),
+            Ok(None) => return (out, None),
+            Err(e) => return (out, Some(format!("{e:?}"))),
+        }
+    }
+}
+
+/// Lossy stills of at least 256 macroblocks, the frames a caller reads ahead.
+fn lossy_ahead_inputs() -> Vec<(String, Vec<u8>)> {
+    let mut v: Vec<(String, Vec<u8>)> = inputs()
+        .into_iter()
+        .filter(|(_, d)| {
+            let Ok(h) = headers::decoding(d) else { return false };
+            FrameDecoder::new(d, &h, None, true).is_ok_and(|f| f.ahead_bytes(1) > 0)
+        })
+        .collect();
+    let mut rng = StdRng::seed_from_u64(23);
+    for (w, h, alpha, partitions) in [(260, 250, 1, 0), (1000, 70, 0, 1), (70, 1000, 2, 2), (4000, 33, 1, 3), (521, 517, 0, 0)] {
+        let p = picture(&mut rng, w, h, alpha);
+        v.push((format!("gen {w}x{h} alpha {alpha} partitions {partitions}"), encode_partitions(w, h, &p, 80.0, partitions)));
+    }
+    v
+}
+
+#[test]
+fn decodes_ahead_as_alone() {
+    let mut rng = StdRng::seed_from_u64(31);
+    let (mut n, mut diff) = (0, 0);
+    let inputs = lossy_ahead_inputs();
+    assert!(inputs.len() >= 10, "{} inputs", inputs.len());
+    for (name, data) in &inputs {
+        let mut variants = vec![(name.clone(), data.clone())];
+        for k in 0..12 {
+            let mut d = data.clone();
+            if k % 2 == 0 {
+                d.truncate(rng.gen_range(d.len() / 3..d.len()));
+            } else {
+                for _ in 0..rng.gen_range(1..4) {
+                    let at = rng.gen_range(40..d.len());
+                    d[at] = rng.gen();
+                }
+            }
+            variants.push((format!("{name} variant {k}"), d));
+        }
+        for (i, (name, d)) in variants.iter().enumerate() {
+            let sizes = sizes(d);
+            for size in [sizes[0], sizes.get(2).copied().flatten(), sizes.get(3).copied().flatten(), sizes.get(4).copied().flatten()] {
+                for alpha in [false, true] {
+                    let alone = banded(d, size, alpha, None);
+                    let (threads, ahead) = [(1, 1), (2, 2), (3, 4), (1, 3), (3, 1)][(i + n) % 5];
+                    let with = banded(d, size, alpha, Some((threads, ahead, rng.gen())));
+                    n += 1;
+                    if with != alone {
+                        diff += 1;
+                        let at = with.0.iter().zip(&alone.0).position(|(a, b)| a != b);
+                        eprintln!(
+                            "{name} size {size:?} alpha {alpha} helpers {threads} ahead {ahead}: {} bands {:?} vs alone {} bands {:?}, first other band {at:?}",
+                            with.0.len(), with.1, alone.0.len(), alone.1
+                        );
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("{n} decodes ahead, {diff} differences");
+    assert_eq!(diff, 0);
+}
+
+#[test]
+fn decodes_ahead_as_alone_round_after_round() {
+    let mut rng = StdRng::seed_from_u64(37);
+    let p = picture(&mut rng, 640, 400, 1);
+    let data = encode_partitions(640, 400, &p, 75.0, 0);
+    let alone = banded(&data, Some((320, 200)), true, None);
+    for round in 0..300 {
+        let with = banded(&data, Some((320, 200)), true, Some((1 + round % 3, 1 + round % 4, round as u64)));
+        assert!(with == alone, "round {round}: {} bands {:?} vs alone {} bands {:?}", with.0.len(), with.1, alone.0.len(), alone.1);
+    }
+}

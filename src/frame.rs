@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Take};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::ahead::{Ahead, Produce, Runner};
 use crate::decoder::DecodingError;
 use crate::extended::{read_alpha_chunk, AlphaRows};
 use crate::headers::Headers;
@@ -26,11 +27,13 @@ pub struct FrameDecoder<'a> {
     height: u32,
     bpp: usize,
     source: Source<'a>,
+    /// The size of the bitstream, which the output is scaled from.
+    bitstream: (u32, u32),
 }
 
 enum Source<'a> {
-    Rgb(BandDecoder<'a, 3>, Option<AlphaRows<'a>>),
-    Rgba(BandDecoder<'a, 4>, Option<AlphaRows<'a>>),
+    Rgb(BandDecoder<'a, 3>, Option<Alpha<'a>>),
+    Rgba(BandDecoder<'a, 4>, Option<Alpha<'a>>),
     Scaled(Box<ScaledLossy<'a>>),
     /// RGBA bands handed out as they are, or as RGB through `band`.
     Lossless { bands: Lossless<'a>, band: Vec<u8> },
@@ -107,7 +110,7 @@ impl<'a> FrameDecoder<'a> {
                 Some(range) => {
                     let shared = Shared::new(r);
                     let alpha = decode_alpha(shared.clone(), start + range.start as u64, range.len(), width, height)?;
-                    (Box::new(shared), Some(alpha))
+                    (Box::new(shared), Some(Alpha::Rows(Box::new(alpha))))
                 }
                 None => (Box::new(r), None),
             };
@@ -137,7 +140,7 @@ impl<'a> FrameDecoder<'a> {
                 }
             }
         };
-        Ok(Self { width: out_width, height: out_height, bpp, source })
+        Ok(Self { width: out_width, height: out_height, bpp, source, bitstream: (width, height) })
     }
 
     /// The output size.
@@ -258,7 +261,170 @@ impl<'a> FrameDecoder<'a> {
             Source::ScaledLossless(s) => s.next_band(),
         }
     }
+}
 
+impl FrameDecoder<'_> {
+    /// What the decode holds at most beyond decoding on its own once [`run_ahead`](Self::run_ahead)
+    /// runs parts of it `ahead` units ahead; 0 where no part would run ahead.
+    pub fn ahead_bytes(&self, ahead: usize) -> usize {
+        let (bytes, alpha) = match &self.source {
+            Source::Rgb(bands, alpha) => (bands.ahead_bytes(ahead), alpha.is_some()),
+            Source::Rgba(bands, alpha) => (bands.ahead_bytes(ahead), alpha.is_some()),
+            Source::Scaled(s) => (s.bands.ahead_bytes(ahead), s.alpha.is_some()),
+            _ => return 0,
+        };
+        match bytes {
+            0 => 0,
+            _ if alpha => bytes + (self.alpha_ahead(ahead) + 2) * self.alpha_unit_bytes(),
+            _ => bytes,
+        }
+    }
+
+    /// The size of the alpha plane, that of the bitstream.
+    fn alpha_width(&self) -> usize {
+        self.bitstream.0 as usize
+    }
+
+    fn alpha_height(&self) -> usize {
+        self.bitstream.1 as usize
+    }
+
+    /// The bytes of a unit of alpha rows decoded ahead: whole rows, about [`ALPHA_AHEAD_BYTES`].
+    fn alpha_unit_bytes(&self) -> usize {
+        let width = self.alpha_width();
+        (ALPHA_AHEAD_BYTES / width).max(1) * width
+    }
+
+    /// The units of alpha rows decoded ahead: `ahead`, and at least [`ALPHA_AHEAD_ROWS`] rows.
+    fn alpha_ahead(&self, ahead: usize) -> usize {
+        let rows = self.alpha_unit_bytes() / self.alpha_width();
+        ahead.max(ALPHA_AHEAD_ROWS.div_ceil(rows))
+    }
+}
+
+impl FrameDecoder<'static> {
+    /// Runs the parts of a lossy decode that go on their own, reading the macroblocks and
+    /// decoding the alpha plane, on `runner`'s helpers while it has idle ones, at most `ahead`
+    /// units ahead of the rows taken. The pixels and errors are those of the decode on its own.
+    /// Before the first band.
+    pub fn run_ahead(&mut self, runner: Runner, ahead: usize) {
+        if self.ahead_bytes(ahead) == 0 {
+            return;
+        }
+        let (per_unit, alpha_ahead) = (self.alpha_unit_bytes(), self.alpha_ahead(ahead));
+        let (width, height) = (self.alpha_width(), self.alpha_height());
+        let alpha = match &mut self.source {
+            Source::Rgb(bands, alpha) => {
+                bands.run_ahead(runner.clone(), ahead);
+                alpha
+            }
+            Source::Rgba(bands, alpha) => {
+                bands.run_ahead(runner.clone(), ahead);
+                alpha
+            }
+            Source::Scaled(s) => {
+                s.bands.run_ahead(runner.clone(), ahead);
+                &mut s.alpha
+            }
+            _ => return,
+        };
+        if let Some(Alpha::Rows(rows)) = alpha.take() {
+            let rows = *rows;
+            let producer = AlphaProducer { rows, width, left: height, per_unit: per_unit / width, done: false };
+            *alpha = Some(Alpha::Ahead(Box::new(AlphaAhead {
+                ahead: Ahead::new(producer, runner, alpha_ahead),
+                unit: AlphaUnit::default(),
+                at: 0,
+                width,
+            })));
+        }
+    }
+}
+
+/// About how many bytes of alpha rows a unit decoded ahead holds.
+const ALPHA_AHEAD_BYTES: usize = 16 << 10;
+/// The fewest alpha rows decoded ahead: with fewer, the helper stops and is called again
+/// several times in each band of rows the colour decode hands out.
+const ALPHA_AHEAD_ROWS: usize = 8;
+
+/// The alpha plane of a lossy bitstream, its rows decoded in step with the colour or ahead of it.
+enum Alpha<'a> {
+    Rows(Box<AlphaRows<'a>>),
+    Ahead(Box<AlphaAhead>),
+}
+
+impl Alpha<'_> {
+    fn next_row(&mut self) -> Result<&[u8], DecodingError> {
+        match self {
+            Alpha::Rows(rows) => rows.next_row(),
+            Alpha::Ahead(ahead) => ahead.next_row(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct AlphaUnit {
+    rows: Vec<u8>,
+    error: Option<DecodingError>,
+}
+
+/// Decodes the rows of an alpha plane `per_unit` at a time.
+struct AlphaProducer {
+    rows: AlphaRows<'static>,
+    width: usize,
+    left: usize,
+    per_unit: usize,
+    done: bool,
+}
+
+impl Produce for AlphaProducer {
+    type Unit = AlphaUnit;
+
+    fn produce(&mut self, spare: Option<AlphaUnit>) -> Option<AlphaUnit> {
+        if self.done || self.left == 0 {
+            return None;
+        }
+        let mut unit = spare.unwrap_or_default();
+        unit.rows.clear();
+        unit.rows.reserve_exact(self.per_unit * self.width);
+        unit.error = None;
+        for _ in 0..self.per_unit.min(self.left) {
+            match self.rows.next_row() {
+                Ok(row) => unit.rows.extend_from_slice(row),
+                Err(e) => {
+                    unit.error = Some(e);
+                    self.done = true;
+                    break;
+                }
+            }
+            self.left -= 1;
+        }
+        Some(unit)
+    }
+}
+
+/// The rows an [`AlphaProducer`] decodes ahead, handed out one at a time.
+struct AlphaAhead {
+    ahead: Ahead<AlphaProducer>,
+    unit: AlphaUnit,
+    at: usize,
+    width: usize,
+}
+
+impl AlphaAhead {
+    fn next_row(&mut self) -> Result<&[u8], DecodingError> {
+        while self.at * self.width == self.unit.rows.len() {
+            if let Some(e) = self.unit.error.take() {
+                return Err(e);
+            }
+            let spent = std::mem::take(&mut self.unit);
+            self.unit = self.ahead.next(Some(spent)).ok_or(DecodingError::BitStreamError)?;
+            self.at = 0;
+        }
+        let row = &self.unit.rows[self.at * self.width..][..self.width];
+        self.at += 1;
+        Ok(row)
+    }
 }
 
 /// Sets the alpha of the RGBA pixels `row` to `alpha`.
@@ -451,7 +617,7 @@ impl<'a> ScaledLossless<'a> {
 /// alpha each scaled to the output size, then converted per pixel.
 struct ScaledLossy<'a> {
     bands: BandDecoder<'a, 3>,
-    alpha: Option<AlphaRows<'a>>,
+    alpha: Option<Alpha<'a>>,
     /// Whether the alpha plane is scaled and handed out, not only decoded.
     keep_alpha: bool,
     alpha_rows: usize,
@@ -465,7 +631,7 @@ struct ScaledLossy<'a> {
 }
 
 impl<'a> ScaledLossy<'a> {
-    fn new(bands: BandDecoder<'a, 3>, alpha: Option<AlphaRows<'a>>, keep_alpha: bool, (w, h): (u32, u32), (ow, oh): (u32, u32), bpp: usize) -> Self {
+    fn new(bands: BandDecoder<'a, 3>, alpha: Option<Alpha<'a>>, keep_alpha: bool, (w, h): (u32, u32), (ow, oh): (u32, u32), bpp: usize) -> Self {
         let (w, h, ow, oh) = (w as usize, h as usize, ow as usize, oh as usize);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         Self {
