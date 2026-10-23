@@ -6,8 +6,10 @@ use std::io::SeekFrom;
 use crate::decoder::DecodingError;
 use crate::ReadSeek;
 
-use super::common::{TokenProbTables, PROB_DCT_CAT, ZIGZAG};
-use super::TreeNode;
+use super::common::{
+    ChromaMode, IntraMode, LumaMode, Prob, TokenProbTables, KEYFRAME_BPRED_MODE_PROBS,
+    KEYFRAME_UV_MODE_PROBS, KEYFRAME_YMODE_PROBS, PROB_DCT_CAT, ZIGZAG,
+};
 
 /// Token probabilities of one plane, by coefficient position (and the position past the
 /// last one), context and tree node: libwebp's `bands_ptr`, without the pointers.
@@ -127,6 +129,111 @@ fn coeffs(
         n += 1;
     }
     16
+}
+
+/// A macroblock's segment, skip flag and prediction modes.
+pub(crate) struct Modes {
+    pub(crate) segment: u8,
+    pub(crate) skip: bool,
+    pub(crate) luma: LumaMode,
+    pub(crate) bpred: [IntraMode; 16],
+    pub(crate) chroma: ChromaMode,
+}
+
+/// The segment probabilities when the segment map is updated, and the skip probability when
+/// skipping is enabled.
+#[derive(Clone, Copy)]
+pub(crate) struct ModeProbs {
+    pub(crate) segment: Option<[Prob; 3]>,
+    pub(crate) skip: Option<Prob>,
+}
+
+/// libwebp's `ParseIntraMode` with its hardcoded trees.
+#[inline(always)]
+fn modes(
+    b: &mut impl Bits,
+    probs: ModeProbs,
+    top: &mut [IntraMode; 4],
+    left: &mut [IntraMode; 4],
+) -> Modes {
+    let segment = match probs.segment {
+        Some(p) if !b.bit(p[0]) => u8::from(b.bit(p[1])),
+        Some(p) => 2 + u8::from(b.bit(p[2])),
+        None => 0,
+    };
+    let skip = probs.skip.is_some_and(|p| b.bit(p));
+    let mut bpred = [IntraMode::DC; 16];
+    let luma = if !b.bit(KEYFRAME_YMODE_PROBS[0]) {
+        for y in 0..4 {
+            let mut ymode = left[y];
+            for x in 0..4 {
+                ymode = bmode(b, &KEYFRAME_BPRED_MODE_PROBS[top[x] as usize][ymode as usize]);
+                top[x] = ymode;
+            }
+            bpred[4 * y..][..4].copy_from_slice(top);
+            left[y] = ymode;
+        }
+        LumaMode::B
+    } else {
+        let (luma, mode) = if b.bit(KEYFRAME_YMODE_PROBS[1]) {
+            if b.bit(KEYFRAME_YMODE_PROBS[3]) {
+                (LumaMode::TM, IntraMode::TM)
+            } else {
+                (LumaMode::H, IntraMode::HE)
+            }
+        } else if b.bit(KEYFRAME_YMODE_PROBS[2]) {
+            (LumaMode::V, IntraMode::VE)
+        } else {
+            (LumaMode::DC, IntraMode::DC)
+        };
+        *top = [mode; 4];
+        *left = [mode; 4];
+        bpred[12..].copy_from_slice(top);
+        luma
+    };
+    let chroma = if !b.bit(KEYFRAME_UV_MODE_PROBS[0]) {
+        ChromaMode::DC
+    } else if !b.bit(KEYFRAME_UV_MODE_PROBS[1]) {
+        ChromaMode::V
+    } else if b.bit(KEYFRAME_UV_MODE_PROBS[2]) {
+        ChromaMode::TM
+    } else {
+        ChromaMode::H
+    };
+    Modes {
+        segment,
+        skip,
+        luma,
+        bpred,
+        chroma,
+    }
+}
+
+#[inline(always)]
+fn bmode(b: &mut impl Bits, p: &[Prob; 9]) -> IntraMode {
+    if !b.bit(p[0]) {
+        IntraMode::DC
+    } else if !b.bit(p[1]) {
+        IntraMode::TM
+    } else if !b.bit(p[2]) {
+        IntraMode::VE
+    } else if !b.bit(p[3]) {
+        if !b.bit(p[4]) {
+            IntraMode::HE
+        } else if !b.bit(p[5]) {
+            IntraMode::RD
+        } else {
+            IntraMode::VR
+        }
+    } else if !b.bit(p[6]) {
+        IntraMode::LD
+    } else if !b.bit(p[7]) {
+        IntraMode::VL
+    } else if !b.bit(p[8]) {
+        IntraMode::HD
+    } else {
+        IntraMode::HU
+    }
 }
 
 #[must_use]
@@ -398,25 +505,44 @@ impl ArithmeticDecoder {
         self.cold_read_optional_signed_value(n)
     }
 
-    // This is generic and inlined just to skip the first bounds check.
-    #[inline]
-    pub(crate) fn read_with_tree<const N: usize>(&mut self, tree: &[TreeNode; N]) -> BitResult<i8> {
-        let first_node = tree[0];
-        self.read_with_tree_with_first_node(tree, first_node)
+    /// Reads a macroblock's modes, see [`modes`], with the modes of the blocks above and to
+    /// the left in `top` and `left`, which become the macroblock's bottom and right modes.
+    #[inline(never)]
+    pub(crate) fn read_modes(
+        &mut self,
+        probs: ModeProbs,
+        top: &mut [IntraMode; 4],
+        left: &mut [IntraMode; 4],
+    ) -> Result<Modes, DecodingError> {
+        let (mut t, mut l) = (*top, *left);
+        let mut fast = self.fast();
+        let m = modes(&mut fast, probs, &mut t, &mut l);
+        if fast.commit_if_valid(()).is_some() {
+            (*top, *left) = (t, l);
+            return Ok(m);
+        }
+        self.cold_read_modes(probs, top, left)
     }
 
-    // Do not inline this because inlining significantly worsens performance.
+    #[cold]
     #[inline(never)]
-    pub(crate) fn read_with_tree_with_first_node(
+    fn cold_read_modes(
         &mut self,
-        tree: &[TreeNode],
-        first_node: TreeNode,
-    ) -> BitResult<i8> {
-        if let Some(v) = self.fast().read_with_tree(tree, first_node) {
-            return BitResult::ok(v);
-        }
-
-        self.cold_read_with_tree(tree, usize::from(first_node.index))
+        probs: ModeProbs,
+        top: &mut [IntraMode; 4],
+        left: &mut [IntraMode; 4],
+    ) -> Result<Modes, DecodingError> {
+        let mut res = self.start_accumulated_result();
+        let m = modes(
+            &mut ColdBits {
+                decoder: self,
+                res: &mut res,
+            },
+            probs,
+            top,
+            left,
+        );
+        self.check(res, m)
     }
 
     /// Reads the coefficient tokens of one block, see [`coeffs`]; `out` must be zero from
@@ -570,27 +696,6 @@ impl ArithmeticDecoder {
         };
         self.keep_accumulating(res, value)
     }
-
-    #[cold]
-    #[inline(never)]
-    fn cold_read_with_tree(&mut self, tree: &[TreeNode], start: usize) -> BitResult<i8> {
-        let mut index = start;
-        let mut res = self.start_accumulated_result();
-
-        loop {
-            let node = tree[index];
-            let prob = node.prob;
-            let b = self.cold_read_bit(prob).or_accumulate(&mut res);
-            let t = if b { node.right } else { node.left };
-            let new_index = usize::from(t);
-            if new_index < tree.len() {
-                index = new_index;
-            } else {
-                let value = TreeNode::value_from_branch(t);
-                return self.keep_accumulating(res, value);
-            }
-        }
-    }
 }
 
 impl FastDecoder<'_> {
@@ -637,11 +742,6 @@ impl FastDecoder<'_> {
         self.commit_if_valid(value)
     }
 
-    fn read_with_tree(mut self, tree: &[TreeNode], first_node: TreeNode) -> Option<i8> {
-        let value = self.fast_read_with_tree(tree, first_node);
-        self.commit_if_valid(value)
-    }
-
     /// Seven more bytes into `value`, as `VP8LoadNewBytes` with eight bytes left; with fewer
     /// it reads the padding, and `commit_if_valid` turns down what was read then.
     #[inline(always)]
@@ -681,18 +781,6 @@ impl FastDecoder<'_> {
             v = (v << 1) + u8::from(b);
         }
         v
-    }
-
-    fn fast_read_with_tree(&mut self, tree: &[TreeNode], mut node: TreeNode) -> i8 {
-        loop {
-            let prob = node.prob;
-            let b = self.fast_read_bit(prob);
-            let i = if b { node.right } else { node.left };
-            let Some(next_node) = tree.get(usize::from(i)) else {
-                return TreeNode::value_from_branch(i);
-            };
-            node = *next_node;
-        }
     }
 }
 
@@ -756,6 +844,40 @@ mod tests {
                     break;
                 }
                 assert_eq!((na.unwrap(), a), (nb.unwrap(), b));
+            }
+        }
+    }
+
+    #[test]
+    fn modes_near_the_end() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+        use IntraMode::*;
+        let mode = |rng: &mut rand::rngs::StdRng| [DC, TM, VE, HE, LD, RD, VR, VL, HD, HU][rng.gen_range(0..10)];
+        for _ in 0..500 {
+            let len: usize = rng.gen_range(1..40);
+            let buf: Vec<u8> = (0..len).map(|_| rng.gen()).collect();
+            let probs = ModeProbs {
+                segment: rng.gen::<bool>().then(|| rng.gen()),
+                skip: rng.gen::<bool>().then(|| rng.gen()),
+            };
+            let (mut fast, mut cold) = (ArithmeticDecoder::new(), ArithmeticDecoder::new());
+            fast.init(&buf);
+            cold.init(&buf);
+            let mut top = [0; 4].map(|_| mode(&mut rng));
+            let mut left = [0; 4].map(|_| mode(&mut rng));
+            let (mut cold_top, mut cold_left) = (top, left);
+            for _ in 0..len {
+                let a = fast.read_modes(probs, &mut top, &mut left);
+                let b = cold.cold_read_modes(probs, &mut cold_top, &mut cold_left);
+                let (Ok(a), Ok(b)) = (a.as_ref(), b.as_ref()) else {
+                    assert_eq!(a.is_err(), b.is_err());
+                    break;
+                };
+                assert_eq!(
+                    (a.segment, a.skip, a.luma, a.bpred, a.chroma, top, left),
+                    (b.segment, b.skip, b.luma, b.bpred, b.chroma, cold_top, cold_left)
+                );
             }
         }
     }

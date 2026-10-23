@@ -59,29 +59,6 @@ pub(crate) enum LumaMode {
     B = B_PRED,
 }
 
-impl LumaMode {
-    pub(crate) const fn from_i8(val: i8) -> Option<Self> {
-        Some(match val {
-            DC_PRED => Self::DC,
-            V_PRED => Self::V,
-            H_PRED => Self::H,
-            TM_PRED => Self::TM,
-            B_PRED => Self::B,
-            _ => return None,
-        })
-    }
-
-    pub(crate) const fn into_intra(self) -> Option<IntraMode> {
-        Some(match self {
-            Self::DC => IntraMode::DC,
-            Self::V => IntraMode::VE,
-            Self::H => IntraMode::HE,
-            Self::TM => IntraMode::TM,
-            Self::B => return None,
-        })
-    }
-}
-
 #[repr(i8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum ChromaMode {
@@ -97,18 +74,6 @@ pub(crate) enum ChromaMode {
 
     /// Propagate second differences.
     TM = TM_PRED,
-}
-
-impl ChromaMode {
-    pub(crate) const fn from_i8(val: i8) -> Option<Self> {
-        Some(match val {
-            DC_PRED => Self::DC,
-            V_PRED => Self::V,
-            H_PRED => Self::H,
-            TM_PRED => Self::TM,
-            _ => return None,
-        })
-    }
 }
 
 #[repr(i8)]
@@ -127,42 +92,11 @@ pub(crate) enum IntraMode {
     HU = B_HU_PRED,
 }
 
-impl IntraMode {
-    pub(crate) const fn from_i8(val: i8) -> Option<Self> {
-        Some(match val {
-            B_DC_PRED => Self::DC,
-            B_TM_PRED => Self::TM,
-            B_VE_PRED => Self::VE,
-            B_HE_PRED => Self::HE,
-            B_LD_PRED => Self::LD,
-            B_RD_PRED => Self::RD,
-            B_VR_PRED => Self::VR,
-            B_VL_PRED => Self::VL,
-            B_HD_PRED => Self::HD,
-            B_HU_PRED => Self::HU,
-            _ => return None,
-        })
-    }
-}
-
 /// The probability used in the arithmetic coder is a u8 for each byte
 pub(crate) type Prob = u8;
 
-pub(crate) const SEGMENT_ID_TREE: [i8; 6] = [2, 4, -0, -1, -2, -3];
-
-// Section 11.2
-// Tree for determining the keyframe luma intra prediction modes:
-pub(crate) const KEYFRAME_YMODE_TREE: [i8; 8] =
-    [-B_PRED, 2, 4, 6, -DC_PRED, -V_PRED, -H_PRED, -TM_PRED];
-
 // Default probabilities for decoding the keyframe luma modes
 pub(crate) const KEYFRAME_YMODE_PROBS: [Prob; 4] = [145, 156, 163, 128];
-
-// Tree for determining the keyframe B_PRED mode:
-pub(crate) const KEYFRAME_BPRED_MODE_TREE: [i8; 18] = [
-    -B_DC_PRED, 2, -B_TM_PRED, 4, -B_VE_PRED, 6, 8, 12, -B_HE_PRED, 10, -B_RD_PRED, -B_VR_PRED,
-    -B_LD_PRED, 14, -B_VL_PRED, 16, -B_HD_PRED, -B_HU_PRED,
-];
 
 // Probabilities for the BPRED_MODE_TREE
 pub(crate) const KEYFRAME_BPRED_MODE_PROBS: [[[Prob; 9]; 10]; 10] = [
@@ -287,9 +221,6 @@ pub(crate) const KEYFRAME_BPRED_MODE_PROBS: [[[Prob; 9]; 10]; 10] = [
         [112, 19, 12, 61, 195, 128, 48, 4, 24],
     ],
 ];
-
-// Section 11.4 Tree for determining macroblock the chroma mode
-pub(crate) const KEYFRAME_UV_MODE_TREE: [i8; 6] = [-DC_PRED, 2, -V_PRED, 4, -H_PRED, -TM_PRED];
 
 // Probabilities for determining macroblock mode
 pub(crate) const KEYFRAME_UV_MODE_PROBS: [Prob; 3] = [142, 114, 183];

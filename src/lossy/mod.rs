@@ -7,7 +7,7 @@ use crate::ReadSeek;
 use common::*;
 use prediction::*;
 
-use arithmetic_decoder::{by_position, ArithmeticDecoder, PlaneProbs};
+use arithmetic_decoder::{by_position, ArithmeticDecoder, ModeProbs, PlaneProbs};
 
 mod arithmetic_decoder;
 mod common;
@@ -27,78 +27,6 @@ mod transform;
 pub(crate) mod encoder;
 mod yuv;
 pub(crate) use yuv::{fill_row_yuv, upsample_chroma_row};
-
-#[derive(Clone, Copy)]
-pub(crate) struct TreeNode {
-    pub left: u8,
-    pub right: u8,
-    pub prob: Prob,
-    pub index: u8,
-}
-
-impl TreeNode {
-    const UNINIT: TreeNode = TreeNode {
-        left: 0,
-        right: 0,
-        prob: 0,
-        index: 0,
-    };
-
-    const fn prepare_branch(t: i8) -> u8 {
-        if t > 0 {
-            (t as u8) / 2
-        } else {
-            let value = -t;
-            0x80 | (value as u8)
-        }
-    }
-
-    pub(crate) const fn value_from_branch(t: u8) -> i8 {
-        (t & !0x80) as i8
-    }
-}
-
-const fn tree_nodes_from<const N: usize, const M: usize>(
-    tree: [i8; N],
-    probs: [Prob; M],
-) -> [TreeNode; M] {
-    if N != 2 * M {
-        panic!("invalid tree with probs");
-    }
-    let mut nodes = [TreeNode::UNINIT; M];
-    let mut i = 0;
-    while i < M {
-        nodes[i].left = TreeNode::prepare_branch(tree[2 * i]);
-        nodes[i].right = TreeNode::prepare_branch(tree[2 * i + 1]);
-        nodes[i].prob = probs[i];
-        nodes[i].index = i as u8;
-        i += 1;
-    }
-    nodes
-}
-
-const SEGMENT_TREE_NODE_DEFAULTS: [TreeNode; 3] = tree_nodes_from(SEGMENT_ID_TREE, [255; 3]);
-
-const KEYFRAME_YMODE_NODES: [TreeNode; 4] =
-    tree_nodes_from(KEYFRAME_YMODE_TREE, KEYFRAME_YMODE_PROBS);
-
-const KEYFRAME_BPRED_MODE_NODES: [[[TreeNode; 9]; 10]; 10] = {
-    let mut output = [[[TreeNode::UNINIT; 9]; 10]; 10];
-    let mut i = 0;
-    while i < output.len() {
-        let mut j = 0;
-        while j < output[i].len() {
-            output[i][j] =
-                tree_nodes_from(KEYFRAME_BPRED_MODE_TREE, KEYFRAME_BPRED_MODE_PROBS[i][j]);
-            j += 1;
-        }
-        i += 1;
-    }
-    output
-};
-
-const KEYFRAME_UV_MODE_NODES: [TreeNode; 3] =
-    tree_nodes_from(KEYFRAME_UV_MODE_TREE, KEYFRAME_UV_MODE_PROBS);
 
 #[derive(Default, Clone, Copy)]
 struct MacroBlock {
@@ -193,12 +121,14 @@ pub struct Vp8Decoder<'a> {
     partitions: [ArithmeticDecoder; 8],
     num_partitions: u8,
 
-    segment_tree_nodes: [TreeNode; 3],
+    segment_probs: [Prob; 3],
     token_probs: Box<TokenProbTables>,
     pos_probs: Box<[PlaneProbs; 4]>,
 
     // Section 9.11
     prob_skip_false: Option<Prob>,
+    /// The modes of the macroblock row, read ahead of its residuals as libwebp reads them.
+    mode_row: Vec<MacroBlock>,
 
     top: Vec<PreviousMacroBlock>,
     left: PreviousMacroBlock,
@@ -257,12 +187,13 @@ impl<'a> Vp8Decoder<'a> {
 
             num_partitions: 1,
 
-            segment_tree_nodes: SEGMENT_TREE_NODE_DEFAULTS,
+            segment_probs: [255; 3],
             token_probs: Box::new(COEFF_PROBS),
             pos_probs: by_position(&COEFF_PROBS),
 
             // Section 9.11
             prob_skip_false: None,
+            mode_row: Vec::new(),
 
             top: Vec::new(),
             left: PreviousMacroBlock::default(),
@@ -428,7 +359,7 @@ impl<'a> Vp8Decoder<'a> {
                 } else {
                     255
                 };
-                self.segment_tree_nodes[i].prob = prob;
+                self.segment_probs[i] = prob;
             }
         }
 
@@ -557,61 +488,31 @@ impl<'a> Vp8Decoder<'a> {
     }
 
     fn read_macroblock_header(&mut self, mbx: usize) -> Result<MacroBlock, DecodingError> {
-        let mut mb = MacroBlock::default();
-        let mut res = self.b.start_accumulated_result();
-
-        if self.segments_enabled && self.segments_update_map {
-            mb.segmentid =
-                (self.b.read_with_tree(&self.segment_tree_nodes)).or_accumulate(&mut res) as u8;
-        };
-
-        mb.coeffs_skipped = if let Some(prob) = self.prob_skip_false {
-            self.b.read_bool(prob).or_accumulate(&mut res)
-        } else {
-            false
-        };
-
-        // intra prediction
-        let luma = (self.b.read_with_tree(&KEYFRAME_YMODE_NODES)).or_accumulate(&mut res);
-        mb.luma_mode =
-            LumaMode::from_i8(luma).ok_or(DecodingError::LumaPredictionModeInvalid(luma))?;
-
-        match mb.luma_mode.into_intra() {
-            // `LumaMode::B` - This is predicted individually
-            None => {
-                for y in 0usize..4 {
-                    for x in 0usize..4 {
-                        let top = self.top[mbx].bpred[x];
-                        let left = self.left.bpred[y];
-                        let intra = self.b.read_with_tree(
-                            &KEYFRAME_BPRED_MODE_NODES[top as usize][left as usize],
-                        );
-                        let intra = intra.or_accumulate(&mut res);
-                        let bmode = IntraMode::from_i8(intra)
-                            .ok_or(DecodingError::IntraPredictionModeInvalid(intra))?;
-                        mb.bpred[x + y * 4] = bmode;
-
-                        self.top[mbx].bpred[x] = bmode;
-                        self.left.bpred[y] = bmode;
-                    }
-                }
-            }
-            Some(mode) => {
-                for i in 0usize..4 {
-                    mb.bpred[12 + i] = mode;
-                    self.left.bpred[i] = mode;
-                }
-            }
+        if mbx == 0 {
+            self.read_mode_row()?;
         }
+        Ok(self.mode_row[mbx])
+    }
 
-        let chroma = (self.b.read_with_tree(&KEYFRAME_UV_MODE_NODES)).or_accumulate(&mut res);
-        mb.chroma_mode = ChromaMode::from_i8(chroma)
-            .ok_or(DecodingError::ChromaPredictionModeInvalid(chroma))?;
-
-        // top should store the bottom of the current bpred, which is the final 4 values
-        self.top[mbx].bpred = mb.bpred[12..].try_into().unwrap();
-
-        self.b.check(res, mb)
+    /// libwebp's `VP8ParseIntraModeRow`.
+    fn read_mode_row(&mut self) -> Result<(), DecodingError> {
+        let probs = ModeProbs {
+            segment: (self.segments_enabled && self.segments_update_map).then_some(self.segment_probs),
+            skip: self.prob_skip_false,
+        };
+        self.mode_row.clear();
+        for top in &mut self.top {
+            let m = self.b.read_modes(probs, &mut top.bpred, &mut self.left.bpred)?;
+            self.mode_row.push(MacroBlock {
+                bpred: m.bpred,
+                luma_mode: m.luma,
+                chroma_mode: m.chroma,
+                segmentid: m.segment,
+                coeffs_skipped: m.skip,
+                ..MacroBlock::default()
+            });
+        }
+        Ok(())
     }
 
     fn intra_predict_luma(
