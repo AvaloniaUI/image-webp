@@ -65,6 +65,22 @@ unsafe fn add_serial(out: *mut u8, top: *const u8, n: usize, pred: impl Fn(__m12
     }
 }
 
+/// Predictor 11, select: the left pixel where it is further from the top-left than the top
+/// pixel is. Both sums with the residual are taken before the select, so the next left pixel
+/// waits only on the left one's distance.
+#[inline(always)]
+unsafe fn add_select(out: *mut u8, top: *const u8, n: usize) {
+    let mut left = load1(out.sub(4));
+    for i in 0..n {
+        let t = top.add(4 * i);
+        let (up, up_left, src) = (load1(t), load1(t.sub(4)), load1(out.add(4 * i)));
+        let mask = _mm_cmpgt_epi32(_mm_sad_epu8(left, up_left), _mm_sad_epu8(up, up_left));
+        let (from_left, from_up) = (_mm_add_epi8(src, left), _mm_add_epi8(src, up));
+        left = _mm_or_si128(_mm_and_si128(mask, from_left), _mm_andnot_si128(mask, from_up));
+        store1(out.add(4 * i), left);
+    }
+}
+
 /// Predictor 1, the left pixel: a prefix sum over each four pixels.
 #[inline(always)]
 unsafe fn add_left(out: *mut u8, n: usize) {
@@ -74,9 +90,9 @@ unsafe fn add_left(out: *mut u8, n: usize) {
         let src = load4(out.add(4 * i));
         let sum0 = _mm_add_epi8(src, _mm_slli_si128::<4>(src));
         let sum1 = _mm_add_epi8(sum0, _mm_slli_si128::<8>(sum0));
-        let res = _mm_add_epi8(sum1, prev);
-        store4(out.add(4 * i), res);
-        prev = _mm_shuffle_epi32::<0xff>(res);
+        store4(out.add(4 * i), _mm_add_epi8(sum1, prev));
+        // The next left pixel waits on one add, the four pixels' sum taken beside it.
+        prev = _mm_add_epi8(prev, _mm_shuffle_epi32::<0xff>(sum1));
         i += 4;
     }
     while i < n {
@@ -114,18 +130,11 @@ pub(crate) fn predict(mode: u8, image_data: &mut [u8], range: Range<usize>, widt
             8 => add_upper(out, top, n, |t, tl, _| average2(tl, t)),
             9 => add_upper(out, top, n, |t, _, tr| average2(t, tr)),
             10 => add_serial(out, top, n, |l, t, tl, tr| average2(average2(l, tl), average2(t, tr))),
-            11 => add_serial(out, top, n, |l, t, tl, _| {
-                // The left pixel where it is further from the top-left than the top pixel is.
-                let pa = _mm_sad_epu8(t, tl);
-                let pb = _mm_sad_epu8(l, tl);
-                let mask = _mm_cmpgt_epi32(pb, pa);
-                _mm_or_si128(_mm_and_si128(mask, l), _mm_andnot_si128(mask, t))
-            }),
+            11 => add_select(out, top, n),
+            // `clamp(l + t - tl)` as `l` saturated up by `t - tl` and down by `tl - t`, one of
+            // them zero: the left pixel waits on two byte ops, not an unpack and a pack.
             12 => add_serial(out, top, n, |l, t, tl, _| {
-                let zero = _mm_setzero_si128();
-                let d = _mm_sub_epi16(_mm_unpacklo_epi8(t, zero), _mm_unpacklo_epi8(tl, zero));
-                let s = _mm_add_epi16(_mm_unpacklo_epi8(l, zero), d);
-                _mm_packus_epi16(s, s)
+                _mm_subs_epu8(_mm_adds_epu8(l, _mm_subs_epu8(t, tl)), _mm_subs_epu8(tl, t))
             }),
             13 => add_serial(out, top, n, |l, t, tl, _| {
                 let zero = _mm_setzero_si128();
