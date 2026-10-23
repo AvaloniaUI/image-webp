@@ -261,11 +261,16 @@ pub(crate) fn predict_bdcpred(a: &mut [u8], x0: usize, y0: usize, stride: usize)
         v += u32::from(a[(y0 + i) * stride + x0 - 1]);
     }
 
-    v >>= 3;
-    for chunk in a.chunks_exact_mut(stride).skip(y0).take(4) {
-        for ch in &mut chunk[x0..][..4] {
-            *ch = v as u8;
-        }
+    let v = (v >> 3) as u8;
+    put_rows(a, x0, y0, stride, [[v; 4]; 4]);
+}
+
+/// Writes a 4x4 block a row at a time: the transform after it loads whole rows, which byte
+/// stores would keep waiting.
+#[inline(always)]
+fn put_rows(a: &mut [u8], x0: usize, y0: usize, stride: usize, rows: [[u8; 4]; 4]) {
+    for (y, row) in rows.into_iter().enumerate() {
+        a[(y0 + y) * stride + x0..][..4].copy_from_slice(&row);
     }
 }
 
@@ -339,21 +344,13 @@ pub(crate) fn predict_bvepred(a: &mut [u8], x0: usize, y0: usize, stride: usize)
 pub(crate) fn predict_bhepred(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     let p = topleft_pixel(a, x0, y0, stride);
     let (l0, l1, l2, l3) = left_pixels(a, x0, y0, stride);
-
-    let avgs = [
+    let rows = [
         avg3(p, l0, l1),
         avg3(l0, l1, l2),
         avg3(l1, l2, l3),
         avg3(l2, l3, l3),
     ];
-
-    let mut pos = y0 * stride + x0;
-    for avg in avgs {
-        for a_p in &mut a[pos..=pos + 3] {
-            *a_p = avg;
-        }
-        pos += stride;
-    }
+    put_rows(a, x0, y0, stride, rows.map(|v| [v; 4]));
 }
 
 #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
@@ -445,44 +442,43 @@ pub(crate) fn predict_bvlpred(a: &mut [u8], x0: usize, y0: usize, stride: usize)
 
 pub(crate) fn predict_bhdpred(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     let (e0, e1, e2, e3, e4, e5, e6, e7, _) = edge_pixels(a, x0, y0, stride);
-
-    a[(y0 + 3) * stride + x0] = avg2(e0, e1);
-    a[(y0 + 3) * stride + x0 + 1] = avg3(e0, e1, e2);
-    a[(y0 + 2) * stride + x0] = avg2(e1, e2);
-    a[(y0 + 3) * stride + x0 + 2] = avg2(e1, e2);
-    a[(y0 + 2) * stride + x0 + 1] = avg3(e1, e2, e3);
-    a[(y0 + 3) * stride + x0 + 3] = avg3(e1, e2, e3);
-    a[(y0 + 2) * stride + x0 + 2] = avg2(e2, e3);
-    a[(y0 + 1) * stride + x0] = avg2(e2, e3);
-    a[(y0 + 2) * stride + x0 + 3] = avg3(e2, e3, e4);
-    a[(y0 + 1) * stride + x0 + 1] = avg3(e2, e3, e4);
-    a[(y0 + 1) * stride + x0 + 2] = avg2(e3, e4);
-    a[y0 * stride + x0] = avg2(e3, e4);
-    a[(y0 + 1) * stride + x0 + 3] = avg3(e3, e4, e5);
-    a[y0 * stride + x0 + 1] = avg3(e3, e4, e5);
-    a[y0 * stride + x0 + 2] = avg3(e4, e5, e6);
-    a[y0 * stride + x0 + 3] = avg3(e5, e6, e7);
+    let (h0, h1, h2, h3) = (avg2(e3, e4), avg2(e2, e3), avg2(e1, e2), avg2(e0, e1));
+    let (d0, d1, d2, d3) = (
+        avg3(e3, e4, e5),
+        avg3(e2, e3, e4),
+        avg3(e1, e2, e3),
+        avg3(e0, e1, e2),
+    );
+    put_rows(
+        a,
+        x0,
+        y0,
+        stride,
+        [
+            [h0, d0, avg3(e4, e5, e6), avg3(e5, e6, e7)],
+            [h1, d1, h0, d0],
+            [h2, d2, h1, d1],
+            [h3, d3, h2, d2],
+        ],
+    );
 }
 
 pub(crate) fn predict_bhupred(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     let (l0, l1, l2, l3) = left_pixels(a, x0, y0, stride);
-
-    a[y0 * stride + x0] = avg2(l0, l1);
-    a[y0 * stride + x0 + 1] = avg3(l0, l1, l2);
-    a[y0 * stride + x0 + 2] = avg2(l1, l2);
-    a[(y0 + 1) * stride + x0] = avg2(l1, l2);
-    a[y0 * stride + x0 + 3] = avg3(l1, l2, l3);
-    a[(y0 + 1) * stride + x0 + 1] = avg3(l1, l2, l3);
-    a[(y0 + 1) * stride + x0 + 2] = avg2(l2, l3);
-    a[(y0 + 2) * stride + x0] = avg2(l2, l3);
-    a[(y0 + 1) * stride + x0 + 3] = avg3(l2, l3, l3);
-    a[(y0 + 2) * stride + x0 + 1] = avg3(l2, l3, l3);
-    a[(y0 + 2) * stride + x0 + 2] = l3;
-    a[(y0 + 2) * stride + x0 + 3] = l3;
-    a[(y0 + 3) * stride + x0] = l3;
-    a[(y0 + 3) * stride + x0 + 1] = l3;
-    a[(y0 + 3) * stride + x0 + 2] = l3;
-    a[(y0 + 3) * stride + x0 + 3] = l3;
+    let (h0, h1, h2) = (avg2(l0, l1), avg2(l1, l2), avg2(l2, l3));
+    let (d0, d1, d2) = (avg3(l0, l1, l2), avg3(l1, l2, l3), avg3(l2, l3, l3));
+    put_rows(
+        a,
+        x0,
+        y0,
+        stride,
+        [
+            [h0, d0, h1, d1],
+            [h1, d1, h2, d2],
+            [h2, d2, l3, l3],
+            [l3; 4],
+        ],
+    );
 }
 
 #[cfg(all(test, feature = "_benchmarks"))]
