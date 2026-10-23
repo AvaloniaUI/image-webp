@@ -370,7 +370,7 @@ fn convert_y<const STEP: usize>(line: &[u8], out: &mut [u8]) {
     let (line, out) = {
         let done = match STEP {
             4 => super::sse2::rgba_to_y_row(line, out),
-            _ => 0,
+            _ => super::sse2::rgb_to_y_row(line, out),
         };
         (&line[done * STEP..], &mut out[done..])
     };
@@ -551,8 +551,14 @@ mod tests {
 
     #[test]
     fn convert_y_matches_reference() {
-        let line: Vec<u8> = (0..4 * 77).map(|i| (i * 89 % 256) as u8).collect();
-        for width in 0..77 {
+        let mut seed = 1u32;
+        let line: Vec<u8> = (0..4 * 140)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                (seed >> 23) as u8
+            })
+            .collect();
+        for width in 0..140 {
             let mut out = vec![0u8; width];
             convert_y::<3>(&line, &mut out);
             for (i, &y) in out.iter().enumerate() {

@@ -553,3 +553,60 @@ pub(crate) fn rgba_to_y_row(line: &[u8], out: &mut [u8]) -> usize {
     }
     n
 }
+
+/// libwebp's `ConvertRGB24ToY_SSE2`: packed RGB rows to Y, 32 pixels at a time, the channels
+/// pulled apart by five rounds of byte interleaving. Returns how many pixels it converted.
+pub(crate) fn rgb_to_y_row(line: &[u8], out: &mut [u8]) -> usize {
+    let n = out.len().min(line.len() / 3) & !31;
+    // SAFETY: the loads read line[..n * 3] and the stores write out[..n].
+    unsafe {
+        let zero = _mm_setzero_si128();
+        let k_rb = _mm_set1_epi32(6420 << 16 | 16839);
+        let k_g0 = _mm_set1_epi32(33059 - 16384);
+        let k_g1 = _mm_set1_epi32(16384);
+        let rounder = _mm_set1_epi32((16 << 16) + (1 << 15));
+        // One round sends byte k of the 96 to 2k mod 95; five send pixel p's channel c, at
+        // 3p + c, to 32c + p.
+        let split = |v: [__m128i; 6]| {
+            [
+                _mm_unpacklo_epi8(v[0], v[3]),
+                _mm_unpackhi_epi8(v[0], v[3]),
+                _mm_unpacklo_epi8(v[1], v[4]),
+                _mm_unpackhi_epi8(v[1], v[4]),
+                _mm_unpacklo_epi8(v[2], v[5]),
+                _mm_unpackhi_epi8(v[2], v[5]),
+            ]
+        };
+        // Four Y in 32-bit lanes from the low four 16-bit r, g and b.
+        let luma = |r, g, b| {
+            let rb = _mm_unpacklo_epi16(r, b);
+            let g0 = _mm_unpacklo_epi16(g, zero);
+            let y = _mm_add_epi32(
+                _mm_madd_epi16(rb, k_rb),
+                _mm_add_epi32(_mm_madd_epi16(g0, k_g0), _mm_madd_epi16(g0, k_g1)),
+            );
+            _mm_srli_epi32::<16>(_mm_add_epi32(y, rounder))
+        };
+        let luma8 = |r, g, b| {
+            let hi = |v| _mm_unpackhi_epi64(v, v);
+            _mm_packs_epi32(luma(r, g, b), luma(hi(r), hi(g), hi(b)))
+        };
+        for i in (0..n).step_by(32) {
+            let p = line.as_ptr().add(i * 3);
+            let mut v = [zero; 6];
+            for (k, v) in v.iter_mut().enumerate() {
+                *v = _mm_loadu_si128(p.add(16 * k).cast());
+            }
+            let planes = split(split(split(split(split(v)))));
+            for j in 0..2 {
+                let (r, g, b) = (planes[j], planes[2 + j], planes[4 + j]);
+                let lo = |v| _mm_unpacklo_epi8(v, zero);
+                let hi = |v| _mm_unpackhi_epi8(v, zero);
+                let y0 = luma8(lo(r), lo(g), lo(b));
+                let y1 = luma8(hi(r), hi(g), hi(b));
+                _mm_storeu_si128(out.as_mut_ptr().add(i + 16 * j).cast(), _mm_packus_epi16(y0, y1));
+            }
+        }
+    }
+    n
+}
