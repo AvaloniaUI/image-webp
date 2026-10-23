@@ -917,8 +917,11 @@ fn transform_color(m: Multipliers, data: &mut [u32]) {
 }
 
 fn prediction_cost_cross_color(accumulated: &[u32; 256], counts: &[u32; 256]) -> i64 {
-    (combined_shannon_entropy(counts, accumulated) as i64)
-        .wrapping_add(prediction_cost_bias(counts, 3, &CROSS_COLOR_BIAS_WEIGHTS))
+    (combined_shannon_entropy(counts, accumulated) as i64).wrapping_add(prediction_cost_bias(
+        counts,
+        3,
+        &CROSS_COLOR_BIAS_WEIGHTS,
+    ))
 }
 
 /// The tile's green, red and blue channels, one byte per pixel.

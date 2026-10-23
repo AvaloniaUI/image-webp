@@ -34,8 +34,14 @@ unsafe fn select(t: __m256i, l: __m256i, tl: __m256i) -> __m256i {
     let zero = _mm256_setzero_si256();
     let dl = abs_diff(l, tl);
     let dt = abs_diff(t, tl);
-    let lo = pixel_sums(_mm256_unpacklo_epi8(dl, zero), _mm256_unpacklo_epi8(dt, zero));
-    let hi = pixel_sums(_mm256_unpackhi_epi8(dl, zero), _mm256_unpackhi_epi8(dt, zero));
+    let lo = pixel_sums(
+        _mm256_unpacklo_epi8(dl, zero),
+        _mm256_unpacklo_epi8(dt, zero),
+    );
+    let hi = pixel_sums(
+        _mm256_unpackhi_epi8(dl, zero),
+        _mm256_unpackhi_epi8(dt, zero),
+    );
     let s = _mm256_castps_si256(_mm256_shuffle_ps(
         _mm256_castsi256_ps(lo),
         _mm256_castsi256_ps(hi),
@@ -72,8 +78,14 @@ unsafe fn add_half_difference(a: __m256i, b: __m256i) -> __m256i {
 unsafe fn clamped_add_subtract_half(l: __m256i, t: __m256i, tl: __m256i) -> __m256i {
     let zero = _mm256_setzero_si256();
     let ave = average2(l, t);
-    let lo = add_half_difference(_mm256_unpacklo_epi8(ave, zero), _mm256_unpacklo_epi8(tl, zero));
-    let hi = add_half_difference(_mm256_unpackhi_epi8(ave, zero), _mm256_unpackhi_epi8(tl, zero));
+    let lo = add_half_difference(
+        _mm256_unpacklo_epi8(ave, zero),
+        _mm256_unpacklo_epi8(tl, zero),
+    );
+    let hi = add_half_difference(
+        _mm256_unpackhi_epi8(ave, zero),
+        _mm256_unpackhi_epi8(tl, zero),
+    );
     _mm256_packus_epi16(lo, hi)
 }
 
@@ -170,7 +182,10 @@ unsafe fn add_slog2(v: __m256i, acc: &mut __m256i) -> u32 {
         let idx = _mm256_srlv_epi32(v, log_cnt);
         let log2 = _mm256_i32gather_epi32::<4>(LOG2_TABLE.as_ptr().cast(), idx);
         let term = _mm256_add_epi32(log2, _mm256_slli_epi32::<23>(log_cnt));
-        let y1 = _mm256_sub_epi32(_mm256_sllv_epi32(_mm256_set1_epi32(1), log_cnt), _mm256_set1_epi32(1));
+        let y1 = _mm256_sub_epi32(
+            _mm256_sllv_epi32(_mm256_set1_epi32(1), log_cnt),
+            _mm256_set1_epi32(1),
+        );
         let corr = _mm256_mullo_epi32(_mm256_and_si256(v, y1), _mm256_set1_epi32(12102203));
         let even = _mm256_add_epi64(
             _mm256_mul_epu32(v, term),
@@ -265,10 +280,17 @@ unsafe fn chunk_stats_avx2(v: &[u32; 64]) -> (u32, u32, u64) {
             }
         }
     }
-    let m = _mm_max_epu32(_mm256_castsi256_si128(max), _mm256_extracti128_si256::<1>(max));
+    let m = _mm_max_epu32(
+        _mm256_castsi256_si128(max),
+        _mm256_extracti128_si256::<1>(max),
+    );
     let m = _mm_max_epu32(m, _mm_shuffle_epi32::<0b01_00_11_10>(m));
     let m = _mm_max_epu32(m, _mm_shuffle_epi32::<0b10_11_00_01>(m));
-    (hsum32(sum), _mm_cvtsi128_si32(m) as u32, hsum64(acc).wrapping_add(large))
+    (
+        hsum32(sum),
+        _mm_cvtsi128_si32(m) as u32,
+        hsum64(acc).wrapping_add(large),
+    )
 }
 
 /// The wrapping sum, the maximum and the sum of `fast_slog2` of `v`, when the CPU has AVX2.
@@ -290,7 +312,10 @@ mod tests {
         let n = cur.len() - 1;
         let (mut want, mut got) = (vec![0; n], vec![0; n]);
         for i in 0..n {
-            want[i] = sub_pixels(cur[i + 1], predict::<M>(cur[i], up[i], up[i + 1], up[i + 2]));
+            want[i] = sub_pixels(
+                cur[i + 1],
+                predict::<M>(cur[i], up[i], up[i + 1], up[i + 2]),
+            );
         }
         // SAFETY: the caller checked for AVX2.
         let done = unsafe { sub_batch::<M>(cur, up, &mut got) };
@@ -319,7 +344,13 @@ mod tests {
         for n in [7usize, 8, 9, 15, 16, 17, 33, 70] {
             for clear_at in [usize::MAX, 3, 12, 40] {
                 let cur: Vec<u32> = (0..=n)
-                    .map(|i| if i == clear_at { rnd() & 0x00ff_ffff } else { rnd() | 0x0100_0000 })
+                    .map(|i| {
+                        if i == clear_at {
+                            rnd() & 0x00ff_ffff
+                        } else {
+                            rnd() | 0x0100_0000
+                        }
+                    })
                     .collect();
                 let up: Vec<u32> = (0..n + 2).map(|_| rnd()).collect();
                 check_avx2::<0>(&cur, &up);
@@ -352,7 +383,22 @@ mod tests {
             seed ^= seed << 5;
             seed
         };
-        let edges = [0u32, 1, 2, 255, 256, 257, 511, 512, 4095, 4096, 65535, 65536, 65537, u32::MAX];
+        let edges = [
+            0u32,
+            1,
+            2,
+            255,
+            256,
+            257,
+            511,
+            512,
+            4095,
+            4096,
+            65535,
+            65536,
+            65537,
+            u32::MAX,
+        ];
         for round in 0..3000 {
             let mut pick = || match rnd() % 6 {
                 0 => 0,
@@ -360,7 +406,13 @@ mod tests {
                 2 => 256 + rnd() % (65536 - 256),
                 3 => edges[(rnd() % edges.len() as u32) as usize],
                 4 => rnd() % (1 << 20),
-                _ => if round % 2 == 0 { 0 } else { rnd() },
+                _ => {
+                    if round % 2 == 0 {
+                        0
+                    } else {
+                        rnd()
+                    }
+                }
             };
             let v: [u32; 64] = core::array::from_fn(|_| pick());
             let want = v.iter().fold((0u32, 0u32, 0u64), |(s, m, e), &x| {
@@ -374,9 +426,13 @@ mod tests {
                 let ab = a.wrapping_add(b);
                 sx = sx.wrapping_add(a);
                 sxy = sxy.wrapping_add(ab);
-                want = want.wrapping_add(fast_slog2(a)).wrapping_add(fast_slog2(ab));
+                want = want
+                    .wrapping_add(fast_slog2(a))
+                    .wrapping_add(fast_slog2(ab));
             }
-            let want = fast_slog2(sx).wrapping_add(fast_slog2(sxy)).wrapping_sub(want);
+            let want = fast_slog2(sx)
+                .wrapping_add(fast_slog2(sxy))
+                .wrapping_sub(want);
             assert_eq!(combined_shannon_entropy(&x, &y), Some(want));
         }
     }
