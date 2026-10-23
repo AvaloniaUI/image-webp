@@ -173,7 +173,7 @@ fn picture(rng: &mut StdRng, w: usize, h: usize, alpha: u8) -> Vec<u8> {
                 5 => [(x * 3) as u8, (y % 450) as u8, (x ^ (y % 450)) as u8, 255],
                 3 | 4 => {
                     let k = ((x / 3 + y / 2 + n as usize % 2) % if alpha == 3 { 4 } else { 40 }) as u8;
-                    [k * 60, k * 13, 255 - k * 5, if k % 3 == 0 { 128 } else { 255 }]
+                    [k.wrapping_mul(60), k.wrapping_mul(13), 255 - k * 5, if k % 3 == 0 { 128 } else { 255 }]
                 }
                 _ => [(x * fx) as u8 ^ n, (y * fy) as u8, ((x + y) * 3) as u8 ^ (n / 2), a],
             }
