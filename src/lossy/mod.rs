@@ -7,7 +7,7 @@ use crate::ReadSeek;
 use common::*;
 use prediction::*;
 
-use arithmetic_decoder::ArithmeticDecoder;
+use arithmetic_decoder::{by_position, ArithmeticDecoder, PlaneProbs};
 
 mod arithmetic_decoder;
 mod common;
@@ -195,6 +195,7 @@ pub struct Vp8Decoder<'a> {
 
     segment_tree_nodes: [TreeNode; 3],
     token_probs: Box<TokenProbTables>,
+    pos_probs: Box<[PlaneProbs; 4]>,
 
     // Section 9.11
     prob_skip_false: Option<Prob>,
@@ -258,6 +259,7 @@ impl<'a> Vp8Decoder<'a> {
 
             segment_tree_nodes: SEGMENT_TREE_NODE_DEFAULTS,
             token_probs: Box::new(COEFF_PROBS),
+            pos_probs: by_position(&COEFF_PROBS),
 
             // Section 9.11
             prob_skip_false: None,
@@ -541,6 +543,7 @@ impl<'a> Vp8Decoder<'a> {
         let _ = self.b.read_literal(1);
 
         self.update_token_probabilities()?;
+        self.pos_probs = by_position(&self.token_probs);
 
         let mut res = self.b.start_accumulated_result();
         let mb_no_skip_coeff = self.b.read_literal(1).or_accumulate(&mut res);
@@ -718,7 +721,7 @@ impl<'a> Vp8Decoder<'a> {
     ) -> Result<usize, DecodingError> {
         assert!(complexity <= 2);
         let first = usize::from(plane == Plane::YCoeff1);
-        let probs = &self.token_probs[plane as usize];
+        let probs = &self.pos_probs[plane as usize];
         self.partitions[p].read_coeffs(
             probs,
             complexity,

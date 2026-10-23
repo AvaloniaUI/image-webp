@@ -6,14 +6,26 @@ use std::io::SeekFrom;
 use crate::decoder::DecodingError;
 use crate::ReadSeek;
 
-use super::common::{PROB_DCT_CAT, ZIGZAG};
+use super::common::{TokenProbTables, PROB_DCT_CAT, ZIGZAG};
 use super::TreeNode;
 
-/// Token probabilities of one plane, by band, context and tree node.
-pub(crate) type PlaneProbs = [[[u8; 11]; 3]; 8];
+/// Token probabilities of one plane, by coefficient position (and the position past the
+/// last one), context and tree node: libwebp's `bands_ptr`, without the pointers.
+pub(crate) type PlaneProbs = [[[u8; 11]; 3]; 17];
 
 /// The band of each coefficient position, and of the position past the last one.
 const BANDS: [u8; 17] = [0, 1, 2, 3, 6, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 0];
+
+/// The probabilities of `tables` by position instead of band.
+pub(crate) fn by_position(tables: &TokenProbTables) -> Box<[PlaneProbs; 4]> {
+    let mut out = Box::new([[[[0; 11]; 3]; 17]; 4]);
+    for (plane, bands) in out.iter_mut().zip(tables) {
+        for (pos, &band) in plane.iter_mut().zip(&BANDS) {
+            *pos = bands[usize::from(band)];
+        }
+    }
+    out
+}
 
 /// Where `coeffs` reads its bits from.
 trait Bits {
@@ -89,7 +101,7 @@ fn coeffs(
     out: &mut [i32; 16],
 ) -> usize {
     let mut n = first;
-    let mut p = &probs[usize::from(BANDS[n])][ctx];
+    let mut p = &probs[n][ctx];
     while n < 16 {
         if !b.bit(p[0]) {
             return n;
@@ -99,9 +111,9 @@ fn coeffs(
             if n == 16 {
                 return 16;
             }
-            p = &probs[usize::from(BANDS[n])][0];
+            p = &probs[n][0];
         }
-        let p_ctx = &probs[usize::from(BANDS[n + 1])];
+        let p_ctx = &probs[n + 1];
         let v = if !b.bit(p[2]) {
             p = &p_ctx[1];
             1
@@ -724,7 +736,7 @@ mod tests {
         for _ in 0..500 {
             let len: usize = rng.gen_range(1..40);
             let buf: Vec<u8> = (0..len).map(|_| rng.gen()).collect();
-            let mut probs: PlaneProbs = [[[0; 11]; 3]; 8];
+            let mut probs: PlaneProbs = [[[0; 11]; 3]; 17];
             for p in probs.as_flattened_mut().as_flattened_mut() {
                 *p = rng.gen_range(1..=255);
             }
