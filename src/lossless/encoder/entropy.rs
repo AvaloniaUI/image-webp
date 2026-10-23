@@ -231,12 +231,22 @@ fn entropy_unrefined<const COMBINED: bool>(x: &[u32], y: &[u32]) -> (BitEntropy,
             }
             tail.fill(0);
         }
-        for &v in chunk.iter() {
-            sum = sum.wrapping_add(v);
-            max_val = max_val.max(v);
-        }
-        for &v in chunk.iter() {
-            entropy = entropy.wrapping_add(fast_slog2(v));
+        #[cfg(target_arch = "x86_64")]
+        let stats = super::avx2::chunk_stats(chunk);
+        #[cfg(not(target_arch = "x86_64"))]
+        let stats = None;
+        if let Some((s, m, e)) = stats {
+            sum = sum.wrapping_add(s);
+            max_val = max_val.max(m);
+            entropy = entropy.wrapping_add(e);
+        } else {
+            for &v in chunk.iter() {
+                sum = sum.wrapping_add(v);
+                max_val = max_val.max(v);
+            }
+            for &v in chunk.iter() {
+                entropy = entropy.wrapping_add(fast_slog2(v));
+            }
         }
         let (mut s, z) = run_masks(&v);
         if base + 64 > n {
@@ -343,6 +353,10 @@ pub(crate) fn bits_entropy(array: &[u32]) -> u64 {
 
 /// `CombinedShannonEntropy_SSE2`: only the bins where `x` or `y` is nonzero contribute.
 pub(crate) fn combined_shannon_entropy(x: &[u32; 256], y: &[u32; 256]) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(e) = super::avx2::combined_shannon_entropy(x, y) {
+        return e;
+    }
     let mut retval = 0u64;
     let (mut sum_x, mut sum_xy) = (0u32, 0u32);
     for (x, y) in x.chunks_exact(16).zip(y.chunks_exact(16)) {

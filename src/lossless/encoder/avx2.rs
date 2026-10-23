@@ -4,6 +4,9 @@
 
 use core::arch::x86_64::*;
 
+use super::entropy::fast_slog2;
+use super::tables::{LOG2_TABLE, SLOG2_TABLE};
+
 #[inline(always)]
 unsafe fn load(p: &[u32], i: usize) -> __m256i {
     _mm256_loadu_si256(p.as_ptr().add(i).cast())
@@ -141,6 +144,142 @@ pub(super) unsafe fn sub_batch_opaque<const M: usize>(
     i
 }
 
+/// `fast_slog2` of the eight lanes of `v`, added to the four 64-bit lanes of `acc`, except
+/// for lanes of 65536 and above (libwebp takes `log` of those in floating point): their bits
+/// are returned for the caller to add.
+#[inline(always)]
+unsafe fn add_slog2(v: __m256i, acc: &mut __m256i) -> u32 {
+    let small = _mm256_cmpeq_epi32(v, _mm256_min_epu32(v, _mm256_set1_epi32(255)));
+    let large = _mm256_cmpeq_epi32(v, _mm256_max_epu32(v, _mm256_set1_epi32(65536)));
+    let small_bits = _mm256_movemask_ps(_mm256_castsi256_ps(small)) as u32;
+    let large_bits = _mm256_movemask_ps(_mm256_castsi256_ps(large)) as u32;
+    if small_bits != 0 {
+        // Lanes that are not small look up SLOG2_TABLE[0], which is 0.
+        let idx = _mm256_and_si256(v, small);
+        let table = SLOG2_TABLE.as_ptr().cast::<i64>();
+        let lo = _mm256_i32gather_epi64::<8>(table, _mm256_castsi256_si128(idx));
+        let hi = _mm256_i32gather_epi64::<8>(table, _mm256_extracti128_si256::<1>(idx));
+        *acc = _mm256_add_epi64(*acc, _mm256_add_epi64(lo, hi));
+    }
+    if (small_bits | large_bits) != 0xff {
+        // v * (LOG2_TABLE[v >> log_cnt] + (log_cnt << 23)) + LOG_2_RECIPROCAL_FIXED * (v & (y - 1))
+        // with log_cnt = floor(log2(v)) - 7 and y = 1 << log_cnt; the other lanes are zeroed.
+        let v = _mm256_andnot_si256(_mm256_or_si256(small, large), v);
+        let exponent = _mm256_srli_epi32::<23>(_mm256_castps_si256(_mm256_cvtepi32_ps(v)));
+        let log_cnt = _mm256_sub_epi32(exponent, _mm256_set1_epi32(127 + 7));
+        let idx = _mm256_srlv_epi32(v, log_cnt);
+        let log2 = _mm256_i32gather_epi32::<4>(LOG2_TABLE.as_ptr().cast(), idx);
+        let term = _mm256_add_epi32(log2, _mm256_slli_epi32::<23>(log_cnt));
+        let y1 = _mm256_sub_epi32(_mm256_sllv_epi32(_mm256_set1_epi32(1), log_cnt), _mm256_set1_epi32(1));
+        let corr = _mm256_mullo_epi32(_mm256_and_si256(v, y1), _mm256_set1_epi32(12102203));
+        let even = _mm256_add_epi64(
+            _mm256_mul_epu32(v, term),
+            _mm256_and_si256(corr, _mm256_set1_epi64x(0xffff_ffff)),
+        );
+        let odd = _mm256_add_epi64(
+            _mm256_mul_epu32(_mm256_srli_epi64::<32>(v), _mm256_srli_epi64::<32>(term)),
+            _mm256_srli_epi64::<32>(corr),
+        );
+        *acc = _mm256_add_epi64(*acc, _mm256_add_epi64(even, odd));
+    }
+    large_bits
+}
+
+#[inline(always)]
+unsafe fn add_large(v: __m256i, mut bits: u32) -> u64 {
+    let mut lanes = [0u32; 8];
+    _mm256_storeu_si256(lanes.as_mut_ptr().cast(), v);
+    let mut sum = 0u64;
+    while bits != 0 {
+        sum = sum.wrapping_add(fast_slog2(lanes[bits.trailing_zeros() as usize]));
+        bits &= bits - 1;
+    }
+    sum
+}
+
+#[inline(always)]
+unsafe fn hsum32(v: __m256i) -> u32 {
+    let s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b01_00_11_10>(s));
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b10_11_00_01>(s));
+    _mm_cvtsi128_si32(s) as u32
+}
+
+#[inline(always)]
+unsafe fn hsum64(v: __m256i) -> u64 {
+    let s = _mm_add_epi64(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
+    let s = _mm_add_epi64(s, _mm_unpackhi_epi64(s, s));
+    _mm_cvtsi128_si64(s) as u64
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn combined_shannon_entropy_avx2(x: &[u32; 256], y: &[u32; 256]) -> u64 {
+    let (mut sum_x, mut sum_xy) = (_mm256_setzero_si256(), _mm256_setzero_si256());
+    let mut acc = _mm256_setzero_si256();
+    let mut large = 0u64;
+    for i in (0..256).step_by(8) {
+        let xv = load(x, i);
+        let xy = _mm256_add_epi32(xv, load(y, i));
+        sum_x = _mm256_add_epi32(sum_x, xv);
+        sum_xy = _mm256_add_epi32(sum_xy, xy);
+        if _mm256_testz_si256(xv, xv) == 0 {
+            let bits = add_slog2(xv, &mut acc);
+            if bits != 0 {
+                large = large.wrapping_add(add_large(xv, bits));
+            }
+        }
+        if _mm256_testz_si256(xy, xy) == 0 {
+            let bits = add_slog2(xy, &mut acc);
+            if bits != 0 {
+                large = large.wrapping_add(add_large(xy, bits));
+            }
+        }
+    }
+    fast_slog2(hsum32(sum_x))
+        .wrapping_add(fast_slog2(hsum32(sum_xy)))
+        .wrapping_sub(hsum64(acc).wrapping_add(large))
+}
+
+/// `combined_shannon_entropy` with the `fast_slog2`s eight at a time, when the CPU has AVX2.
+pub(super) fn combined_shannon_entropy(x: &[u32; 256], y: &[u32; 256]) -> Option<u64> {
+    if !crate::wide::has_avx2() {
+        return None;
+    }
+    // SAFETY: the CPU supports AVX2.
+    Some(unsafe { combined_shannon_entropy_avx2(x, y) })
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn chunk_stats_avx2(v: &[u32; 64]) -> (u32, u32, u64) {
+    let (mut sum, mut max) = (_mm256_setzero_si256(), _mm256_setzero_si256());
+    let mut acc = _mm256_setzero_si256();
+    let mut large = 0u64;
+    for i in (0..64).step_by(8) {
+        let x = load(v, i);
+        sum = _mm256_add_epi32(sum, x);
+        max = _mm256_max_epu32(max, x);
+        if _mm256_testz_si256(x, x) == 0 {
+            let bits = add_slog2(x, &mut acc);
+            if bits != 0 {
+                large = large.wrapping_add(add_large(x, bits));
+            }
+        }
+    }
+    let m = _mm_max_epu32(_mm256_castsi256_si128(max), _mm256_extracti128_si256::<1>(max));
+    let m = _mm_max_epu32(m, _mm_shuffle_epi32::<0b01_00_11_10>(m));
+    let m = _mm_max_epu32(m, _mm_shuffle_epi32::<0b10_11_00_01>(m));
+    (hsum32(sum), _mm_cvtsi128_si32(m) as u32, hsum64(acc).wrapping_add(large))
+}
+
+/// The wrapping sum, the maximum and the sum of `fast_slog2` of `v`, when the CPU has AVX2.
+pub(super) fn chunk_stats(v: &[u32; 64]) -> Option<(u32, u32, u64)> {
+    if !crate::wide::has_avx2() {
+        return None;
+    }
+    // SAFETY: the CPU supports AVX2.
+    Some(unsafe { chunk_stats_avx2(v) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +337,47 @@ mod tests {
                 check_avx2::<12>(&cur, &up);
                 check_avx2::<13>(&cur, &up);
             }
+        }
+    }
+
+    #[test]
+    fn avx2_slog2_sums_match_scalar() {
+        if !crate::wide::has_avx2() {
+            return;
+        }
+        let mut seed = 0x6a09_e667u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let edges = [0u32, 1, 2, 255, 256, 257, 511, 512, 4095, 4096, 65535, 65536, 65537, u32::MAX];
+        for round in 0..3000 {
+            let mut pick = || match rnd() % 6 {
+                0 => 0,
+                1 => rnd() % 256,
+                2 => 256 + rnd() % (65536 - 256),
+                3 => edges[(rnd() % edges.len() as u32) as usize],
+                4 => rnd() % (1 << 20),
+                _ => if round % 2 == 0 { 0 } else { rnd() },
+            };
+            let v: [u32; 64] = core::array::from_fn(|_| pick());
+            let want = v.iter().fold((0u32, 0u32, 0u64), |(s, m, e), &x| {
+                (s.wrapping_add(x), m.max(x), e.wrapping_add(fast_slog2(x)))
+            });
+            assert_eq!(chunk_stats(&v), Some(want), "{v:?}");
+            let x: [u32; 256] = core::array::from_fn(|_| pick() >> (round % 8));
+            let y: [u32; 256] = core::array::from_fn(|_| pick() >> (round % 5));
+            let (mut want, mut sx, mut sxy) = (0u64, 0u32, 0u32);
+            for (&a, &b) in x.iter().zip(&y) {
+                let ab = a.wrapping_add(b);
+                sx = sx.wrapping_add(a);
+                sxy = sxy.wrapping_add(ab);
+                want = want.wrapping_add(fast_slog2(a)).wrapping_add(fast_slog2(ab));
+            }
+            let want = fast_slog2(sx).wrapping_add(fast_slog2(sxy)).wrapping_sub(want);
+            assert_eq!(combined_shannon_entropy(&x, &y), Some(want));
         }
     }
 }
