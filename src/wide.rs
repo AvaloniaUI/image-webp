@@ -20,6 +20,13 @@ pub(crate) fn has_avx2() -> bool {
     }
 }
 
+/// Reads the CPU's features and `IMAGE_WEBP_NO_AVX2` now. The first decode or encode does it
+/// otherwise, on its own thread, where a `getenv` races a `setenv` on another.
+pub fn detect_cpu() {
+    #[cfg(target_arch = "x86_64")]
+    detect();
+}
+
 #[cfg(target_arch = "x86_64")]
 #[cold]
 fn detect() -> bool {

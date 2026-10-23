@@ -17,6 +17,7 @@ pub use frame::FrameDecoder;
 pub use animation::{AnimationEncoder, AnimationParams};
 pub use encoder::{encode_alpha_chunk, ColorType, EncodingError, WebPEncoder};
 pub use lossless::EncoderParams;
+pub use wide::detect_cpu;
 
 /// The data a decoder reads at offsets.
 pub(crate) trait ReadSeek: std::io::Read + std::io::Seek {}
