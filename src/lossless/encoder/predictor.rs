@@ -888,6 +888,7 @@ fn transform_color_blue(green_to_blue: u8, red_to_blue: u8, argb: u32) -> u8 {
     (new_blue & 0xff) as u8
 }
 
+#[inline(always)]
 fn transform_color(m: Multipliers, data: &mut [u32]) {
     for p in data {
         let argb = *p;
@@ -1170,12 +1171,14 @@ pub(crate) fn color_space_transform(
             best_green_red_to_blue(&mut tile, prev_x, prev_y, quality, &acc_blue, &mut best_tx);
             prev_x = best_tx;
             image[offset] = prev_x.to_code();
-            for y in tile_y_offset..all_y_max {
-                transform_color(
-                    prev_x,
-                    &mut argb[y * width + tile_x_offset..y * width + all_x_max],
-                );
-            }
+            crate::wide::wide(|| {
+                for y in tile_y_offset..all_y_max {
+                    transform_color(
+                        prev_x,
+                        &mut argb[y * width + tile_x_offset..y * width + all_x_max],
+                    );
+                }
+            });
             for y in tile_y_offset..all_y_max {
                 let mut ix = y * width + tile_x_offset;
                 let ix_end = ix + all_x_max - tile_x_offset;
@@ -1268,6 +1271,43 @@ mod tests {
             check::<11>(&cur, &up);
             check::<12>(&cur, &up);
             check::<13>(&cur, &up);
+        }
+    }
+
+    #[test]
+    fn wide_transforms_match_scalar() {
+        let mut seed = 0x3c6e_f372u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for n in [1usize, 7, 31, 32, 33, 100, 1000] {
+            let argb: Vec<u32> = (0..n)
+                .map(|i| if i % 5 < 2 { 0xff10_2030 } else { rnd() })
+                .collect();
+            let m = Multipliers {
+                green_to_red: rnd() as u8,
+                green_to_blue: rnd() as u8,
+                red_to_blue: rnd() as u8,
+            };
+            let mut got = argb.clone();
+            crate::wide::wide(|| transform_color(m, &mut got));
+            let want: Vec<u32> = argb
+                .iter()
+                .map(|&p| {
+                    (p & 0xff00_ff00)
+                        | (u32::from(transform_color_red(m.green_to_red, p)) << 16)
+                        | u32::from(transform_color_blue(m.green_to_blue, m.red_to_blue, p))
+                })
+                .collect();
+            assert_eq!(got, want, "transform_color {n}");
+            let mut wide = [0u32; HISTO_SIZE];
+            let mut narrow = [0u32; HISTO_SIZE];
+            crate::wide::wide(|| update_histo(&mut wide, &argb));
+            update_histo(&mut narrow, &argb);
+            assert_eq!(wide, narrow, "update_histo {n}");
         }
     }
 
