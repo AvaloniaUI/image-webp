@@ -1519,6 +1519,23 @@ impl<'a> Encoder<'a> {
         pred_luma4(&mut it.yuv_p[..], &it.i4_boundary, it.i4_top);
     }
 
+    /// `quantize_intra4` with trellis and `itransform_disto` of each prediction, the
+    /// transforms two at a time, when AVX2 can run.
+    fn trellis_intra4_modes(&self, src_off: usize, w: Option<&[u16; 16]>) -> Option<[I4Recon; 10]> {
+        let (src, preds) = (&self.it.yuv_in[src_off..], &self.it.yuv_p[..]);
+        let mut coeffs = ftransform_modes(src, preds)?;
+        let dqm = &self.dqm[self.mb().segment as usize];
+        let ctx = (self.it.top_nz[self.it.i4 & 3] + self.it.left_nz[self.it.i4 >> 2]) as usize;
+        let mut out = [I4Recon::default(); 10];
+        for (c, o) in coeffs.iter_mut().zip(&mut out) {
+            let (y1, lambda) = (&dqm.y1, dqm.lambda_trellis_i4);
+            trellis_quantize_block(&self.proba, c, &mut o.levels, ctx, 3, y1, lambda);
+            o.nz = non_zero_mask(&o.levels);
+        }
+        itransform_disto_modes(src, preds, &coeffs, w, &mut out);
+        Some(out)
+    }
+
     fn pick_best_intra4(&mut self, rd: &mut ModeScore) -> bool {
         let seg = self.mb().segment as usize;
         let lambda = self.dqm[seg].lambda_i4;
@@ -1547,7 +1564,7 @@ impl<'a> Encoder<'a> {
             self.make_intra4_preds();
             let w = (tlambda != 0).then_some(&WEIGHT_Y);
             let paired = if self.it.do_trellis {
-                None
+                self.trellis_intra4_modes(src_off, w)
             } else {
                 let it = &self.it;
                 reconstruct4x4_disto_modes(

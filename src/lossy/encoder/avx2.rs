@@ -311,21 +311,53 @@ pub(crate) unsafe fn reconstruct4x4_disto_x2(
     w: Option<&[u16; 16]>,
     out: &mut [I4Recon],
 ) {
-    let src = &src[..3 * BPS + 4];
     let (r0, r1) = (&r[0][..3 * BPS + 4], &r[1][..3 * BPS + 4]);
     let out = &mut out[..2];
-    let zero = _mm256_setzero_si256();
+    let [c0, c8] = ftransform_x2(src, r0, r1);
+    let (dequant, [z0, z8]) = quantize_regs(c0, c8, mtx);
+    let packed = _mm256_packs_epi16(z0, z8);
+    let non_zero = !_mm256_movemask_epi8(_mm256_cmpeq_epi8(packed, _mm256_setzero_si256())) as u32;
+    let mut lv = [[0i16; 8]; 4];
+    _mm256_storeu_si256(lv[0..2].as_mut_ptr().cast(), z0);
+    _mm256_storeu_si256(lv[2..4].as_mut_ptr().cast(), z8);
+    for (k, o) in out.iter_mut().enumerate() {
+        o.levels[..8].copy_from_slice(&lv[k]);
+        o.levels[8..].copy_from_slice(&lv[2 + k]);
+        o.levels.swap(3, 12);
+        let nz = non_zero >> (16 * k) & 0xffff;
+        let swapped = ((nz >> 3) ^ (nz >> 12)) & 1;
+        o.nz = nz ^ (swapped << 3 | swapped << 12);
+    }
+    itransform_disto_x2(src, r0, r1, dequant, w, out);
+}
 
+/// `sse2::ftransform_regs` of `src - r0` (low lane) and `src - r1` (high lane).
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn ftransform_x2(src: &[u8], r0: &[u8], r1: &[u8]) -> [__m256i; 2] {
+    let src = &src[..3 * BPS + 4];
     let row01 = _mm256_sub_epi16(rows2_paired(src, src, 0), rows2_paired(r0, r1, 0));
     let row23 = _mm256_sub_epi16(rows2_paired(src, src, 2), rows2_paired(r0, r1, 2));
     let (v01, v32) = ftransform_pass1(row01, row23);
-    let [c0, c8] = ftransform_pass2(v01, v32);
-    let (dequant, [z0, z8]) = quantize_regs(c0, c8, mtx);
-    let non_zero =
-        !_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_packs_epi16(z0, z8), zero)) as u32;
+    ftransform_pass2(v01, v32)
+}
 
-    let packed = itransform_one_rows(dequant, rows2(r0, r1, 0), rows2(r0, r1, 2));
-
+/// The inverse transforms of `coeffs` (coefficients 0..8 and 8..16, a block per lane) added
+/// to `r0` and `r1`, packed into `out[..2].pixels` with their SSE and raw TDisto against
+/// `src`.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn itransform_disto_x2(
+    src: &[u8],
+    r0: &[u8],
+    r1: &[u8],
+    coeffs: [__m256i; 2],
+    w: Option<&[u16; 16]>,
+    out: &mut [I4Recon],
+) {
+    let src = &src[..3 * BPS + 4];
+    let zero = _mm256_setzero_si256();
+    let packed = itransform_one_rows(coeffs, rows2(r0, r1, 0), rows2(r0, r1, 2));
     let s01 = rows2(src, src, 0);
     let s23 = rows2(src, src, 2);
     let o01 = _mm256_unpacklo_epi8(packed, zero);
@@ -347,23 +379,49 @@ pub(crate) unsafe fn reconstruct4x4_disto_x2(
     };
     let sums = _mm256_hadd_epi32(sse, disto);
     let sums = _mm256_hadd_epi32(sums, sums);
-
-    let mut lv = [[0i16; 8]; 4];
-    _mm256_storeu_si256(lv[0..2].as_mut_ptr().cast(), z0);
-    _mm256_storeu_si256(lv[2..4].as_mut_ptr().cast(), z8);
     let mut px = [[0u8; 16]; 2];
     _mm256_storeu_si256(px.as_mut_ptr().cast(), packed);
     let sums: [i32; 8] = core::mem::transmute(sums);
-    for (k, o) in out.iter_mut().enumerate() {
-        o.levels[..8].copy_from_slice(&lv[k]);
-        o.levels[8..].copy_from_slice(&lv[2 + k]);
-        o.levels.swap(3, 12);
-        let nz = non_zero >> (16 * k) & 0xffff;
-        let swapped = ((nz >> 3) ^ (nz >> 12)) & 1;
-        o.nz = nz ^ (swapped << 3 | swapped << 12);
+    for (k, o) in out[..2].iter_mut().enumerate() {
         o.pixels = px[k];
         o.d = sums[4 * k];
         o.disto = sums[4 * k + 1];
+    }
+}
+
+/// `sse2::ftransform` of `src` against each of the ten 4x4 predictions in `preds`, two per
+/// register.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn ftransform_modes(src: &[u8], preds: &[u8], out: &mut [[i16; 16]; 10]) {
+    for (m, out) in out.chunks_exact_mut(2).enumerate() {
+        let r0 = &preds[I4_MODE_OFFSETS[2 * m]..][..3 * BPS + 4];
+        let r1 = &preds[I4_MODE_OFFSETS[2 * m + 1]..][..3 * BPS + 4];
+        let [c0, c8] = ftransform_x2(src, r0, r1);
+        store_i16x16(&mut out[0], _mm256_permute2x128_si256::<0x20>(c0, c8));
+        store_i16x16(&mut out[1], _mm256_permute2x128_si256::<0x31>(c0, c8));
+    }
+}
+
+/// `itransform_one_disto` of each `coeffs[m]` added to the prediction of mode `m` in
+/// `preds`, two per register, into `out[m]`'s `pixels`, `d` and raw `disto`.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn itransform_disto_modes(
+    src: &[u8],
+    preds: &[u8],
+    coeffs: &[[i16; 16]; 10],
+    w: Option<&[u16; 16]>,
+    out: &mut [I4Recon; 10],
+) {
+    for (m, out) in out.chunks_exact_mut(2).enumerate() {
+        let r0 = &preds[I4_MODE_OFFSETS[2 * m]..][..3 * BPS + 4];
+        let r1 = &preds[I4_MODE_OFFSETS[2 * m + 1]..][..3 * BPS + 4];
+        let a = load_i16x16(&coeffs[2 * m]);
+        let b = load_i16x16(&coeffs[2 * m + 1]);
+        let c = [
+            _mm256_permute2x128_si256::<0x20>(a, b),
+            _mm256_permute2x128_si256::<0x31>(a, b),
+        ];
+        itransform_disto_x2(src, r0, r1, c, w, out);
     }
 }
 
@@ -611,6 +669,44 @@ mod tests {
                         (g.nz, g.d, g.disto, g.levels, g.pixels),
                         (nz, d, disto, levels, pixels)
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mode_kernels_match_sse2() {
+        if !crate::wide::has_avx2() {
+            return;
+        }
+        use super::super::dsp::{I4_MODE_OFFSETS, PRED_SIZE};
+        use super::super::sse2;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+        let w = [38u16, 32, 20, 9, 32, 28, 17, 7, 20, 17, 10, 4, 9, 7, 4, 2];
+        let mut preds = vec![0u8; PRED_SIZE];
+        for round in 0..2000 {
+            let mut src = [0u8; 4 * BPS];
+            random_pixels(&mut rng, round, &mut src);
+            random_pixels(&mut rng, round + 1, &mut preds);
+            let mut coeffs = [[0i16; 16]; 10];
+            unsafe { super::ftransform_modes(&src, &preds, &mut coeffs) };
+            for (m, c) in coeffs.iter_mut().enumerate() {
+                let mut want = [0i16; 16];
+                sse2::ftransform(&src, &preds[I4_MODE_OFFSETS[m]..], &mut want);
+                assert_eq!(*c, want);
+                for v in c.iter_mut() {
+                    *v = rng.gen_range(-2048..=2048) >> [0, 3, 6, 9][round % 4];
+                }
+            }
+            for w in [None, Some(&w)] {
+                let mut got = [I4Recon::default(); 10];
+                unsafe { super::itransform_disto_modes(&src, &preds, &coeffs, w, &mut got) };
+                for (m, g) in got.iter().enumerate() {
+                    let mut dst = [0u8; 4 * BPS];
+                    let r = &preds[I4_MODE_OFFSETS[m]..];
+                    let (d, disto) = sse2::itransform_one_disto(r, &coeffs[m], &mut dst, &src, w);
+                    let pixels: [u8; 16] = std::array::from_fn(|i| dst[(i / 4) * BPS + i % 4]);
+                    assert_eq!((g.d, g.disto, g.pixels), (d, disto, pixels));
                 }
             }
         }

@@ -270,6 +270,49 @@ pub(crate) fn reconstruct4x4_disto_modes(
     }
 }
 
+/// `ftransform` of `src` against each of the ten 4x4 predictions in `preds`, two per call,
+/// when AVX2 can run; `None` otherwise.
+#[inline]
+#[allow(unsafe_code)]
+pub(crate) fn ftransform_modes(src: &[u8], preds: &[u8]) -> Option<[[i16; 16]; 10]> {
+    #[cfg(target_arch = "x86_64")]
+    if crate::wide::has_avx2() {
+        let mut out = [[0i16; 16]; 10];
+        // SAFETY: the CPU supports AVX2.
+        unsafe { super::avx2::ftransform_modes(src, preds, &mut out) };
+        return Some(out);
+    }
+    let _ = (src, preds);
+    None
+}
+
+/// `itransform_disto` of each `coeffs[m]` added to the 4x4 prediction of mode `m`, into
+/// `out[m]`'s `pixels`, `d` and `disto`. Only called once `ftransform_modes` returned some.
+#[inline]
+#[allow(unsafe_code)]
+pub(crate) fn itransform_disto_modes(
+    src: &[u8],
+    preds: &[u8],
+    coeffs: &[[i16; 16]; 10],
+    w: Option<&[u16; 16]>,
+    out: &mut [I4Recon; 10],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        assert!(crate::wide::has_avx2());
+        // SAFETY: the CPU supports AVX2.
+        unsafe { super::avx2::itransform_disto_modes(src, preds, coeffs, w, out) };
+        for o in out.iter_mut() {
+            o.disto = o.disto.abs() >> 5;
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (src, preds, coeffs, w, out);
+        unreachable!()
+    }
+}
+
 #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn itransform_portable(r: &[u8], input: &[i16], dst: &mut [u8], two: bool) {
     itransform_one(r, &input[..16], dst);
