@@ -277,8 +277,11 @@ impl ArithmeticDecoder {
     /// Reads the bytes `start..end` of the data a window at a time, refilled by
     /// [`top_up`](Self::top_up).
     pub(crate) fn init_window(&mut self, r: &mut dyn ReadSeek, start: u64, end: u64) -> Result<(), DecodingError> {
+        // An empty partition is never topped up, and loads still read the padding.
+        let mut bytes = Vec::with_capacity(WINDOW.min((end - start) as usize) + PAD);
+        bytes.resize(PAD, 0);
         *self = Self {
-            bytes: Vec::with_capacity(WINDOW.min((end - start) as usize) + PAD),
+            bytes,
             len: 0,
             state: Self::START,
             eof: false,

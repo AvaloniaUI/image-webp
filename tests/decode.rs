@@ -248,3 +248,17 @@ fn test_vp8l_max_width_and_height_dimensions() {
     let decoder = image_webp::WebPDecoder::new(Cursor::new(data)).unwrap();
     assert_eq!(decoder.dimensions(), (16384, 16384));
 }
+
+#[test]
+fn corrupt_token_partitions_are_errors() {
+    // An empty token partition: a size-0 entry in the partition table, or a first partition
+    // size that moves the table so that it reads one.
+    for file in ["empty-token-partition", "short-first-partition"] {
+        let data = std::fs::read(format!("tests/images/corrupt/{file}.webp")).unwrap();
+        let mut decoder = image_webp::WebPDecoder::new(Cursor::new(&data)).unwrap();
+        let mut buf = vec![0; decoder.output_buffer_size().unwrap()];
+        assert!(decoder.read_image(&mut buf).is_err(), "{file}");
+        let mut decoder = image_webp::WebPDecoder::new(Cursor::new(&data)).unwrap();
+        assert!(decoder.read_image_rows(|_, _| {}).is_err(), "{file}");
+    }
+}
