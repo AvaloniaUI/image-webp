@@ -30,6 +30,7 @@ mod extended;
 mod frame;
 pub mod headers;
 mod rescaler;
+mod wide;
 mod lossless;
 mod lossy;
 
