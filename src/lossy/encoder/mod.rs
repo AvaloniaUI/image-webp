@@ -4,6 +4,8 @@
 //! libwebp: Copyright 2010 Google Inc. All Rights Reserved. Distributed under libwebp's
 //! BSD 3-Clause license and patent grant, reproduced in LICENSE-LIBWEBP.
 
+#[cfg(target_arch = "x86_64")]
+mod avx2;
 mod bit_writer;
 mod cost;
 pub(crate) mod csp;
@@ -1540,10 +1542,24 @@ impl<'a> Encoder<'a> {
             let mut best_in_tmp = false;
 
             self.make_intra4_preds();
+            let w = (tlambda != 0).then_some(&WEIGHT_Y);
+            let paired = if self.it.do_trellis {
+                None
+            } else {
+                let it = &self.it;
+                reconstruct4x4_disto_modes(
+                    &it.yuv_in[src_off..],
+                    &it.yuv_p[..],
+                    &self.dqm[seg].y1,
+                    w,
+                )
+            };
             for mode in 0..NUM_BMODES {
                 let mut tmp_levels = [0i16; 16];
-                let w = (tlambda != 0).then_some(&WEIGHT_Y);
-                let (non_zero, d, disto) = if self.it.do_trellis {
+                let (non_zero, d, disto) = if let Some(p) = &paired {
+                    tmp_levels = p[mode].levels;
+                    (p[mode].nz, p[mode].d, p[mode].disto)
+                } else if self.it.do_trellis {
                     let (coeffs, _) = self.quantize_intra4(&mut tmp_levels, mode);
                     let it = &mut self.it;
                     let dst = if best_in_tmp {
@@ -1604,7 +1620,13 @@ impl<'a> Encoder<'a> {
             if total_header_bits > self.max_i4_header_bits {
                 return false;
             }
-            if best_in_tmp {
+            if let Some(p) = &paired {
+                let px = &p[best_mode as usize].pixels;
+                for y in 0..4 {
+                    let o = src_off + y * BPS;
+                    self.it.yuv_out2[o..o + 4].copy_from_slice(&px[4 * y..4 * y + 4]);
+                }
+            } else if best_in_tmp {
                 let it = &mut self.it;
                 copy(&it.i4_tmp, &mut it.yuv_out2[src_off..], 4, 4);
             }

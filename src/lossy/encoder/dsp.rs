@@ -236,6 +236,40 @@ pub(crate) fn reconstruct4x4_disto(
     }
 }
 
+/// One prediction's `reconstruct4x4_disto`, the reconstruction packed row by row.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct I4Recon {
+    pub(crate) levels: [i16; 16],
+    pub(crate) nz: u32,
+    pub(crate) d: i32,
+    pub(crate) disto: i32,
+    pub(crate) pixels: [u8; 16],
+}
+
+/// `reconstruct4x4_disto` of `src` against each of the ten 4x4 predictions in `preds`, two
+/// per call, when AVX2 can run; `None` otherwise.
+#[inline]
+pub(crate) fn reconstruct4x4_disto_modes(
+    src: &[u8],
+    preds: &[u8],
+    mtx: &Matrix,
+    w: Option<&[u16; 16]>,
+) -> Option<[I4Recon; 10]> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut out = super::avx2::reconstruct4x4_disto_modes(src, preds, mtx, w)?;
+        for o in &mut out {
+            o.disto = o.disto.abs() >> 5;
+        }
+        Some(out)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (src, preds, mtx, w);
+        None
+    }
+}
+
 #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn itransform_portable(r: &[u8], input: &[i16], dst: &mut [u8], two: bool) {
     itransform_one(r, &input[..16], dst);
