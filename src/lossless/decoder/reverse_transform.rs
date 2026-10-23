@@ -52,12 +52,20 @@ pub(crate) fn apply_predictor_transform(
             image_data[r * width * 4 + i] =
                 image_data[r * width * 4 + i].wrapping_add(image_data[(r - 1) * width * 4 + i]);
         }
-        for block_x in 0..block_xsize {
-            let block_index = (y >> size_bits) * block_xsize + block_x;
-            // libwebp uses the low four bits; modes 14 and 15 predict as mode 0.
-            let predictor = predictor_data[block_index * 4 + 1] & 0xf;
+        // libwebp uses the low four bits; modes 14 and 15 predict as mode 0.
+        let modes = &predictor_data[(y >> size_bits) * block_xsize * 4..][..block_xsize * 4];
+        let mode = |block_x: usize| modes[block_x * 4 + 1] & 0xf;
+        let mut block_x = 0;
+        while block_x < block_xsize {
+            // A run of blocks of one mode is one call: the kernel's setup and its tail once.
+            let predictor = mode(block_x);
+            let mut end = block_x + 1;
+            while end < block_xsize && mode(end) == predictor {
+                end += 1;
+            }
             let start_index = (r * width + (block_x << size_bits).max(1)) * 4;
-            let end_index = (r * width + ((block_x + 1) << size_bits).min(width)) * 4;
+            let end_index = (r * width + (end << size_bits).min(width)) * 4;
+            block_x = end;
 
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             super::simd::predict(predictor, image_data, start_index..end_index, width);
@@ -67,7 +75,7 @@ pub(crate) fn apply_predictor_transform(
     }
 }
 
-/// Undoes predictor `mode` over `image_data[range]` as [`apply_predictor_transform`] does per block.
+/// Undoes predictor `mode` over `image_data[range]` as [`apply_predictor_transform`] does per run of blocks.
 #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn predict_portable(mode: u8, image_data: &mut [u8], range: Range<usize>, width: usize) {
     match mode {
@@ -810,6 +818,47 @@ mod simd_tests {
                 scalar::apply_predictor_transform_1(&mut a, 4..width * 4, width);
                 simd::predict_left(&mut b, 4..width * 4);
                 assert_eq!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn predictor_transform_matches_a_block_at_a_time() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(8);
+        for width in [1u16, 2, 5, 9, 16, 33, 100] {
+            for size_bits in 2..=4 {
+                for y0 in [0, 3] {
+                    let (w, rows) = (usize::from(width), 6);
+                    let mut data = vec![0u8; (rows + 1) * w * 4];
+                    rng.fill(&mut data[..]);
+                    let blocks = usize::from(super::subsample_size(width, size_bits));
+                    // Few modes, so neighbouring blocks share one and run together.
+                    let modes: Vec<u8> = (0..blocks * (y0 + rows).div_ceil(1 << size_bits) * 4)
+                        .map(|_| [0, 1, 11, 12, 14][rng.gen_range(0..5)])
+                        .collect();
+                    let mut want = data.clone();
+                    if y0 == 0 {
+                        want[w * 4 + 3] = want[w * 4 + 3].wrapping_add(255);
+                        scalar::apply_predictor_transform_1(&mut want[w * 4..], 4..w * 4, w);
+                    }
+                    for r in 1..=rows {
+                        let y = y0 + r - 1;
+                        if y == 0 {
+                            continue;
+                        }
+                        for i in 0..4 {
+                            want[r * w * 4 + i] = want[r * w * 4 + i].wrapping_add(want[(r - 1) * w * 4 + i]);
+                        }
+                        for bx in 0..blocks {
+                            let mode = modes[((y >> size_bits) * blocks + bx) * 4 + 1] & 0xf;
+                            let start = (r * w + (bx << size_bits).max(1)) * 4;
+                            let end = (r * w + ((bx + 1) << size_bits).min(w)) * 4;
+                            scalar::predict_portable(mode, &mut want, start..end, w);
+                        }
+                    }
+                    scalar::apply_predictor_transform(&mut data, width, y0, rows, size_bits, &modes);
+                    assert_eq!(data, want, "width {width} size_bits {size_bits} y0 {y0}");
+                }
             }
         }
     }
