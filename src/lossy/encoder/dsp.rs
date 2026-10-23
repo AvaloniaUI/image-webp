@@ -1024,6 +1024,25 @@ pub(crate) fn non_zero_mask(levels: &[i16; 16]) -> u32 {
     (levels.iter().enumerate()).fold(0, |m, (n, &l)| m | u32::from(l != 0) << n)
 }
 
+/// The highest `n` in `first..16` whose coefficient `input[ZIGZAG[n]]` squared is above
+/// `thresh`, else `first - 1`.
+#[inline]
+#[allow(unsafe_code)]
+pub(crate) fn trellis_last(input: &[i16; 16], first: usize, thresh: i32) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    if crate::wide::has_avx2() {
+        // SAFETY: the CPU supports AVX2.
+        return unsafe { super::avx2::trellis_last(input, first, thresh) };
+    }
+    for n in (first..16).rev() {
+        let j = ZIGZAG[n];
+        if i32::from(input[j]) * i32::from(input[j]) > thresh {
+            return n as i32;
+        }
+    }
+    first as i32 - 1
+}
+
 pub(crate) fn quantize2_blocks(input: &mut [i16], out: &mut [i16], mtx: &Matrix) -> u32 {
     let nz0 = quantize_block(&mut input[..16], &mut out[..16], mtx);
     let nz1 = quantize_block(&mut input[16..32], &mut out[16..32], mtx);

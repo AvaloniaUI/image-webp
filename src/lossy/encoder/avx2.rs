@@ -5,7 +5,7 @@
 
 use core::arch::x86_64::*;
 
-use super::dsp::{I4Recon, Matrix, BPS, I4_MODE_OFFSETS, MAX_LEVEL, QFIX};
+use super::dsp::{I4Recon, Matrix, BPS, I4_MODE_OFFSETS, MAX_LEVEL, QFIX, ZIGZAG};
 
 #[inline(always)]
 fn ld32(p: &[u8], off: usize) -> i32 {
@@ -592,6 +592,55 @@ pub(crate) unsafe fn tdisto16x16(a: &[u8], b: &[u8], w: &[u16; 16]) -> i32 {
     acc[0] + acc[1] + acc[4] + acc[5]
 }
 
+/// For each 8-bit mask of coefficients `8 * HALF..8 * HALF + 8` (natural order), the same bits
+/// at their zigzag positions.
+const fn zigzag_bits<const HALF: usize>() -> [u16; 256] {
+    let mut inv = [0usize; 16];
+    let mut n = 0;
+    while n < 16 {
+        inv[ZIGZAG[n]] = n;
+        n += 1;
+    }
+    let mut out = [0u16; 256];
+    let mut m = 0;
+    while m < 256 {
+        let mut j = 0;
+        while j < 8 {
+            if m >> j & 1 != 0 {
+                out[m] |= 1 << inv[8 * HALF + j];
+            }
+            j += 1;
+        }
+        m += 1;
+    }
+    out
+}
+
+static ZIGZAG_LO: [u16; 256] = zigzag_bits::<0>();
+static ZIGZAG_HI: [u16; 256] = zigzag_bits::<1>();
+
+/// The trellis' last candidate position: the highest `n` in `first..16` whose coefficient
+/// `input[ZIGZAG[n]]` squared is above `thresh`, else `first - 1`.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn trellis_last(input: &[i16; 16], first: usize, thresh: i32) -> i32 {
+    let v = load_i16x16(input);
+    let lo = _mm256_mullo_epi16(v, v);
+    let hi = _mm256_mulhi_epi16(v, v);
+    let t = _mm256_set1_epi32(thresh);
+    let above = |sq| _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(sq, t))) as u32;
+    // Lanes hold coefficients 0..4 | 8..12 and 4..8 | 12..16.
+    let a = above(_mm256_unpacklo_epi16(lo, hi));
+    let b = above(_mm256_unpackhi_epi16(lo, hi));
+    let natural = (a & 0xf) | (b & 0xf) << 4 | (a >> 4) << 8 | (b >> 4) << 12;
+    let zz = ZIGZAG_LO[(natural & 0xff) as usize] | ZIGZAG_HI[(natural >> 8) as usize];
+    let zz = u32::from(zz) & !((1u32 << first) - 1);
+    if zz == 0 {
+        first as i32 - 1
+    } else {
+        31 - zz.leading_zeros() as i32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::dsp::{bias, I4Recon, Matrix, BPS, QFIX};
@@ -708,6 +757,36 @@ mod tests {
                     let pixels: [u8; 16] = std::array::from_fn(|i| dst[(i / 4) * BPS + i % 4]);
                     assert_eq!((g.d, g.disto, g.pixels), (d, disto, pixels));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn trellis_last_matches_scalar() {
+        if !crate::wide::has_avx2() {
+            return;
+        }
+        let mut rng = rand::rngs::StdRng::seed_from_u64(10);
+        for round in 0..100000 {
+            let mut input = [0i16; 16];
+            for v in &mut input {
+                *v = match round % 3 {
+                    0 => rng.gen(),
+                    1 => rng.gen_range(-40..=40),
+                    _ => rng.gen_range(-2..=2) * rng.gen_range(0..2000),
+                };
+            }
+            let thresh = rng.gen_range(0..2000) * [1, 1, 100][round % 3];
+            for first in [0, 1] {
+                let mut want = first as i32 - 1;
+                for n in (first..16).rev() {
+                    let j = super::ZIGZAG[n];
+                    if i32::from(input[j]) * i32::from(input[j]) > thresh {
+                        want = n as i32;
+                        break;
+                    }
+                }
+                assert_eq!(unsafe { super::trellis_last(&input, first, thresh) }, want);
             }
         }
     }

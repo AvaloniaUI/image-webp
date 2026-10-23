@@ -2427,15 +2427,7 @@ fn trellis_quantize_block(
 
     let thresh = i32::from(mtx.q[1]) * i32::from(mtx.q[1]) / 4;
     let last_proba = probas[ENC_BANDS[first] as usize][ctx0][0];
-    let mut last = first as i32 - 1;
-    for n in (first..16).rev() {
-        let j = ZIGZAG[n];
-        let err = i32::from(input[j]) * i32::from(input[j]);
-        if err > thresh {
-            last = n as i32;
-            break;
-        }
-    }
+    let mut last = trellis_last(input, first, thresh);
     if last < 15 {
         last += 1;
     }
