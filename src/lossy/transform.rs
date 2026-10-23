@@ -79,10 +79,12 @@ pub(crate) fn kind(n: usize, dc: i32) -> u8 {
 pub(crate) fn luma_kind(n: usize, block: &[i32; 16]) -> u8 {
     if n > 1 {
         // libwebp has no SIMD TransformAC3 on x86: its C version computes in 32 bits. The 16-bit
-        // full transform gives the same pixels while the coefficients cannot wrap.
-        if cfg!(target_arch = "x86_64")
-            && n <= 3
-            && ((block[0] + 8192) | (block[1] + 8192) | (block[4] + 8192)) as u32 >= 16384
+        // full transform gives the same pixels while the coefficients cannot wrap. Its NEON
+        // version saturates at other steps than the full transform, so aarch64 always takes it.
+        if n <= 3
+            && (cfg!(target_arch = "aarch64")
+                || cfg!(target_arch = "x86_64")
+                    && ((block[0] + 8192) | (block[1] + 8192) | (block[4] + 8192)) as u32 >= 16384)
         {
             AC3
         } else {
@@ -102,6 +104,9 @@ pub(crate) fn add_coeffs(dst: &mut [u8], block: &[i32], kind: u8, pos: usize, st
     match kind {
         NO_COEFFS => {}
         DC_ONLY => add_dc((block[0] + 4) >> 3, dst, pos, stride),
+        #[cfg(target_arch = "aarch64")]
+        AC3 => super::simd::transform_ac3_add(block, dst, pos, stride),
+        #[cfg(not(target_arch = "aarch64"))]
         AC3 => transform_ac3_add(block, dst, pos, stride),
         _ => transform_add(block, dst, pos, stride),
     }
@@ -109,7 +114,8 @@ pub(crate) fn add_coeffs(dst: &mut [u8], block: &[i32], kind: u8, pos: usize, st
 
 /// Adds the inverse transforms of the four `blocks` of a chroma plane, of `kinds`, to its 8x8
 /// pixels at `pos` of `dst`. As libwebp's `DoUVTransform` on x86, a plane with AC coefficients
-/// in any block takes the full transform on all four, two at a time.
+/// in any block takes the full transform on all four, two at a time. On aarch64 its NEON
+/// transform gives an empty or DC-only block the pixels of [`add_dc`].
 #[inline(always)]
 pub(crate) fn add_coeffs_uv(
     dst: &mut [u8],
@@ -153,6 +159,7 @@ fn transform_add(block: &[i32], dst: &mut [u8], pos: usize, stride: usize) {
 
 /// libwebp's `TransformAC3_C`: the inverse transform of `block`, whose only coefficients are
 /// 0, 1 and 4, added to the 4x4 pixels at `pos` of `dst`.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[cold]
 #[inline(never)]
 fn transform_ac3_add(block: &[i32], dst: &mut [u8], pos: usize, stride: usize) {
@@ -359,6 +366,81 @@ mod tests {
             crate::lossy::simd::transform_add(&blocks[..16], &mut b, 1, stride);
             crate::lossy::simd::transform_add(&blocks[16..32], &mut b, 5, stride);
             assert_eq!(a, b, "dc {dc}");
+        }
+    }
+
+    /// Blocks with their coefficients up to a random end, at every magnitude, through
+    /// libwebp's own `DoTransform` and `DoUVTransform` classes and kernels on this target.
+    #[allow(unsafe_code)]
+    #[test]
+    fn transforms_match_libwebp() {
+        use crate::lossy::common::ZIGZAG;
+        use rand::{Rng, SeedableRng};
+        type Idct = unsafe extern "C" fn(*const i16, *mut u8);
+        extern "C" {
+            fn VP8DspInit();
+            static VP8Transform: Option<unsafe extern "C" fn(*const i16, *mut u8, i32)>;
+            static VP8TransformAC3: Option<Idct>;
+            static VP8TransformDC: Option<Idct>;
+            static VP8TransformUV: Option<Idct>;
+            static VP8TransformDCUV: Option<Idct>;
+        }
+        const BPS: usize = 32;
+        unsafe {
+            assert!(libwebp_sys::WebPGetDecoderVersion() > 0);
+            VP8DspInit();
+        }
+        let mut rng = rand::rngs::StdRng::seed_from_u64(12);
+        let coeffs = |rng: &mut rand::rngs::StdRng, block: &mut [i32]| {
+            let n = [0, 1, 2, 3, rng.gen_range(4..=16)][rng.gen_range(0..5)];
+            let range = [16, 2048, 8192, 32768][rng.gen_range(0..4)];
+            for &z in &ZIGZAG[..n] {
+                block[usize::from(z)] = rng.gen_range(-range..range);
+            }
+            n
+        };
+        for _ in 0..200_000 {
+            let mut block = [0i32; 16];
+            let n = coeffs(&mut rng, &mut block);
+            let dst: Vec<u8> = (0..8 * BPS).map(|_| rng.gen()).collect();
+            let (mut a, mut b) = (dst.clone(), dst);
+            add_coeffs(&mut a, &block, luma_kind(n, &block), 0, BPS);
+            let src = block.map(|c| c as i16);
+            unsafe {
+                match n {
+                    4.. => VP8Transform.unwrap()(src.as_ptr(), b.as_mut_ptr(), 0),
+                    2 | 3 => VP8TransformAC3.unwrap()(src.as_ptr(), b.as_mut_ptr()),
+                    _ if block[0] != 0 => VP8TransformDC.unwrap()(src.as_ptr(), b.as_mut_ptr()),
+                    _ => {}
+                }
+            }
+            assert_eq!(a, b, "luma n {n} {block:?}");
+
+            let mut blocks = [0i32; 64];
+            let mut kinds = [NO_COEFFS; 4];
+            for (block, kind) in blocks.chunks_exact_mut(16).zip(&mut kinds) {
+                let n = if rng.gen_bool(0.7) {
+                    rng.gen_range(0..=1)
+                } else {
+                    coeffs(&mut rng, block)
+                };
+                if n == 1 {
+                    block[0] = rng.gen_range(-32768..32768);
+                }
+                *kind = super::kind(n, block[0]);
+            }
+            let dst: Vec<u8> = (0..8 * BPS).map(|_| rng.gen()).collect();
+            let (mut a, mut b) = (dst.clone(), dst);
+            add_coeffs_uv(&mut a, &blocks, &kinds, 0, BPS);
+            let src = blocks.map(|c| c as i16);
+            unsafe {
+                if kinds.contains(&FULL) {
+                    VP8TransformUV.unwrap()(src.as_ptr(), b.as_mut_ptr());
+                } else {
+                    VP8TransformDCUV.unwrap()(src.as_ptr(), b.as_mut_ptr());
+                }
+            }
+            assert_eq!(a, b, "chroma {kinds:?} {blocks:?}");
         }
     }
 }

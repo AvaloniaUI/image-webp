@@ -590,21 +590,21 @@ unsafe fn transpose4x4(r: [int16x4_t; 4]) -> [int16x4_t; 4] {
     ]
 }
 
-/// One pass of libwebp's `TransformOne`: `x * 35468 >> 16` is `vqdmulh` by 17734, and
-/// `x + (x * 20091 >> 16)` adds half of `vqdmulh` by 20091.
+/// One pass of libwebp's `TransformPass_NEON`, saturating: `x * 35468 >> 16` is `vqdmulh` by
+/// 17734, and `x + (x * 20091 >> 16)` adds half of `vqdmulh` by 20091.
 #[inline(always)]
 unsafe fn transform_pass(i: [int16x4_t; 4]) -> [int16x4_t; 4] {
     let mul1 = |x: int16x4_t| vsra_n_s16::<1>(x, vqdmulh_n_s16(x, 20091));
     let mul2 = |x: int16x4_t| vqdmulh_n_s16(x, 17734);
-    let a = vadd_s16(i[0], i[2]);
-    let b = vsub_s16(i[0], i[2]);
-    let c = vsub_s16(mul2(i[1]), mul1(i[3]));
-    let d = vadd_s16(mul1(i[1]), mul2(i[3]));
+    let a = vqadd_s16(i[0], i[2]);
+    let b = vqsub_s16(i[0], i[2]);
+    let c = vqsub_s16(mul2(i[1]), mul1(i[3]));
+    let d = vqadd_s16(mul1(i[1]), mul2(i[3]));
     [
-        vadd_s16(a, d),
-        vadd_s16(b, c),
-        vsub_s16(b, c),
-        vsub_s16(a, d),
+        vqadd_s16(a, d),
+        vqadd_s16(b, c),
+        vqsub_s16(b, c),
+        vqsub_s16(a, d),
     ]
 }
 
@@ -627,20 +627,43 @@ unsafe fn add_row(p: *mut u8, t: int16x4_t) {
     store4(p, vqmovun_s16(vcombine_s16(s, s)));
 }
 
-/// libwebp's `TransformOne` for one block: the inverse transform of `block` (16
-/// coefficients that fit 16 bits) added to the 4x4 pixels at `pos` of `dst`.
+/// libwebp's `TransformOne_NEON`: the inverse transform of `block` (16 coefficients that fit 16
+/// bits) in saturating 16 bits, added to the 4x4 pixels at `pos` of `dst`.
 pub(crate) fn transform_add(block: &[i32], dst: &mut [u8], pos: usize, stride: usize) {
     let block = &block[..16];
     check(dst.len(), pos, 0, 3 * stride + 4);
     unsafe {
         let row = |r: usize| vqmovn_s32(vld1q_s32(block.as_ptr().add(4 * r)));
-        let t = transform_pass([row(0), row(1), row(2), row(3)]);
-        let [t0, t1, t2, t3] = transpose4x4(t);
-        let s = transform_pass([vadd_s16(t0, vdup_n_s16(4)), t1, t2, t3]);
-        let t = transpose4x4(s.map(|x| vshr_n_s16::<3>(x)));
+        let t = transpose4x4(transform_pass([row(0), row(1), row(2), row(3)]));
+        let t = transpose4x4(transform_pass(t));
         let p = dst.as_mut_ptr().add(pos);
         for (k, t) in t.into_iter().enumerate() {
-            add_row(p.add(k * stride), t);
+            add_row(p.add(k * stride), vrshr_n_s16::<3>(t));
+        }
+    }
+}
+
+/// libwebp's `TransformAC3_NEON`: the inverse transform of `block`, whose only coefficients are
+/// 0, 1 and 4, in saturating 16 bits, added to the 4x4 pixels at `pos` of `dst`.
+pub(crate) fn transform_ac3_add(block: &[i32], dst: &mut [u8], pos: usize, stride: usize) {
+    let block = &block[..16];
+    check(dst.len(), pos, 0, 3 * stride + 4);
+    let mul1 = |a: i32| (((a * 20091) >> 16) + a) as i16;
+    let mul2 = |a: i32| ((a * 35468) >> 16) as i16;
+    let (c1, d1) = (mul2(block[1]), mul1(block[1]));
+    let cd = [d1, c1, c1.wrapping_neg(), d1.wrapping_neg()];
+    unsafe {
+        let b = vqadd_s16(vdup_n_s16(block[0] as i16), vld1_s16(cd.as_ptr()));
+        let (c4, d4) = (vdup_n_s16(mul2(block[4])), vdup_n_s16(mul1(block[4])));
+        let rows = [
+            vqadd_s16(b, d4),
+            vqadd_s16(b, c4),
+            vqsub_s16(b, c4),
+            vqsub_s16(b, d4),
+        ];
+        let p = dst.as_mut_ptr().add(pos);
+        for (k, t) in rows.into_iter().enumerate() {
+            add_row(p.add(k * stride), vrshr_n_s16::<3>(t));
         }
     }
 }
