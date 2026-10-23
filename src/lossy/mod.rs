@@ -10,6 +10,8 @@ use prediction::*;
 use arithmetic_decoder::{by_position, ArithmeticDecoder, ModeProbs, PlaneProbs};
 
 mod arithmetic_decoder;
+#[cfg(target_arch = "x86_64")]
+mod avx2;
 mod common;
 mod loop_filter;
 #[cfg(target_arch = "aarch64")]

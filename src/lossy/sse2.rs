@@ -562,8 +562,23 @@ pub(crate) fn yuv_to_rgb_row<const BPP: usize>(
     v: &[u8],
     out: &mut [u8],
 ) -> usize {
-    let n = y.len().min(u.len()).min(v.len()).min(out.len() / BPP);
     let mut i = 0;
+    if crate::wide::has_avx2() {
+        // SAFETY: the CPU has AVX2.
+        i = unsafe { super::avx2::yuv_to_rgb_row::<BPP>(y, u, v, out) };
+    }
+    yuv_to_rgb_row_from::<BPP>(y, u, v, out, i)
+}
+
+/// `yuv_to_rgb_row` with the pixels before `i` already converted.
+pub(crate) fn yuv_to_rgb_row_from<const BPP: usize>(
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    out: &mut [u8],
+    mut i: usize,
+) -> usize {
+    let n = y.len().min(u.len()).min(v.len()).min(out.len() / BPP);
     unsafe {
         let (y, u, v, out) = (y.as_ptr(), u.as_ptr(), v.as_ptr(), out.as_mut_ptr());
         if BPP == 3 {
