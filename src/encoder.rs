@@ -145,9 +145,18 @@ impl<W: Write> WebPEncoder<W> {
     ) -> Result<(), EncodingError> {
         if self.params.use_lossy {
             let stride = width as usize * color.bytes_per_pixel();
-            return self.encode_rows(width, height, color, |y, row| {
-                row.copy_from_slice(&data[y as usize * stride..][..stride]);
-            });
+            let params = self.params.clone();
+            // The picture is in memory already, so its YUV (1.5 bytes a pixel, as libwebp
+            // holds) is kept for the passes after the first instead of converted again.
+            return self.encode_lossy(
+                width,
+                height,
+                color,
+                |y, row| row.copy_from_slice(&data[y as usize * stride..][..stride]),
+                true,
+                true,
+                |alpha| alpha.map(|alpha| alpha_chunk_payload(&alpha, width, height, &params)),
+            );
         }
         if width == 0 || width > 16384 || height == 0 || height > 16384 {
             return Err(EncodingError::InvalidDimensions);
@@ -184,7 +193,7 @@ impl<W: Write> WebPEncoder<W> {
             return self.encode(&data, width, height, color);
         }
         let params = self.params.clone();
-        self.encode_lossy(width, height, color, read_row, true, |alpha| {
+        self.encode_lossy(width, height, color, read_row, true, false, |alpha| {
             alpha.map(|alpha| alpha_chunk_payload(&alpha, width, height, &params))
         })
     }
@@ -207,7 +216,7 @@ impl<W: Write> WebPEncoder<W> {
         alpha_chunk: impl FnOnce() -> Option<Vec<u8>>,
     ) -> Result<(), EncodingError> {
         if self.params.use_lossy {
-            self.encode_lossy(width, height, color, read_row, false, |_| alpha_chunk())
+            self.encode_lossy(width, height, color, read_row, false, false, |_| alpha_chunk())
         } else {
             self.encode_rows(width, height, color, read_row)
         }
@@ -220,6 +229,7 @@ impl<W: Write> WebPEncoder<W> {
         color: ColorType,
         read_row: impl FnMut(u32, &mut [u8]),
         keep_alpha: bool,
+        keep_strips: bool,
         alpha_chunk: impl FnOnce(Option<Vec<u8>>) -> Option<Vec<u8>>,
     ) -> Result<(), EncodingError> {
         let (parts, (has_alpha, alpha_plane)) = encode_frame_lossy(
@@ -229,6 +239,7 @@ impl<W: Write> WebPEncoder<W> {
             self.params.lossy_quality,
             self.params.lossy_method,
             keep_alpha,
+            keep_strips,
             read_row,
         )?;
         let alpha_chunk = alpha_chunk(alpha_plane).filter(|_| has_alpha);

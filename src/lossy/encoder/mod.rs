@@ -2444,8 +2444,8 @@ fn trellis_quantize_block(
             let score_of = |s: &ScoreState| s.score + rd_score(i64::from(s.costs[variable]), 0);
             let mut best_cur_score = score_of(&prev_states[0]);
             let mut best_prev = 0i8;
-            for p in 1..NUM_NODES {
-                let score = score_of(&prev_states[p]);
+            for (p, state) in prev_states.iter().enumerate().skip(1) {
+                let score = score_of(state);
                 if score < best_cur_score {
                     best_cur_score = score;
                     best_prev = p as i8;
@@ -2555,8 +2555,9 @@ pub(crate) fn encode(
 
 /// Encodes rows of `color` pixels as the payload of a `VP8 ` chunk, in pieces, like libwebp at
 /// `quality` and `method` with the default preset. `read_row(y, row)` fills `row`; rows are
-/// read top to bottom once per pass. Also returns whether some pixel is not opaque, and then
-/// the alpha plane if `keep_alpha`.
+/// read top to bottom once per pass, or once if `keep_strips`. Also returns whether some pixel
+/// is not opaque, and then the alpha plane if `keep_alpha`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_frame_lossy(
     width: u32,
     height: u32,
@@ -2564,9 +2565,11 @@ pub(crate) fn encode_frame_lossy(
     quality: u8,
     method: u8,
     keep_alpha: bool,
+    keep_strips: bool,
     read_row: impl FnMut(u32, &mut [u8]),
 ) -> Result<EncodedFrame, crate::EncodingError> {
-    let config = Config::new(f32::from(quality.min(100)), i32::from(method.min(6)));
+    let mut config = Config::new(f32::from(quality.min(100)), i32::from(method.min(6)));
+    config.keep_strips = keep_strips;
     encode_frame_lossy_with(config, width, height, color, keep_alpha, read_row)
 }
 

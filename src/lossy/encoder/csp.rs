@@ -142,7 +142,13 @@ impl<'a> Source<'a> {
     /// Keeps the converted picture (1.5 bytes a pixel) so that later passes copy strips
     /// instead of reading and converting the rows again.
     pub(crate) fn keep_strips(&mut self) {
-        self.cache = Some(StripCache::default());
+        let uv = self.uv_stride * self.height.div_ceil(2);
+        self.cache = Some(StripCache {
+            y: Vec::with_capacity(self.y_stride * self.height),
+            u: Vec::with_capacity(uv),
+            v: Vec::with_capacity(uv),
+            strips: 0,
+        });
     }
 
     /// Whether some pixel is not opaque, and then the alpha plane if `keep_alpha`. Valid once
