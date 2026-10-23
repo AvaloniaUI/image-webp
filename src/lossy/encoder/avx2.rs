@@ -5,7 +5,10 @@
 
 use core::arch::x86_64::*;
 
-use super::dsp::{I4Recon, Matrix, BPS, I4_MODE_OFFSETS, MAX_LEVEL, QFIX, ZIGZAG};
+use super::dsp::{
+    I4Recon, Matrix, BPS, I4DC4, I4HD4, I4_LOOKUP1, I4_LOOKUP2, I4_LOOKUP3, I4_MODE_OFFSETS,
+    MAX_LEVEL, QFIX, ZIGZAG,
+};
 
 #[inline(always)]
 fn ld32(p: &[u8], off: usize) -> i32 {
@@ -753,6 +756,115 @@ pub(crate) unsafe fn rgb_to_y_row(line: &[u8], out: &mut [u8]) -> usize {
         _mm256_storeu_si256(out.as_mut_ptr().add(32).cast(), second);
     }
     n
+}
+
+/// The `pshufb` indices of `pred_luma4`'s rows into `avg2` (`TABLE` 0) or `avg3` (1), 0x80
+/// where the other one holds the byte: per row DC TM VE HE in the low lane and RD VR LD VL
+/// in the high one, then HD HU of rows 0-1 and 2-3.
+const fn pred4_lookup<const TABLE: u8>() -> [[u8; 32]; 5] {
+    let mut out = [[0x80u8; 32]; 5];
+    let mut r = 0;
+    while r < 5 {
+        let mut i = 0;
+        while i < 32 {
+            let v = if r == 4 {
+                I4_LOOKUP1[32 + i]
+            } else if i < 16 {
+                I4_LOOKUP3[16 * r + i]
+            } else {
+                I4_LOOKUP2[16 * r + i - 16]
+            };
+            if v >> 4 == TABLE {
+                out[r][i] = v & 15;
+            }
+            i += 1;
+        }
+        r += 1;
+    }
+    out
+}
+
+const PRED4_AVG2: [[u8; 32]; 5] = pred4_lookup::<0>();
+const PRED4_AVG3: [[u8; 32]; 5] = pred4_lookup::<1>();
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn pred4_row(avg2: __m256i, avg3: __m256i, r: usize) -> __m256i {
+    let lo = _mm256_loadu_si256(PRED4_AVG2[r].as_ptr().cast());
+    let hi = _mm256_loadu_si256(PRED4_AVG3[r].as_ptr().cast());
+    _mm256_or_si256(_mm256_shuffle_epi8(avg2, lo), _mm256_shuffle_epi8(avg3, hi))
+}
+
+/// `dsp::pred_luma4` as `neon::pred_luma4` computes it: the averages of the edge picked into
+/// whole rows of four modes.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn pred_luma4(dst: &mut [u8], b: &[u8], t: usize) {
+    let edge = &b[t - 5..t + 11];
+    let dst = &mut dst[I4DC4..I4DC4 + 7 * BPS + 8];
+    // L K J I X A B C D E F G H
+    let edge = _mm_loadu_si128(edge.as_ptr().cast());
+    let prev = _mm_shuffle_epi8(edge, _mm_loadu_si128(I4_LOOKUP1.as_ptr().cast()));
+    let next = _mm_srli_si128::<2>(prev);
+    let avg2 = _mm_avg_epu8(prev, edge);
+    let lsb = _mm_and_si128(_mm_xor_si128(prev, next), _mm_set1_epi8(1));
+    let avg3 = _mm_avg_epu8(_mm_subs_epu8(_mm_avg_epu8(prev, next), lsb), edge);
+    let dc_in = _mm_and_si128(edge, _mm_setr_epi32(-1, 0xffff_ff00_u32 as i32, 0xff, 0));
+    let sad = _mm_sad_epu8(dc_in, _mm_setzero_si128());
+    let dc = (_mm_cvtsi128_si32(sad) + _mm_extract_epi16::<4>(sad) + 4) >> 3;
+    let avg3 = _mm_insert_epi8::<14>(avg3, dc);
+    let avg3 = _mm_insert_epi8::<15>(avg3, _mm_cvtsi128_si32(edge) & 0xff);
+    let (avg2, avg3) = (both(avg2), both(avg3));
+
+    // TrueMotion: left + top - top-left, saturated, row y in bytes 4y..4y+4.
+    let z = -128;
+    let top = _mm_shuffle_epi8(
+        edge,
+        _mm_setr_epi8(5, z, 6, z, 7, z, 8, z, 5, z, 6, z, 7, z, 8, z),
+    );
+    let d = _mm_sub_epi16(
+        top,
+        _mm_shuffle_epi8(
+            edge,
+            _mm_setr_epi8(4, z, 4, z, 4, z, 4, z, 4, z, 4, z, 4, z, 4, z),
+        ),
+    );
+    let l01 = _mm_shuffle_epi8(
+        edge,
+        _mm_setr_epi8(3, z, 3, z, 3, z, 3, z, 2, z, 2, z, 2, z, 2, z),
+    );
+    let l23 = _mm_shuffle_epi8(
+        edge,
+        _mm_setr_epi8(1, z, 1, z, 1, z, 1, z, 0, z, 0, z, 0, z, 0, z),
+    );
+    let tm = _mm_packus_epi16(_mm_add_epi16(l01, d), _mm_add_epi16(l23, d));
+    let tm = [
+        _mm_shuffle_epi32::<0x00>(tm),
+        tm,
+        _mm_shuffle_epi32::<0xaa>(tm),
+        _mm_shuffle_epi32::<0xff>(tm),
+    ];
+    for (y, tm) in tm.into_iter().enumerate() {
+        let row = pred4_row(avg2, avg3, y);
+        let row = _mm256_blend_epi32::<0b10>(row, _mm256_castsi128_si256(tm));
+        _mm256_storeu_si256(dst[y * BPS..y * BPS + 32].as_mut_ptr().cast(), row);
+    }
+    let hd_hu = pred4_row(avg2, avg3, 4);
+    let (lo, hi) = (
+        _mm256_castsi256_si128(hd_hu),
+        _mm256_extracti128_si256::<1>(hd_hu),
+    );
+    let o = I4HD4 - I4DC4;
+    for (y, v) in [
+        lo,
+        _mm_unpackhi_epi64(lo, lo),
+        hi,
+        _mm_unpackhi_epi64(hi, hi),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        _mm_storel_epi64(dst[o + y * BPS..o + y * BPS + 8].as_mut_ptr().cast(), v);
+    }
 }
 
 #[cfg(test)]

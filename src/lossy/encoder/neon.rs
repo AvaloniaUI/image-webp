@@ -5,7 +5,7 @@
 
 use core::arch::aarch64::*;
 
-use super::dsp::{Matrix, BPS, MAX_LEVEL};
+use super::dsp::{Matrix, BPS, I4_LOOKUP1, I4_LOOKUP2, I4_LOOKUP3, MAX_LEVEL};
 
 const KC1: i16 = 20091;
 const KC2: i16 = (35468 / 2) as i16;
@@ -306,25 +306,6 @@ pub(crate) fn last_non_zero(coeffs: &[i16]) -> i32 {
     }
 }
 
-const LOOKUP1: [u8; 64] = [
-    0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 12, 12, //
-    3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0, //
-    4, 20, 21, 22, 3, 18, 2, 17, 3, 19, 4, 20, 2, 17, 1, 16, //
-    2, 18, 3, 19, 1, 16, 31, 31, 1, 17, 2, 18, 31, 31, 31, 31,
-];
-const LOOKUP2: [u8; 64] = [
-    20, 21, 22, 23, 5, 6, 7, 8, 22, 23, 24, 25, 6, 7, 8, 9, //
-    19, 20, 21, 22, 20, 21, 22, 23, 23, 24, 25, 26, 22, 23, 24, 25, //
-    18, 19, 20, 21, 19, 5, 6, 7, 24, 25, 26, 27, 7, 8, 9, 26, //
-    17, 18, 19, 20, 18, 20, 21, 22, 25, 26, 27, 28, 23, 24, 25, 27,
-];
-const LOOKUP3: [u8; 64] = [
-    30, 30, 30, 30, 0, 0, 0, 0, 21, 22, 23, 24, 19, 19, 19, 19, //
-    30, 30, 30, 30, 0, 0, 0, 0, 21, 22, 23, 24, 18, 18, 18, 18, //
-    30, 30, 30, 30, 0, 0, 0, 0, 21, 22, 23, 24, 17, 17, 17, 17, //
-    30, 30, 30, 30, 0, 0, 0, 0, 21, 22, 23, 24, 16, 16, 16, 16,
-];
-
 /// libwebp's `Intra4Preds_NEON`: the ten 4x4 predictions picked from the averages of the
 /// edge with table lookups, a whole row of four modes per store. `b[t]` is the first top
 /// sample, as for `dsp::pred_luma4`.
@@ -334,9 +315,9 @@ pub(crate) fn pred_luma4(dst: &mut [u8], b: &[u8], t: usize) {
     let edge = &b[t - 5..t + 11];
     let dst = &mut dst[I4DC4..I4DC4 + 7 * BPS + 8];
     unsafe {
-        let l1 = vld1q_u8_x4(LOOKUP1.as_ptr());
-        let l2 = vld1q_u8_x4(LOOKUP2.as_ptr());
-        let l3 = vld1q_u8_x4(LOOKUP3.as_ptr());
+        let l1 = vld1q_u8_x4(I4_LOOKUP1.as_ptr());
+        let l2 = vld1q_u8_x4(I4_LOOKUP2.as_ptr());
+        let l3 = vld1q_u8_x4(I4_LOOKUP3.as_ptr());
         // L K J I X A B C D E F G H
         let preload = vld1q_u8(edge.as_ptr());
         let a = vqtbl1q_u8(preload, l1.0);

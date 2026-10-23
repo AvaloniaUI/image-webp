@@ -34,6 +34,29 @@ pub(crate) const I4_MODE_OFFSETS: [usize; 10] = [
     I4DC4, I4TM4, I4VE4, I4HE4, I4RD4, I4VR4, I4LD4, I4VL4, I4HD4, I4HU4,
 ];
 
+/// libwebp's `Intra4Preds_NEON` tables. Indices 0..16 pick from the `avg2` of the edge
+/// `L K J I X A B C D E F G H`, 16..32 from its `avg3` (30 the DC, 31 `L`). LOOKUP1 holds
+/// the edge's left neighbours, TM's left samples per row, then HD HU rows 0-1 and 2-3;
+/// LOOKUP2 per row RD VR LD VL; LOOKUP3 per row DC TM VE HE, TM computed apart.
+pub(crate) const I4_LOOKUP1: [u8; 64] = [
+    0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 12, 12, //
+    3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0, //
+    4, 20, 21, 22, 3, 18, 2, 17, 3, 19, 4, 20, 2, 17, 1, 16, //
+    2, 18, 3, 19, 1, 16, 31, 31, 1, 17, 2, 18, 31, 31, 31, 31,
+];
+pub(crate) const I4_LOOKUP2: [u8; 64] = [
+    20, 21, 22, 23, 5, 6, 7, 8, 22, 23, 24, 25, 6, 7, 8, 9, //
+    19, 20, 21, 22, 20, 21, 22, 23, 23, 24, 25, 26, 22, 23, 24, 25, //
+    18, 19, 20, 21, 19, 5, 6, 7, 24, 25, 26, 27, 7, 8, 9, 26, //
+    17, 18, 19, 20, 18, 20, 21, 22, 25, 26, 27, 28, 23, 24, 25, 27,
+];
+pub(crate) const I4_LOOKUP3: [u8; 64] = [
+    30, 30, 30, 30, 0, 0, 0, 0, 21, 22, 23, 24, 19, 19, 19, 19, //
+    30, 30, 30, 30, 0, 0, 0, 0, 21, 22, 23, 24, 18, 18, 18, 18, //
+    30, 30, 30, 30, 0, 0, 0, 0, 21, 22, 23, 24, 17, 17, 17, 17, //
+    30, 30, 30, 30, 0, 0, 0, 0, 21, 22, 23, 24, 16, 16, 16, 16,
+];
+
 pub(crate) const SCAN: [usize; 16] = [
     0,
     4,
@@ -576,9 +599,15 @@ fn avg2(a: i32, b: i32) -> u8 {
 
 /// The ten 4x4 predictions. `b[t]` is the first top sample: left samples are `b[t-5..t-2]`
 /// (bottom to top), the top-left is `b[t-1]` and top/top-right samples `b[t..t+8]`.
+#[allow(unsafe_code)]
 pub(crate) fn pred_luma4(dst: &mut [u8], b: &[u8], t: usize) {
     #[cfg(target_arch = "aarch64")]
     super::neon::pred_luma4(dst, b, t);
+    #[cfg(target_arch = "x86_64")]
+    if crate::wide::has_avx2() {
+        // SAFETY: the CPU supports AVX2.
+        return unsafe { super::avx2::pred_luma4(dst, b, t) };
+    }
     #[cfg(not(target_arch = "aarch64"))]
     pred_luma4_portable(dst, b, t);
 }
