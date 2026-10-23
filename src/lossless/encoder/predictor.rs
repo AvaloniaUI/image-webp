@@ -323,7 +323,7 @@ fn as256(s: &[u32]) -> &[u32; 256] {
 }
 
 fn prediction_cost_spatial_histogram(
-    accumulated: &[u32],
+    accumulated: &[SlogHisto; 4],
     tile: &[u32],
     mode: usize,
     left_mode: usize,
@@ -332,10 +332,8 @@ fn prediction_cost_spatial_histogram(
     let mut retval = 0i64;
     for i in 0..4 {
         retval += prediction_cost_bias(&tile[i * 256..], 1, &SPATIAL_BIAS_WEIGHTS);
-        retval = retval.wrapping_add(combined_shannon_entropy(
-            as256(&tile[i * 256..]),
-            as256(&accumulated[i * 256..]),
-        ) as i64);
+        retval =
+            retval.wrapping_add(accumulated[i].combined_entropy(as256(&tile[i * 256..])) as i64);
     }
     if mode == left_mode {
         retval -= SPATIAL_PREDICTOR_BIAS;
@@ -638,7 +636,9 @@ fn get_best_predictors_and_sub_sampling(
     let tiles_per_col = sub_sample_size(height as u32, min_bits) as usize;
     let max_subsampling_index = (max_bits - min_bits) as usize;
     let mut all_argb = vec![0u32; (max_subsampling_index + 1) * NUM_PRED_MODES * HISTO_SIZE];
-    let mut all_accumulated = vec![0u32; (max_subsampling_index + 1) * HISTO_SIZE];
+    let mut all_accumulated: Vec<[SlogHisto; 4]> = (0..=max_subsampling_index)
+        .map(|_| Default::default())
+        .collect();
     let mut all_pred_histos = vec![0u32; (max_subsampling_index + 1) * NUM_PRED_MODES];
     let max_tile_size = 1usize << max_subsampling_index;
     let update_up_to_index = (4.min(max_bits).max(min_bits) - min_bits) as usize;
@@ -671,7 +671,7 @@ fn get_best_predictors_and_sub_sampling(
                 super_tile_x,
                 super_tile_y,
                 super_tiles_per_row,
-                &mut all_accumulated,
+                &mut all_accumulated[subsampling_index],
                 all_modes,
                 &mut all_pred_histos,
             );
@@ -726,13 +726,12 @@ fn get_best_predictors_and_sub_sampling(
     let mut best_cost = i64::MAX;
     let mut best = 0;
     for subsampling_index in 0..=max_subsampling_index {
-        let accumulated = &all_accumulated[subsampling_index * HISTO_SIZE..];
+        let accumulated = &all_accumulated[subsampling_index];
         let mut cost = shannon_entropy(
             &all_pred_histos[subsampling_index * NUM_PRED_MODES..][..NUM_PRED_MODES],
         ) as i64;
-        for plane in 0..4 {
-            cost = cost
-                .wrapping_add(shannon_entropy(&accumulated[plane * 256..(plane + 1) * 256]) as i64);
+        for plane in accumulated {
+            cost = cost.wrapping_add(shannon_entropy(plane.histogram()) as i64);
         }
         if cost < best_cost {
             best_cost = cost;
@@ -758,12 +757,10 @@ fn get_best_predictor_for_tile(
     tile_x: usize,
     tile_y: usize,
     tiles_per_row: usize,
-    all_accumulated: &mut [u32],
+    accumulated: &mut [SlogHisto; 4],
     all_modes: &mut [Vec<u32>],
     all_pred_histos: &mut [u32],
 ) {
-    let accumulated =
-        &mut all_accumulated[subsampling_index * HISTO_SIZE..(subsampling_index + 1) * HISTO_SIZE];
     let modes = &mut all_modes[subsampling_index];
     let left_mode = if tile_x > 0 {
         ((modes[tile_y * tiles_per_row + tile_x - 1] >> 8) & 0xff) as usize
@@ -788,8 +785,9 @@ fn get_best_predictor_for_tile(
         }
     }
     let off = (subsampling_index * NUM_PRED_MODES + best_mode) * HISTO_SIZE;
-    for (o, &a) in accumulated.iter_mut().zip(&all_argb[off..off + HISTO_SIZE]) {
-        *o = o.wrapping_add(a);
+    let (planes, _) = all_argb[off..off + HISTO_SIZE].as_chunks::<256>();
+    for (h, plane) in accumulated.iter_mut().zip(planes) {
+        h.add(plane);
     }
     modes[tile_y * tiles_per_row + tile_x] = ARGB_BLACK | ((best_mode as u32) << 8);
     all_pred_histos[subsampling_index * NUM_PRED_MODES + best_mode] += 1;
@@ -916,8 +914,8 @@ fn transform_color(m: Multipliers, data: &mut [u32]) {
     }
 }
 
-fn prediction_cost_cross_color(accumulated: &[u32; 256], counts: &[u32; 256]) -> i64 {
-    (combined_shannon_entropy(counts, accumulated) as i64).wrapping_add(prediction_cost_bias(
+fn prediction_cost_cross_color(accumulated: &SlogHisto, counts: &[u32; 256]) -> i64 {
+    (accumulated.combined_entropy(counts) as i64).wrapping_add(prediction_cost_bias(
         counts,
         3,
         &CROSS_COLOR_BIAS_WEIGHTS,
@@ -1006,7 +1004,7 @@ fn cost_cross_color_red(
     prev_x: Multipliers,
     prev_y: Multipliers,
     green_to_red: i32,
-    acc: &[u32; 256],
+    acc: &SlogHisto,
 ) -> i64 {
     let histo = tile.red_histogram(green_to_red as u8);
     let mut cur_diff = prediction_cost_cross_color(acc, &histo);
@@ -1027,7 +1025,7 @@ fn best_green_to_red(
     prev_x: Multipliers,
     prev_y: Multipliers,
     quality: i32,
-    acc: &[u32; 256],
+    acc: &SlogHisto,
     best_tx: &mut Multipliers,
 ) {
     let max_iters = 4 + ((7 * quality) >> 8);
@@ -1055,7 +1053,7 @@ fn cost_cross_color_blue(
     prev_y: Multipliers,
     green_to_blue: i32,
     red_to_blue: i32,
-    acc: &[u32; 256],
+    acc: &SlogHisto,
 ) -> i64 {
     let histo = tile.blue_histogram(green_to_blue as u8, red_to_blue as u8);
     let mut cur_diff = prediction_cost_cross_color(acc, &histo);
@@ -1085,7 +1083,7 @@ fn best_green_red_to_blue(
     prev_x: Multipliers,
     prev_y: Multipliers,
     quality: i32,
-    acc: &[u32; 256],
+    acc: &SlogHisto,
     best_tx: &mut Multipliers,
 ) {
     const OFFSET: [[i32; 2]; 8] = [
@@ -1161,6 +1159,7 @@ pub(crate) fn color_space_transform(
     let tile_ysize = sub_sample_size(height as u32, bits) as usize;
     let mut acc_red = [0u32; 256];
     let mut acc_blue = [0u32; 256];
+    let (mut slog_red, mut slog_blue) = (SlogHisto::default(), SlogHisto::default());
     let mut prev_x = Multipliers::default();
     let mut prev_y = Multipliers::default();
     let mut tile = Tile::default();
@@ -1181,8 +1180,10 @@ pub(crate) fn color_space_transform(
                 all_x_max - tile_x_offset,
                 all_y_max - tile_y_offset,
             );
-            best_green_to_red(&mut tile, prev_x, prev_y, quality, &acc_red, &mut best_tx);
-            best_green_red_to_blue(&mut tile, prev_x, prev_y, quality, &acc_blue, &mut best_tx);
+            slog_red.update(&acc_red);
+            slog_blue.update(&acc_blue);
+            best_green_to_red(&mut tile, prev_x, prev_y, quality, &slog_red, &mut best_tx);
+            best_green_red_to_blue(&mut tile, prev_x, prev_y, quality, &slog_blue, &mut best_tx);
             prev_x = best_tx;
             image[offset] = prev_x.to_code();
             crate::wide::wide(|| {

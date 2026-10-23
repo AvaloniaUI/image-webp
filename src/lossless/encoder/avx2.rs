@@ -227,41 +227,52 @@ unsafe fn hsum64(v: __m256i) -> u64 {
     _mm_cvtsi128_si64(s) as u64
 }
 
+/// `SlogHisto::combined_entropy`'s sum over the bins where `x` is nonzero: `fast_slog2(x)
+/// + fast_slog2(x + y) - slog[i]` each, and the sum of `x`.
 #[target_feature(enable = "avx2")]
-unsafe fn combined_shannon_entropy_avx2(x: &[u32; 256], y: &[u32; 256]) -> u64 {
-    let (mut sum_x, mut sum_xy) = (_mm256_setzero_si256(), _mm256_setzero_si256());
-    let mut acc = _mm256_setzero_si256();
+unsafe fn combined_entropy_avx2(x: &[u32; 256], y: &[u32; 256], slog: &[u64; 256]) -> (u64, u32) {
+    let zero = _mm256_setzero_si256();
+    let (mut sum_x, mut acc, mut sub) = (zero, zero, zero);
     let mut large = 0u64;
     for i in (0..256).step_by(8) {
         let xv = load(x, i);
-        let xy = _mm256_add_epi32(xv, load(y, i));
+        if _mm256_testz_si256(xv, xv) != 0 {
+            continue;
+        }
+        let is_zero = _mm256_cmpeq_epi32(xv, zero);
+        let xy = _mm256_andnot_si256(is_zero, _mm256_add_epi32(xv, load(y, i)));
         sum_x = _mm256_add_epi32(sum_x, xv);
-        sum_xy = _mm256_add_epi32(sum_xy, xy);
-        if _mm256_testz_si256(xv, xv) == 0 {
-            let bits = add_slog2(xv, &mut acc);
-            if bits != 0 {
-                large = large.wrapping_add(add_large(xv, bits));
-            }
+        let bits = add_slog2(xv, &mut acc);
+        if bits != 0 {
+            large = large.wrapping_add(add_large(xv, bits));
         }
-        if _mm256_testz_si256(xy, xy) == 0 {
-            let bits = add_slog2(xy, &mut acc);
-            if bits != 0 {
-                large = large.wrapping_add(add_large(xy, bits));
-            }
+        let bits = add_slog2(xy, &mut acc);
+        if bits != 0 {
+            large = large.wrapping_add(add_large(xy, bits));
         }
+        let lo = _mm256_cvtepi32_epi64(_mm256_castsi256_si128(is_zero));
+        let hi = _mm256_cvtepi32_epi64(_mm256_extracti128_si256::<1>(is_zero));
+        let s = slog[i..i + 8].as_ptr().cast::<__m256i>();
+        sub = _mm256_add_epi64(sub, _mm256_andnot_si256(lo, _mm256_loadu_si256(s)));
+        sub = _mm256_add_epi64(sub, _mm256_andnot_si256(hi, _mm256_loadu_si256(s.add(1))));
     }
-    fast_slog2(hsum32(sum_x))
-        .wrapping_add(fast_slog2(hsum32(sum_xy)))
-        .wrapping_sub(hsum64(acc).wrapping_add(large))
+    (
+        hsum64(_mm256_sub_epi64(acc, sub)).wrapping_add(large),
+        hsum32(sum_x),
+    )
 }
 
-/// `combined_shannon_entropy` with the `fast_slog2`s eight at a time, when the CPU has AVX2.
-pub(super) fn combined_shannon_entropy(x: &[u32; 256], y: &[u32; 256]) -> Option<u64> {
+/// `combined_entropy_avx2`, when the CPU has AVX2.
+pub(super) fn combined_entropy(
+    x: &[u32; 256],
+    y: &[u32; 256],
+    slog: &[u64; 256],
+) -> Option<(u64, u32)> {
     if !crate::wide::has_avx2() {
         return None;
     }
     // SAFETY: the CPU supports AVX2.
-    Some(unsafe { combined_shannon_entropy_avx2(x, y) })
+    Some(unsafe { combined_entropy_avx2(x, y, slog) })
 }
 
 #[target_feature(enable = "avx2")]
@@ -305,7 +316,7 @@ pub(super) fn chunk_stats(v: &[u32; 64]) -> Option<(u32, u32, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lossless::encoder::entropy::sub_pixels;
+    use crate::lossless::encoder::entropy::{sub_pixels, SlogHisto};
     use crate::lossless::encoder::predictor::predict;
 
     fn check_avx2<const M: usize>(cur: &[u32], up: &[u32]) {
@@ -419,7 +430,15 @@ mod tests {
                 (s.wrapping_add(x), m.max(x), e.wrapping_add(fast_slog2(x)))
             });
             assert_eq!(chunk_stats(&v), Some(want), "{v:?}");
-            let x: [u32; 256] = core::array::from_fn(|_| pick() >> (round % 8));
+            let mut x: [u32; 256] = core::array::from_fn(|_| pick() >> (round % 8));
+            if round % 3 == 0 {
+                // Sparse, as a tile's histogram is: most groups of eight are all zero.
+                for (i, v) in x.iter_mut().enumerate() {
+                    if (i * 37 + round) % 64 >= round % 5 {
+                        *v = 0;
+                    }
+                }
+            }
             let y: [u32; 256] = core::array::from_fn(|_| pick() >> (round % 5));
             let (mut want, mut sx, mut sxy) = (0u64, 0u32, 0u32);
             for (&a, &b) in x.iter().zip(&y) {
@@ -433,7 +452,9 @@ mod tests {
             let want = fast_slog2(sx)
                 .wrapping_add(fast_slog2(sxy))
                 .wrapping_sub(want);
-            assert_eq!(combined_shannon_entropy(&x, &y), Some(want));
+            let mut h = SlogHisto::default();
+            h.update(&y);
+            assert_eq!(h.combined_entropy(&x), want);
         }
     }
 }

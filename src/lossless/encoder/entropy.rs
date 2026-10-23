@@ -351,34 +351,103 @@ pub(crate) fn bits_entropy(array: &[u32]) -> u64 {
     bits_entropy_refine(&bits_entropy_unrefined(array))
 }
 
-/// `CombinedShannonEntropy_SSE2`: only the bins where `x` or `y` is nonzero contribute.
-pub(crate) fn combined_shannon_entropy(x: &[u32; 256], y: &[u32; 256]) -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    if let Some(e) = super::avx2::combined_shannon_entropy(x, y) {
-        return e;
-    }
-    let mut retval = 0u64;
-    let (mut sum_x, mut sum_xy) = (0u32, 0u32);
-    for (x, y) in x.chunks_exact(16).zip(y.chunks_exact(16)) {
-        let (x, y): (&[u32; 16], &[u32; 16]) = (x.try_into().unwrap(), y.try_into().unwrap());
-        let mut used = 0u32;
-        for j in 0..16 {
-            used |= u32::from((x[j] | y[j]) != 0) << j;
+/// A bit for each nonzero entry of `v`.
+#[inline]
+fn nonzero_bits(v: &[u32]) -> u32 {
+    v.iter()
+        .enumerate()
+        .fold(0, |m, (j, &x)| m | u32::from(x != 0) << j)
+}
+
+/// A histogram `y` that many others are scored against with `CombinedShannonEntropy`, with
+/// `fast_slog2` of each bin cached. A bin where `x` is zero adds `fast_slog2(y)`, which is in
+/// `total`, so a score only visits the bins where `x` is nonzero.
+pub(crate) struct SlogHisto {
+    y: [u32; 256],
+    slog: [u64; 256],
+    total: u64,
+    sum: u32,
+}
+
+impl Default for SlogHisto {
+    fn default() -> Self {
+        Self {
+            y: [0; 256],
+            slog: [0; 256],
+            total: 0,
+            sum: 0,
         }
-        while used != 0 {
-            let j = used.trailing_zeros() as usize;
-            let xy = x[j].wrapping_add(y[j]);
-            sum_x = sum_x.wrapping_add(x[j]);
-            sum_xy = sum_xy.wrapping_add(xy);
-            retval = retval
-                .wrapping_add(fast_slog2(x[j]))
-                .wrapping_add(fast_slog2(xy));
-            used &= used - 1;
+    }
+}
+
+impl SlogHisto {
+    /// Takes `y` as the new histogram, recomputing the bins that changed.
+    pub(crate) fn update(&mut self, y: &[u32; 256]) {
+        for (i, &v) in y.iter().enumerate() {
+            if v != self.y[i] {
+                self.set(i, v);
+            }
         }
     }
-    fast_slog2(sum_x)
-        .wrapping_add(fast_slog2(sum_xy))
-        .wrapping_sub(retval)
+
+    /// Adds `delta` to the histogram, recomputing the bins where it is nonzero.
+    pub(crate) fn add(&mut self, delta: &[u32; 256]) {
+        for (k, d) in delta.chunks_exact(16).enumerate() {
+            let mut used = nonzero_bits(d);
+            while used != 0 {
+                let i = 16 * k + used.trailing_zeros() as usize;
+                self.set(i, self.y[i].wrapping_add(delta[i]));
+                used &= used - 1;
+            }
+        }
+    }
+
+    #[inline]
+    fn set(&mut self, i: usize, y: u32) {
+        let s = fast_slog2(y);
+        self.total = self.total.wrapping_add(s).wrapping_sub(self.slog[i]);
+        self.sum = self.sum.wrapping_add(y).wrapping_sub(self.y[i]);
+        self.slog[i] = s;
+        self.y[i] = y;
+    }
+
+    pub(crate) fn histogram(&self) -> &[u32; 256] {
+        &self.y
+    }
+
+    /// `CombinedShannonEntropy(x, y)`, all sums wrapping like libwebp's.
+    pub(crate) fn combined_entropy(&self, x: &[u32; 256]) -> u64 {
+        let (diff, sum_x) = self.nonzero_terms(x);
+        fast_slog2(sum_x)
+            .wrapping_add(fast_slog2(sum_x.wrapping_add(self.sum)))
+            .wrapping_sub(self.total.wrapping_add(diff))
+    }
+
+    fn nonzero_terms(&self, x: &[u32; 256]) -> (u64, u32) {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(r) = super::avx2::combined_entropy(x, &self.y, &self.slog) {
+            return r;
+        }
+        self.nonzero_terms_portable(x)
+    }
+
+    fn nonzero_terms_portable(&self, x: &[u32; 256]) -> (u64, u32) {
+        let (mut diff, mut sum_x) = (0u64, 0u32);
+        for (k, x) in x.chunks_exact(16).enumerate() {
+            let mut used = nonzero_bits(x);
+            while used != 0 {
+                let j = used.trailing_zeros() as usize;
+                let i = 16 * k + j;
+                sum_x = sum_x.wrapping_add(x[j]);
+                diff = diff
+                    .wrapping_add(fast_slog2(x[j]))
+                    .wrapping_add(fast_slog2(x[j].wrapping_add(self.y[i])))
+                    .wrapping_sub(self.slog[i]);
+                used &= used - 1;
+            }
+        }
+        (diff, sum_x)
+    }
 }
 
 pub(crate) fn shannon_entropy(x: &[u32]) -> u64 {
@@ -508,7 +577,22 @@ mod tests {
                     want = fast_slog2(sx)
                         .wrapping_add(fast_slog2(sxy))
                         .wrapping_sub(want);
-                    assert_eq!(combined_shannon_entropy(xa, ya), want);
+                    let mut h = SlogHisto::default();
+                    h.update(&[7; 256]);
+                    h.update(ya);
+                    assert_eq!(h.combined_entropy(xa), want);
+                    let mut g = SlogHisto::default();
+                    g.add(ya);
+                    g.add(&[0; 256]);
+                    assert_eq!(g.combined_entropy(xa), want);
+                    let mut xy = *xa;
+                    for (a, b) in xy.iter_mut().zip(ya) {
+                        *a = a.wrapping_add(*b);
+                    }
+                    h.add(xa);
+                    g.update(&xy);
+                    assert_eq!(h.combined_entropy(ya), g.combined_entropy(ya));
+                    assert_eq!(h.nonzero_terms_portable(xa), h.nonzero_terms(xa));
                 }
             }
         }
