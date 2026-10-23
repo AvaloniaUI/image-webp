@@ -38,9 +38,9 @@ pub(crate) fn apply_predictor_transform(
     if y0 == 0 {
         let row = &mut image_data[width * 4..];
         row[3] = row[3].wrapping_add(255);
-        #[cfg(target_arch = "x86_64")]
-        super::sse2::predict_left(row, 4..width * 4);
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        super::simd::predict_left(row, 4..width * 4);
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         apply_predictor_transform_1(row, 4..width * 4, width);
     }
     for r in 1..=rows {
@@ -59,16 +59,16 @@ pub(crate) fn apply_predictor_transform(
             let start_index = (r * width + (block_x << size_bits).max(1)) * 4;
             let end_index = (r * width + ((block_x + 1) << size_bits).min(width)) * 4;
 
-            #[cfg(target_arch = "x86_64")]
-            super::sse2::predict(predictor, image_data, start_index..end_index, width);
-            #[cfg(not(target_arch = "x86_64"))]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            super::simd::predict(predictor, image_data, start_index..end_index, width);
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             predict_portable(predictor, image_data, start_index..end_index, width);
         }
     }
 }
 
 /// Undoes predictor `mode` over `image_data[range]` as [`apply_predictor_transform`] does per block.
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn predict_portable(mode: u8, image_data: &mut [u8], range: Range<usize>, width: usize) {
     match mode {
         0 => apply_predictor_transform_0(image_data, range, width),
@@ -374,19 +374,19 @@ pub(crate) fn apply_color_transform(
     size_bits: u8,
     transform_data: &[u8],
 ) {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         let block_xsize = usize::from(subsample_size(width, size_bits));
         for (y, row) in (y0..).zip(image_data.chunks_exact_mut(usize::from(width) * 4)) {
             let start = (y >> size_bits) * block_xsize * 4;
-            super::sse2::color_transform_row(row, 1 << size_bits, &transform_data[start..start + block_xsize * 4]);
+            super::simd::color_transform_row(row, 1 << size_bits, &transform_data[start..start + block_xsize * 4]);
         }
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     apply_color_transform_portable(image_data, width, y0, size_bits, transform_data);
 }
 
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 pub(crate) fn apply_color_transform_portable(
     image_data: &mut [u8],
     width: u16,
@@ -429,13 +429,13 @@ pub(crate) fn apply_color_transform_portable(
 }
 
 pub(crate) fn apply_subtract_green_transform(image_data: &mut [u8]) {
-    #[cfg(target_arch = "x86_64")]
-    super::sse2::add_green(image_data);
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    super::simd::add_green(image_data);
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     apply_subtract_green_portable(image_data);
 }
 
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 pub(crate) fn apply_subtract_green_portable(image_data: &mut [u8]) {
     for pixel in image_data.chunks_exact_mut(4) {
         pixel[0] = pixel[0].wrapping_add(pixel[1]);
@@ -759,5 +759,81 @@ mod benches {
         b.iter(|| {
             super::apply_subtract_green_transform(black_box(&mut data));
         });
+    }
+}
+
+/// The SIMD kernels against the portable ones.
+#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod simd_tests {
+    use rand::{Rng, SeedableRng};
+
+    use super as scalar;
+    use super::super::simd;
+
+    #[test]
+    fn predictors_match_the_portable_ones() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let portable: [fn(&mut [u8], std::ops::Range<usize>, usize); 14] = [
+            scalar::apply_predictor_transform_0,
+            scalar::apply_predictor_transform_1,
+            scalar::apply_predictor_transform_2,
+            scalar::apply_predictor_transform_3,
+            scalar::apply_predictor_transform_4,
+            scalar::apply_predictor_transform_5,
+            scalar::apply_predictor_transform_6,
+            scalar::apply_predictor_transform_7,
+            scalar::apply_predictor_transform_8,
+            scalar::apply_predictor_transform_9,
+            scalar::apply_predictor_transform_10,
+            scalar::apply_predictor_transform_11,
+            scalar::apply_predictor_transform_12,
+            scalar::apply_predictor_transform_13,
+        ];
+        for width in [1, 2, 3, 4, 5, 7, 8, 9, 16, 17, 33, 100] {
+            for _ in 0..40 {
+                let mut data = vec![0u8; width * 4 * 2 + 4];
+                rng.fill(&mut data[..]);
+                // Small values and equal neighbours bring the select's ties and the clamps out.
+                if rng.gen() {
+                    data.iter_mut().for_each(|b| *b = (*b % 4).wrapping_sub(2));
+                }
+                let x0 = rng.gen_range(1..=width);
+                let x1 = rng.gen_range(x0..=width);
+                let range = (width + x0) * 4..(width + x1) * 4;
+                for mode in 0..16u8 {
+                    let (mut a, mut b) = (data.clone(), data.clone());
+                    portable[usize::from(if mode >= 14 { 0 } else { mode })](&mut a, range.clone(), width);
+                    simd::predict(mode, &mut b, range.clone(), width);
+                    assert_eq!(a, b, "mode {mode} width {width} {range:?}");
+                }
+                let (mut a, mut b) = (data.clone(), data.clone());
+                scalar::apply_predictor_transform_1(&mut a, 4..width * 4, width);
+                simd::predict_left(&mut b, 4..width * 4);
+                assert_eq!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn color_transform_and_add_green_match_the_portable_ones() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+        for width in [1u16, 3, 4, 5, 13, 64, 67] {
+            for size_bits in 2..5 {
+                let rows = 5;
+                let mut data = vec![0u8; usize::from(width) * 4 * rows];
+                rng.fill(&mut data[..]);
+                let blocks = usize::from(width).div_ceil(1 << size_bits) * rows.div_ceil(1 << size_bits);
+                let mut mults = vec![0u8; blocks * 4];
+                rng.fill(&mut mults[..]);
+                let (mut a, mut b) = (data.clone(), data.clone());
+                scalar::apply_color_transform_portable(&mut a, width, 0, size_bits, &mults);
+                scalar::apply_color_transform(&mut b, width, 0, size_bits, &mults);
+                assert_eq!(a, b, "width {width} size_bits {size_bits}");
+                let (mut a, mut b) = (data.clone(), data);
+                scalar::apply_subtract_green_portable(&mut a);
+                simd::add_green(&mut b);
+                assert_eq!(a, b);
+            }
+        }
     }
 }

@@ -3,9 +3,15 @@
 //! [Lossless spec](https://developers.google.com/speed/webp/docs/webp_lossless_bitstream_specification)
 
 mod huffman;
+#[cfg(target_arch = "aarch64")]
+mod neon;
 mod reverse_transform;
 #[cfg(target_arch = "x86_64")]
 mod sse2;
+#[cfg(target_arch = "aarch64")]
+use neon as simd;
+#[cfg(target_arch = "x86_64")]
+use sse2 as simd;
 
 use std::io::{self, BufRead};
 use std::mem;
