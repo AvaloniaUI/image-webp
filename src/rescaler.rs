@@ -231,7 +231,11 @@ impl Rescaler {
         let src = &src[..self.src_width * N];
         let (x_sub, fx_scale) = (self.x_sub as u32, self.fx_scale);
         #[cfg(target_arch = "x86_64")]
-        if sse2::shrink_spans(
+        use sse2::shrink_spans;
+        #[cfg(target_arch = "aarch64")]
+        use neon::shrink_spans;
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        if shrink_spans(
             src,
             N,
             &self.starts,
@@ -261,24 +265,36 @@ impl Rescaler {
         debug_assert!(self.has_pending_output());
         let dst = &mut dst[..self.dst_row_len()];
         if self.y_expand {
-            if self.y_accum == 0 {
-                for (d, &f) in dst.iter_mut().zip(&self.frow) {
-                    *d = clip(mult_fix(f, self.fy_scale));
-                }
-            } else {
+            let ab = (self.y_accum != 0).then(|| {
                 let b = frac((-self.y_accum) as u64, self.y_sub as u64);
-                let a = (ONE - u64::from(b)) as u32;
-                for ((d, &f), &i) in dst.iter_mut().zip(&self.frow).zip(&self.irow) {
-                    let v = u64::from(a) * u64::from(f) + u64::from(b) * u64::from(i);
-                    let j = ((v + ROUNDER) >> FIX) as u32;
-                    *d = clip(mult_fix(j, self.fy_scale));
+                ((ONE - u64::from(b)) as u32, b)
+            });
+            #[cfg(target_arch = "aarch64")]
+            let done = neon::export_expand(dst, &self.frow, &self.irow, self.fy_scale, ab);
+            #[cfg(not(target_arch = "aarch64"))]
+            let done = 0;
+            let rows = dst.iter_mut().zip(&self.frow).zip(&self.irow).skip(done);
+            match ab {
+                None => {
+                    for ((d, &f), _) in rows {
+                        *d = clip(mult_fix(f, self.fy_scale));
+                    }
+                }
+                Some((a, b)) => {
+                    for ((d, &f), &i) in rows {
+                        let v = u64::from(a) * u64::from(f) + u64::from(b) * u64::from(i);
+                        let j = ((v + ROUNDER) >> FIX) as u32;
+                        *d = clip(mult_fix(j, self.fy_scale));
+                    }
                 }
             }
         } else if self.fxy_scale != 0 {
             let yscale = self.fy_scale.wrapping_mul((-self.y_accum) as u32);
             #[cfg(target_arch = "x86_64")]
             let done = sse2::export_shrink(dst, &mut self.irow, &self.frow, yscale, self.fxy_scale);
-            #[cfg(not(target_arch = "x86_64"))]
+            #[cfg(target_arch = "aarch64")]
+            let done = neon::export_shrink(dst, &mut self.irow, &self.frow, yscale, self.fxy_scale);
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             let done = 0;
             export_shrink(
                 &mut dst[done..],
@@ -339,7 +355,9 @@ fn shrink_whole_n<const N: usize>(
 ) {
     #[cfg(target_arch = "x86_64")]
     let done = sse2::shrink_whole(src, N, k, x_sub, out, sum.as_deref_mut());
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    let done = neon::shrink_whole(src, N, k, x_sub, out, sum.as_deref_mut());
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let done = 0;
     let pixels = src
         .chunks_exact(N * k)
@@ -673,6 +691,266 @@ mod sse2 {
     }
 }
 
+/// libwebp's NEON exports (`rescaler_neon.c`), which differ from its C ones over the samples that
+/// whole groups of 8 cover: they multiply by half the scale with `vqrdmulh`, on the samples as
+/// signed, subtract saturating and narrow through 16 bits. The rest of a row takes the C ones.
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_code)]
+mod neon {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn mult_fix(v: uint32x4_t, half_scale: int32x4_t) -> uint32x4_t {
+        vreinterpretq_u32_s32(vqrdmulhq_s32(vreinterpretq_s32_u32(v), half_scale))
+    }
+
+    #[inline(always)]
+    unsafe fn mult_fix_floor(v: uint32x4_t, half_scale: int32x4_t) -> uint32x4_t {
+        vreinterpretq_u32_s32(vqdmulhq_s32(vreinterpretq_s32_u32(v), half_scale))
+    }
+
+    #[inline(always)]
+    unsafe fn half(scale: u32) -> int32x4_t {
+        vdupq_n_s32((scale >> 1) as i32)
+    }
+
+    #[inline(always)]
+    unsafe fn narrow(a: uint32x4_t, b: uint32x4_t) -> uint8x8_t {
+        vqmovn_u16(vcombine_u16(vmovn_u32(a), vmovn_u32(b)))
+    }
+
+    /// [`super::mult_fix`], which libwebp's import keeps in C.
+    #[inline(always)]
+    unsafe fn mult_fix_c(v: uint32x4_t, scale: u32) -> uint32x4_t {
+        let lo = vrshrn_n_u64::<32>(vmull_n_u32(vget_low_u32(v), scale));
+        let hi = vrshrn_n_u64::<32>(vmull_high_n_u32(v, scale));
+        vcombine_u32(lo, hi)
+    }
+
+    #[inline(always)]
+    unsafe fn load4(p: *const u8) -> uint8x8_t {
+        vreinterpret_u8_u32(vdup_n_u32(p.cast::<u32>().read_unaligned()))
+    }
+
+    #[inline(always)]
+    unsafe fn emit(out: &mut [u32], sum: &mut Option<&mut [u32]>, i: usize, v: uint32x4_t) {
+        vst1q_u32(out.as_mut_ptr().add(i), v);
+        if let Some(sum) = sum {
+            let p = sum.as_mut_ptr().add(i);
+            vst1q_u32(p, vaddq_u32(vld1q_u32(p), v));
+        }
+    }
+
+    /// [`super::shrink_whole`] for the outputs whole vectors cover; returns how many it wrote.
+    pub(super) fn shrink_whole(
+        src: &[u8],
+        channels: usize,
+        k: usize,
+        x_sub: u32,
+        out: &mut [u32],
+        mut sum: Option<&mut [u32]>,
+    ) -> usize {
+        let n = out.len();
+        assert!(src.len() >= n * k && sum.as_ref().is_none_or(|s| s.len() >= n));
+        let s = src.as_ptr();
+        let mut i = 0;
+        // SAFETY: each load ends within the `k` source samples of the outputs it writes, each
+        // store within the `n` outputs.
+        unsafe {
+            let xs = vdupq_n_u32(x_sub);
+            let widen = |v: uint16x4_t| vmulq_u32(vmovl_u16(v), xs);
+            match (channels, k) {
+                (1, 1) => {
+                    while i + 16 <= n {
+                        let v = vld1q_u8(s.add(i));
+                        let (lo, hi) = (vmovl_u8(vget_low_u8(v)), vmovl_high_u8(v));
+                        emit(out, &mut sum, i, widen(vget_low_u16(lo)));
+                        emit(out, &mut sum, i + 4, widen(vget_high_u16(lo)));
+                        emit(out, &mut sum, i + 8, widen(vget_low_u16(hi)));
+                        emit(out, &mut sum, i + 12, widen(vget_high_u16(hi)));
+                        i += 16;
+                    }
+                }
+                (1, 2) => {
+                    while i + 8 <= n {
+                        let v = vpaddlq_u8(vld1q_u8(s.add(2 * i)));
+                        emit(out, &mut sum, i, widen(vget_low_u16(v)));
+                        emit(out, &mut sum, i + 4, widen(vget_high_u16(v)));
+                        i += 8;
+                    }
+                }
+                (1, 4) => {
+                    while i + 4 <= n {
+                        let v = vpaddlq_u16(vpaddlq_u8(vld1q_u8(s.add(4 * i))));
+                        emit(out, &mut sum, i, vmulq_u32(v, xs));
+                        i += 4;
+                    }
+                }
+                (1, 8) => {
+                    while i + 4 <= n {
+                        let p = s.add(8 * i);
+                        let a = vpaddlq_u16(vpaddlq_u8(vld1q_u8(p)));
+                        let b = vpaddlq_u16(vpaddlq_u8(vld1q_u8(p.add(16))));
+                        emit(out, &mut sum, i, vmulq_u32(vpaddq_u32(a, b), xs));
+                        i += 4;
+                    }
+                }
+                // Two pixels to a 16-bit vector: up to 256 pixels' channel sums fit.
+                (4, 2..=256) => {
+                    while i + 4 <= n {
+                        let p = s.add(i * k);
+                        let mut acc = vdupq_n_u16(0);
+                        for j in (0..k - 1).step_by(2) {
+                            acc = vaddw_u8(acc, vld1_u8(p.add(4 * j)));
+                        }
+                        let mut px = vadd_u16(vget_low_u16(acc), vget_high_u16(acc));
+                        if k % 2 == 1 {
+                            px = vadd_u16(px, vget_low_u16(vmovl_u8(load4(p.add(4 * (k - 1))))));
+                        }
+                        emit(out, &mut sum, i, widen(px));
+                        i += 4;
+                    }
+                }
+                _ => {}
+            }
+        }
+        i
+    }
+
+    /// [`super::shrink_span`] for every output pixel of one channel, four outputs to a vector where
+    /// four in a row take `k` source pixels each. False for more channels.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn shrink_spans(
+        src: &[u8],
+        channels: usize,
+        starts: &[u32],
+        weights: &[u32],
+        k: usize,
+        x_sub: u32,
+        fx_scale: u32,
+        out: &mut [u32],
+    ) -> bool {
+        let n = weights.len();
+        assert!(starts.len() == n + 1 && out.len() >= n * channels);
+        if channels != 1 {
+            return false;
+        }
+        let s = src.as_ptr();
+        // SAFETY: each load is checked against `src` through `starts` before it is made, each
+        // store ends within the first `n` outputs.
+        unsafe {
+            let xs = vdupq_n_u32(x_sub);
+            let mut x = 0;
+            while x < n {
+                let a = starts[x] as usize;
+                let whole = x >= 1 && x + 4 <= n && a >= 1 && starts[x + 4] as usize == a + 4 * k;
+                if !(whole && matches!(k, 1 | 2 | 4 | 8) && a + 4 * k <= src.len()) {
+                    super::shrink_span::<1>(src, starts, weights, x_sub, fx_scale, x, out);
+                    x += 1;
+                    continue;
+                }
+                let p = s.add(a);
+                let (sums, last) = match k {
+                    1 => {
+                        let v = vmovl_u16(vget_low_u16(vmovl_u8(load4(p))));
+                        (v, v)
+                    }
+                    2 => {
+                        let v = vld1_u8(p);
+                        let last = vshr_n_u16::<8>(vreinterpret_u16_u8(v));
+                        (vmovl_u16(vpaddl_u8(v)), vmovl_u16(last))
+                    }
+                    4 => {
+                        let v = vld1q_u8(p);
+                        let last = vshrq_n_u32::<24>(vreinterpretq_u32_u8(v));
+                        (vpaddlq_u16(vpaddlq_u8(v)), last)
+                    }
+                    _ => {
+                        let (u, v) = (vld1q_u8(p), vld1q_u8(p.add(16)));
+                        let sums =
+                            vpaddq_u32(vpaddlq_u16(vpaddlq_u8(u)), vpaddlq_u16(vpaddlq_u8(v)));
+                        let lu = vmovn_u64(vshrq_n_u64::<56>(vreinterpretq_u64_u8(u)));
+                        let lv = vmovn_u64(vshrq_n_u64::<56>(vreinterpretq_u64_u8(v)));
+                        (sums, vcombine_u32(lu, lv))
+                    }
+                };
+                let prev = vextq_u32::<3>(vdupq_n_u32(u32::from(*p.sub(1))), last);
+                let w = vld1q_u32(weights.as_ptr().add(x));
+                let wp = vld1q_u32(weights.as_ptr().add(x - 1));
+                let carry = mult_fix_c(vmulq_u32(prev, wp), fx_scale);
+                let v = vsubq_u32(vmulq_u32(vaddq_u32(sums, carry), xs), vmulq_u32(last, w));
+                vst1q_u32(out.as_mut_ptr().add(x), v);
+                x += 4;
+            }
+        }
+        true
+    }
+
+    /// `RescalerExportRowExpand_NEON`, interpolating `frow` and `irow` by `ab` where given;
+    /// returns how many samples it wrote.
+    pub(super) fn export_expand(
+        dst: &mut [u8],
+        frow: &[u32],
+        irow: &[u32],
+        fy_scale: u32,
+        ab: Option<(u32, u32)>,
+    ) -> usize {
+        let n = dst.len() & !7;
+        assert!(frow.len() >= n && irow.len() >= n);
+        // SAFETY: every load and store ends within the first `n` samples of the rows.
+        unsafe {
+            let fy = half(fy_scale);
+            let row = |i: usize| {
+                let f = vld1q_u32(frow.as_ptr().add(i));
+                let Some((a, b)) = ab else { return f };
+                let g = vld1q_u32(irow.as_ptr().add(i));
+                let lo = vmlal_n_u32(vmull_n_u32(vget_low_u32(f), a), vget_low_u32(g), b);
+                let hi = vmlal_n_u32(vmull_n_u32(vget_high_u32(f), a), vget_high_u32(g), b);
+                vcombine_u32(vrshrn_n_u64::<32>(lo), vrshrn_n_u64::<32>(hi))
+            };
+            for i in (0..n).step_by(8) {
+                let d = narrow(mult_fix(row(i), fy), mult_fix(row(i + 4), fy));
+                vst1_u8(dst.as_mut_ptr().add(i), d);
+            }
+        }
+        n
+    }
+
+    /// `RescalerExportRowShrink_NEON`; returns how many samples it wrote.
+    pub(super) fn export_shrink(
+        dst: &mut [u8],
+        irow: &mut [u32],
+        frow: &[u32],
+        yscale: u32,
+        fxy_scale: u32,
+    ) -> usize {
+        let n = dst.len() & !7;
+        assert!(irow.len() >= n && frow.len() >= n);
+        // SAFETY: every load and store ends within the first `n` samples of the rows.
+        unsafe {
+            let (ys, fxy) = (half(yscale), half(fxy_scale));
+            for i in (0..n).step_by(8) {
+                let ip = irow.as_mut_ptr().add(i);
+                let fp = frow.as_ptr().add(i);
+                let (mut a0, mut a1) = (vdupq_n_u32(0), vdupq_n_u32(0));
+                if yscale != 0 {
+                    a0 = mult_fix_floor(vld1q_u32(fp), ys);
+                    a1 = mult_fix_floor(vld1q_u32(fp.add(4)), ys);
+                }
+                let b0 = vqsubq_u32(vld1q_u32(ip), a0);
+                let b1 = vqsubq_u32(vld1q_u32(ip.add(4)), a1);
+                vst1_u8(
+                    dst.as_mut_ptr().add(i),
+                    narrow(mult_fix(b0, fxy), mult_fix(b1, fxy)),
+                );
+                vst1q_u32(ip, a0);
+                vst1q_u32(ip.add(4), a1);
+            }
+        }
+        n
+    }
+}
+
 /// libwebp's `WebPRescalerGetScaledDimensions` leaves given sizes as they are; the decoders
 /// turn off the loop filter where both sides shrink below three quarters.
 pub(crate) fn bypasses_filter(width: u32, height: u32, scaled: (u32, u32)) -> bool {
@@ -830,37 +1108,116 @@ mod tests {
         }
     }
 
+    /// Exported rows against libwebp's own `WebPRescalerExportRowShrink` and
+    /// `WebPRescalerExportRowExpand` on this target, at lengths around its vectors.
+    #[allow(unsafe_code)]
     #[test]
-    fn export_shrink_matches_scalar() {
+    fn export_matches_libwebp() {
+        #[repr(C)]
+        #[derive(Default)]
+        struct WebPRescaler {
+            x_expand: i32,
+            y_expand: i32,
+            num_channels: i32,
+            fx_scale: u32,
+            fy_scale: u32,
+            fxy_scale: u32,
+            y_accum: i32,
+            y_add: i32,
+            y_sub: i32,
+            x_add: i32,
+            x_sub: i32,
+            src_width: i32,
+            src_height: i32,
+            dst_width: i32,
+            dst_height: i32,
+            src_y: i32,
+            dst_y: i32,
+            dst: Option<core::ptr::NonNull<u8>>,
+            dst_stride: i32,
+            irow: Option<core::ptr::NonNull<u32>>,
+            frow: Option<core::ptr::NonNull<u32>>,
+        }
+        type Export = unsafe extern "C" fn(*mut WebPRescaler);
+        extern "C" {
+            fn WebPRescalerDspInit();
+            static WebPRescalerExportRowShrink: Option<Export>;
+            static WebPRescalerExportRowExpand: Option<Export>;
+        }
+        unsafe {
+            assert!(libwebp_sys::WebPGetDecoderVersion() > 0);
+            WebPRescalerDspInit();
+        }
+        let scales = [
+            1,
+            0x0100_0001,
+            0x4000_0000,
+            0x8000_0001,
+            0x1234_5679,
+            u32::MAX,
+        ];
         let mut rng = Rng(7);
-        for n in [1, 15, 16, 17, 48, 61] {
-            for yscale in [0, 1 << 31, 0x1234_5678, u32::MAX] {
-                for fxy in [1, 0x0100_0000, 0x4000_0000, u32::MAX] {
-                    let small = rng.next().is_multiple_of(2);
-                    let irow: Vec<u32> = (0..n)
-                        .map(|_| {
-                            if small {
-                                (rng.next() % 4096) as u32
-                            } else {
-                                rng.next() as u32
-                            }
-                        })
-                        .collect();
-                    let frow: Vec<u32> = (0..n).map(|_| rng.next() as u32).collect();
-                    let (mut a, mut b) = (vec![0; n], vec![0; n]);
-                    let (mut ia, mut ib) = (irow.clone(), irow);
-                    let mut r = Rescaler::new(2 * n, 4, n, 2, 1);
-                    (r.irow, r.frow, r.fy_scale, r.fxy_scale, r.y_accum) =
-                        (ia.clone(), frow.clone(), yscale, fxy, -1);
-                    r.export(&mut a);
-                    ia = r.irow;
-                    export_shrink(&mut b, &mut ib, &frow, yscale, fxy);
-                    assert_eq!(
-                        (a, ia),
-                        (b, ib),
-                        "{n} samples, yscale {yscale:x}, fxy {fxy:x}"
-                    );
+        for n in [1, 7, 8, 15, 16, 17, 24, 48, 61] {
+            for case in 0..256 {
+                let expand = case % 2 == 1;
+                let small = case % 4 < 2;
+                // A row's sum holds its last input row, and stays below 2^31: past that, libwebp's
+                // own kernels disagree with each other.
+                let mut sample = || match small {
+                    true => (rng.next() % 4096) as u32,
+                    false => (rng.next() % (1 << 30)) as u32,
+                };
+                let frow: Vec<u32> = (0..n).map(|_| sample()).collect();
+                let irow: Vec<u32> = frow.iter().map(|&f| f + sample()).collect();
+                let pick = |rng: &mut Rng| scales[rng.next() as usize % scales.len()];
+                let (fy_scale, fxy_scale) = (pick(&mut rng), pick(&mut rng));
+                let y_sub = 1 + (rng.next() % 5000) as i32;
+                let y_accum = match rng.next() % 3 {
+                    0 => 0,
+                    _ => -((rng.next() % y_sub as u64) as i32),
+                };
+
+                let mut r = match expand {
+                    true => Rescaler::new(n, 2, n, 4, 1),
+                    false => Rescaler::new(2 * n, 4, n, 2, 1),
+                };
+                (r.irow, r.frow, r.fy_scale, r.fxy_scale, r.y_accum, r.y_sub) = (
+                    irow.clone(),
+                    frow.clone(),
+                    fy_scale,
+                    fxy_scale,
+                    y_accum,
+                    y_sub,
+                );
+                let mut ours = vec![0; n];
+                r.export(&mut ours);
+
+                let (mut theirs, mut irow, mut frow) = (vec![0u8; n], irow, frow);
+                let mut w = WebPRescaler {
+                    y_expand: i32::from(expand),
+                    num_channels: 1,
+                    fy_scale,
+                    fxy_scale,
+                    y_accum,
+                    y_sub,
+                    dst_width: n as i32,
+                    dst_height: 1,
+                    dst: core::ptr::NonNull::new(theirs.as_mut_ptr()),
+                    irow: core::ptr::NonNull::new(irow.as_mut_ptr()),
+                    frow: core::ptr::NonNull::new(frow.as_mut_ptr()),
+                    ..Default::default()
+                };
+                unsafe {
+                    match expand {
+                        true => WebPRescalerExportRowExpand.unwrap()(&mut w),
+                        false => WebPRescalerExportRowShrink.unwrap()(&mut w),
+                    }
                 }
+                assert_eq!(
+                    (ours, r.irow),
+                    (theirs, irow),
+                    "{n} samples, expand {expand}, fy {fy_scale:x}, fxy {fxy_scale:x}, accum {y_accum}/{y_sub}"
+                );
             }
         }
     }

@@ -1,5 +1,6 @@
 //! Times scaled decodes of a lossy WebP at 1/2, 1/4 and 1/8 (whole and one pixel off), and of a
-//! lossless WebP made from it, printing the fastest run and a checksum of the pixels.
+//! lossless WebP made from it, printing the fastest run, libwebp's fastest single-threaded run of
+//! the same decode and a checksum of the pixels (flagged where they differ from libwebp's).
 //!
 //! cargo run --release --example scaled_bench -- image.webp [runs] [case]
 
@@ -18,6 +19,32 @@ fn decode(data: &[u8], size: Option<(u32, u32)>, alpha: bool) -> (Vec<u8>, u32, 
         out.extend_from_slice(rows);
     }
     (out, w, h)
+}
+
+fn decode_libwebp(data: &[u8], size: (u32, u32), alpha: bool) -> Vec<u8> {
+    unsafe {
+        let mut config = std::mem::zeroed::<sys::WebPDecoderConfig>();
+        assert!(sys::WebPInitDecoderConfig(&mut config));
+        let bpp = if alpha { 4 } else { 3 };
+        let mut out = vec![0u8; (size.0 * size.1) as usize * bpp];
+        config.output.colorspace = if alpha {
+            sys::WEBP_CSP_MODE::MODE_RGBA
+        } else {
+            sys::WEBP_CSP_MODE::MODE_RGB
+        };
+        config.output.is_external_memory = 1;
+        config.output.u.RGBA = sys::WebPRGBABuffer {
+            rgba: out.as_mut_ptr(),
+            stride: (size.0 as usize * bpp) as i32,
+            size: out.len(),
+        };
+        config.options.use_scaling = 1;
+        config.options.scaled_width = size.0 as i32;
+        config.options.scaled_height = size.1 as i32;
+        let status = sys::WebPDecode(data.as_ptr(), data.len(), &mut config);
+        assert_eq!(status, sys::VP8StatusCode::VP8_STATUS_OK);
+        out
+    }
 }
 
 fn lossless(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
@@ -74,17 +101,24 @@ fn main() {
         if args.get(3).is_some_and(|only| name != *only) {
             continue;
         }
-        let mut best = f64::MAX;
+        let (mut best, mut theirs) = (f64::MAX, f64::MAX);
         let mut sum = 0;
+        let mut same = true;
         for _ in 0..runs {
             let t = Instant::now();
             let (out, _, _) = decode(file, Some(size), alpha);
             best = best.min(t.elapsed().as_secs_f64() * 1e3);
+            let t = Instant::now();
+            let reference = decode_libwebp(file, size, alpha);
+            theirs = theirs.min(t.elapsed().as_secs_f64() * 1e3);
+            same &= out == reference;
             sum = fnv(&out);
         }
         println!(
-            "{name:<20} {:>5}x{:<5} {best:8.2} ms  {sum:016x}",
-            size.0, size.1
+            "{name:<20} {:>5}x{:<5} {best:8.2} ms  libwebp {theirs:8.2} ms  {sum:016x}{}",
+            size.0,
+            size.1,
+            if same { "" } else { "  DIFFERS" }
         );
     }
 }
