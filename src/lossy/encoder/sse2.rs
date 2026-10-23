@@ -510,6 +510,18 @@ unsafe fn quantize_regs(
     (dequant, !_mm_movemask_epi8(_mm_cmpeq_epi8(packed, zero)) as u32 & 0xffff)
 }
 
+/// The position of the last non-zero coefficient of `coeffs`, or -1, as libwebp's
+/// `SetResidualCoeffs_SSE2`.
+#[inline]
+pub(crate) fn last_non_zero(coeffs: &[i16]) -> i32 {
+    let coeffs = &coeffs[..16];
+    unsafe {
+        let packed = _mm_packs_epi16(load_i16x8(coeffs, 0), load_i16x8(coeffs, 8));
+        let zero = _mm_movemask_epi8(_mm_cmpeq_epi8(packed, _mm_setzero_si128())) as u32;
+        31 - (!zero & 0xffff).leading_zeros() as i32
+    }
+}
+
 /// The luma of the leading pixels of an RGBA row, 16 at a time, as libwebp's
 /// `ConvertRGBToY_SSE2`: the green weight 33059 does not fit an i16, so it is split in two
 /// products. Returns how many it did.

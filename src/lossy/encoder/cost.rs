@@ -208,6 +208,9 @@ pub(crate) struct Residual<'a> {
 
 impl<'a> Residual<'a> {
     pub(crate) fn new(first: usize, coeff_type: usize, coeffs: &'a [i16]) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        let last = super::sse2::last_non_zero(coeffs);
+        #[cfg(not(target_arch = "x86_64"))]
         let last = coeffs[..16]
             .iter()
             .rposition(|&c| c != 0)
@@ -627,6 +630,20 @@ impl Proba {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn residual_last_is_last_non_zero() {
+        for last in -1..16 {
+            for v in [1i16, -1, 300, -2048] {
+                let mut coeffs = [0i16; 16];
+                if last >= 0 {
+                    coeffs[last as usize] = v;
+                    coeffs[0] = v;
+                }
+                assert_eq!(Residual::new(0, 0, &coeffs).last, last);
+            }
+        }
+    }
 
     #[test]
     fn token_buffer_reads_back_across_pages_and_clear() {
