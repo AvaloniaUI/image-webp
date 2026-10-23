@@ -289,7 +289,7 @@ pub(crate) fn reconstruct4x4_disto_modes(
         return None;
     }
     let mut out = [I4Recon::default(); 10];
-    for (m, out) in out.chunks_exact_mut(2).enumerate() {
+    for (m, out) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
         let r = [
             &preds[I4_MODE_OFFSETS[2 * m]..],
             &preds[I4_MODE_OFFSETS[2 * m + 1]..],
@@ -393,7 +393,7 @@ unsafe fn itransform_disto_x2(
 /// register.
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn ftransform_modes(src: &[u8], preds: &[u8], out: &mut [[i16; 16]; 10]) {
-    for (m, out) in out.chunks_exact_mut(2).enumerate() {
+    for (m, out) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
         let r0 = &preds[I4_MODE_OFFSETS[2 * m]..][..3 * BPS + 4];
         let r1 = &preds[I4_MODE_OFFSETS[2 * m + 1]..][..3 * BPS + 4];
         let [c0, c8] = ftransform_x2(src, r0, r1);
@@ -412,7 +412,7 @@ pub(crate) unsafe fn itransform_disto_modes(
     w: Option<&[u16; 16]>,
     out: &mut [I4Recon; 10],
 ) {
-    for (m, out) in out.chunks_exact_mut(2).enumerate() {
+    for (m, out) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
         let r0 = &preds[I4_MODE_OFFSETS[2 * m]..][..3 * BPS + 4];
         let r1 = &preds[I4_MODE_OFFSETS[2 * m + 1]..][..3 * BPS + 4];
         let a = load_i16x16(&coeffs[2 * m]);
@@ -574,16 +574,16 @@ pub(crate) unsafe fn tdisto16x16(a: &[u8], b: &[u8], w: &[u16; 16]) -> i32 {
     let b = &b[..15 * BPS + 16];
     let mut acc = _mm256_setzero_si256();
     for y in (0..16).step_by(4) {
-        let mut rows = [[_mm256_setzero_si256(); 4]; 2];
-        for i in 0..4 {
+        let (mut left, mut right) = ([_mm256_setzero_si256(); 4], [_mm256_setzero_si256(); 4]);
+        for (i, (l, r)) in left.iter_mut().zip(&mut right).enumerate() {
             let off = (y + i) * BPS;
             let va = _mm_loadu_si128(a[off..off + 16].as_ptr().cast());
             let vb = _mm_loadu_si128(b[off..off + 16].as_ptr().cast());
-            rows[0][i] = _mm256_cvtepu8_epi16(_mm_unpacklo_epi32(va, vb));
-            rows[1][i] = _mm256_cvtepu8_epi16(_mm_unpackhi_epi32(va, vb));
+            *l = _mm256_cvtepu8_epi16(_mm_unpacklo_epi32(va, vb));
+            *r = _mm256_cvtepu8_epi16(_mm_unpackhi_epi32(va, vb));
         }
-        let t01 = ttransform_rows(rows[0], w);
-        let t23 = ttransform_rows(rows[1], w);
+        let t01 = ttransform_rows(left, w);
+        let t23 = ttransform_rows(right, w);
         let h = _mm256_hadd_epi32(t01, t23);
         let h = _mm256_hadd_epi32(h, h);
         acc = _mm256_add_epi32(acc, _mm256_srai_epi32::<5>(_mm256_abs_epi32(h)));

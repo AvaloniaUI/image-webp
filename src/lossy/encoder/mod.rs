@@ -1125,7 +1125,7 @@ impl<'a> Encoder<'a> {
         let mut tmp = [[0i16; 16]; 16];
         let mut dc_tmp = [0i16; 16];
 
-        for (y, row) in tmp.chunks_exact_mut(4).enumerate() {
+        for (y, row) in tmp.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let (lo, hi) = row.split_at_mut(2);
             let off = y * 4 * BPS;
             ftransform4(
