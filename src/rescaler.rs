@@ -438,6 +438,10 @@ mod sse2 {
         }
         let s = src.as_ptr();
         let mut i = 0;
+        if crate::wide::has_avx2() && channels == 1 {
+            // SAFETY: the CPU has AVX2, and the bounds are checked above.
+            i = unsafe { super::avx2::shrink_whole(src, k, x_sub, out, sum.as_deref_mut()) };
+        }
         // SAFETY: each load ends within the `k` source samples of the outputs it writes, each
         // store within the `n` outputs.
         unsafe {
@@ -725,6 +729,75 @@ mod avx2 {
     #[inline(always)]
     unsafe fn clip(v: __m256i) -> __m256i {
         _mm256_min_epu32(v, _mm256_set1_epi32(255))
+    }
+
+    #[inline(always)]
+    unsafe fn emit(out: &mut [u32], sum: &mut Option<&mut [u32]>, i: usize, v: __m256i) {
+        _mm256_storeu_si256(out.as_mut_ptr().add(i).cast(), v);
+        if let Some(sum) = sum {
+            let p = sum.as_mut_ptr().add(i).cast();
+            _mm256_storeu_si256(p, _mm256_add_epi32(_mm256_loadu_si256(p), v));
+        }
+    }
+
+    /// `sse2::shrink_whole` of one channel 8 or 32 outputs at a time; returns how many it
+    /// wrote. Takes `src` of at least `k` samples an output and `x_sub` that fits an i16.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn shrink_whole(
+        src: &[u8],
+        k: usize,
+        x_sub: u32,
+        out: &mut [u32],
+        mut sum: Option<&mut [u32]>,
+    ) -> usize {
+        let n = out.len();
+        let s = src.as_ptr();
+        let mut i = 0;
+        let z = _mm256_setzero_si256();
+        let xs = _mm256_set1_epi32(x_sub as i32);
+        let xs16 = _mm256_set1_epi16(x_sub as i16);
+        match k {
+            1 => {
+                while i + 32 <= n {
+                    for g in 0..4 {
+                        let v = _mm256_cvtepu8_epi32(_mm_loadl_epi64(s.add(i + 8 * g).cast()));
+                        emit(out, &mut sum, i + 8 * g, _mm256_madd_epi16(v, xs));
+                    }
+                    i += 32;
+                }
+            }
+            2 => {
+                while i + 8 <= n {
+                    let v = _mm256_cvtepu8_epi16(_mm_loadu_si128(s.add(2 * i).cast()));
+                    emit(out, &mut sum, i, _mm256_madd_epi16(v, xs16));
+                    i += 8;
+                }
+            }
+            4 => {
+                let low = _mm256_set1_epi16(0xff);
+                while i + 8 <= n {
+                    let v = _mm256_loadu_si256(s.add(4 * i).cast());
+                    let pairs = _mm256_add_epi16(_mm256_and_si256(v, low), _mm256_srli_epi16::<8>(v));
+                    emit(out, &mut sum, i, _mm256_madd_epi16(pairs, xs16));
+                    i += 8;
+                }
+            }
+            8 => {
+                while i + 8 <= n {
+                    let a = _mm256_sad_epu8(_mm256_loadu_si256(s.add(8 * i).cast()), z);
+                    let b = _mm256_sad_epu8(_mm256_loadu_si256(s.add(8 * i + 32).cast()), z);
+                    let v = _mm256_unpacklo_epi64(
+                        _mm256_shuffle_epi32::<0b1000>(a),
+                        _mm256_shuffle_epi32::<0b1000>(b),
+                    );
+                    let v = _mm256_permute4x64_epi64::<0b1101_1000>(v);
+                    emit(out, &mut sum, i, _mm256_madd_epi16(v, xs));
+                    i += 8;
+                }
+            }
+            _ => {}
+        }
+        i
     }
 
     /// `sse2::export_shrink` 32 samples at a time; returns how many it wrote.
@@ -1185,6 +1258,31 @@ mod tests {
                         (rows(&mut rng, false, false), rows(&mut rng, false, true)),
                         "{channels} channels, {sw} -> {dw}"
                     );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[allow(unsafe_code)]
+    #[test]
+    fn avx2_whole_shrinks_match_the_sums() {
+        if !crate::wide::has_avx2() {
+            return;
+        }
+        let mut rng = Rng(12);
+        for k in [1, 2, 4, 8] {
+            for n in [0, 1, 7, 8, 9, 31, 32, 33, 70] {
+                let src: Vec<u8> = (0..n * k).map(|_| rng.next() as u8).collect();
+                let x_sub = (rng.next() % 32768) as u32;
+                let base: Vec<u32> = (0..n).map(|_| rng.next() as u32).collect();
+                let (mut out, mut sum) = (vec![0; n], base.clone());
+                // SAFETY: the CPU has AVX2.
+                let done = unsafe { avx2::shrink_whole(&src, k, x_sub, &mut out, Some(&mut sum)) };
+                assert_eq!(done, if k == 1 { n / 32 * 32 } else { n / 8 * 8 });
+                for x in 0..done {
+                    let v = src[x * k..][..k].iter().map(|&p| u32::from(p)).sum::<u32>() * x_sub;
+                    assert_eq!((out[x], sum[x]), (v, base[x].wrapping_add(v)), "k {k} n {n}");
                 }
             }
         }
