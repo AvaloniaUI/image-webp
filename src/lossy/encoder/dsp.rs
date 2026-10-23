@@ -897,9 +897,22 @@ pub(crate) const MAX_COEFF_THRESH: usize = 31;
 
 /// `max_value` and `last_non_zero` of the DCT-coefficient histogram of blocks
 /// `start..end`, numbered as `SCAN` then `SCAN_UV`.
+#[allow(unsafe_code)]
 pub(crate) fn collect_histogram(r: &[u8], pred: &[u8], start: usize, end: usize) -> (i32, i32) {
     // Four interleaved histograms, so repeated bins do not serialize on one counter.
     let mut distribution = [[0u16; MAX_COEFF_THRESH + 1]; 4];
+    #[cfg(target_arch = "x86_64")]
+    if crate::wide::has_avx2() {
+        // Luma or chroma: rows of four blocks, the chroma ones U U V V.
+        let rows: &[usize] = match (start, end) {
+            (0, 16) => &[0, 4 * BPS, 8 * BPS, 12 * BPS],
+            (16, 24) => &[0, 4 * BPS],
+            _ => unreachable!(),
+        };
+        // SAFETY: the CPU supports AVX2.
+        unsafe { super::avx2::histogram_rows(r, pred, rows, &mut distribution) };
+        return histogram_alpha(&distribution);
+    }
     for j in (start..end).step_by(2) {
         let off = if j < 16 { SCAN[j] } else { SCAN_UV[j - 16] };
         let mut out = [0i16; 32];
@@ -911,6 +924,10 @@ pub(crate) fn collect_histogram(r: &[u8], pred: &[u8], start: usize, end: usize)
             }
         }
     }
+    histogram_alpha(&distribution)
+}
+
+fn histogram_alpha(distribution: &[[u16; MAX_COEFF_THRESH + 1]; 4]) -> (i32, i32) {
     let distribution: [u16; MAX_COEFF_THRESH + 1] = std::array::from_fn(|k| {
         distribution[0][k] + distribution[1][k] + distribution[2][k] + distribution[3][k]
     });

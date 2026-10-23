@@ -385,10 +385,11 @@ unsafe fn store_i16x16(p: &mut [i16], v: __m256i) {
     _mm256_storeu_si256(p[..16].as_mut_ptr().cast(), v)
 }
 
-/// `sse2::ftransform2` of the two pairs of 4x4 blocks side by side at `src - r`, the left
-/// pair into `lo` and the right one into `hi`, 32 coefficients each.
+/// The coefficients of the four 4x4 blocks side by side at `src - r`: blocks 0 | 2 rows
+/// 0-1, 0 | 2 rows 2-3, then the same of blocks 1 | 3.
+#[inline]
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn ftransform4(src: &[u8], r: &[u8], lo: &mut [i16], hi: &mut [i16]) {
+unsafe fn ftransform4_regs(src: &[u8], r: &[u8]) -> [__m256i; 4] {
     let src = &src[..3 * BPS + 16];
     let r = &r[..3 * BPS + 16];
     let d0 = _mm256_sub_epi16(load16(src, 0), load16(r, 0));
@@ -401,10 +402,44 @@ pub(crate) unsafe fn ftransform4(src: &[u8], r: &[u8], lo: &mut [i16], hi: &mut 
         ftransform_pass1(_mm256_unpackhi_epi32(d0, d1), _mm256_unpackhi_epi32(d2, d3));
     let [l0, l8] = ftransform_pass2(v01l, v32l);
     let [h0, h8] = ftransform_pass2(v01h, v32h);
+    [l0, l8, h0, h8]
+}
+
+/// `sse2::ftransform2` of the two pairs of 4x4 blocks side by side at `src - r`, the left
+/// pair into `lo` and the right one into `hi`, 32 coefficients each.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn ftransform4(src: &[u8], r: &[u8], lo: &mut [i16], hi: &mut [i16]) {
+    let [l0, l8, h0, h8] = ftransform4_regs(src, r);
     store_i16x16(&mut lo[..16], _mm256_permute2x128_si256::<0x20>(l0, l8));
     store_i16x16(&mut lo[16..32], _mm256_permute2x128_si256::<0x20>(h0, h8));
     store_i16x16(&mut hi[..16], _mm256_permute2x128_si256::<0x31>(l0, l8));
     store_i16x16(&mut hi[16..32], _mm256_permute2x128_si256::<0x31>(h0, h8));
+}
+
+/// `dsp::collect_histogram`'s counts of the blocks in the 16-pixel rows at `rows` of
+/// `src - r`, into `distribution`.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn histogram_rows(
+    src: &[u8],
+    r: &[u8],
+    rows: &[usize],
+    distribution: &mut [[u16; 32]; 4],
+) {
+    let max = _mm256_set1_epi16(31);
+    for &off in rows {
+        let c = ftransform4_regs(&src[off..], &r[off..]);
+        let bin = |v| _mm256_min_epu16(_mm256_srli_epi16::<3>(_mm256_abs_epi16(v)), max);
+        let mut bins = [0u8; 64];
+        let b01 = _mm256_packus_epi16(bin(c[0]), bin(c[1]));
+        let b23 = _mm256_packus_epi16(bin(c[2]), bin(c[3]));
+        _mm256_storeu_si256(bins.as_mut_ptr().cast(), b01);
+        _mm256_storeu_si256(bins.as_mut_ptr().add(32).cast(), b23);
+        for b in bins.as_chunks::<4>().0 {
+            for (h, &b) in distribution.iter_mut().zip(b) {
+                h[usize::from(b)] += 1;
+            }
+        }
+    }
 }
 
 #[inline]
@@ -619,6 +654,19 @@ mod tests {
                 }
             }
             assert_eq!(unsafe { super::tdisto16x16(&a, &b, &w) }, t);
+
+            let mut h1 = [[0u16; 32]; 4];
+            unsafe { super::histogram_rows(&a, &b, &[0, 4 * BPS, 8 * BPS, 12 * BPS], &mut h1) };
+            let mut h2 = [0u16; 32];
+            for off in super::super::dsp::SCAN {
+                let mut out = [0i16; 16];
+                sse2::ftransform(&a[off..], &b[off..], &mut out);
+                for v in out {
+                    h2[usize::from((v.unsigned_abs() >> 3).min(31))] += 1;
+                }
+            }
+            let h1: [u16; 32] = std::array::from_fn(|k| h1.iter().map(|h| h[k]).sum());
+            assert_eq!(h1, h2);
         }
     }
 }
