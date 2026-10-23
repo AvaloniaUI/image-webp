@@ -121,6 +121,44 @@ pub(crate) unsafe fn yuv_to_rgb_row<const BPP: usize>(
     i
 }
 
+/// `sse2::upsample_pairs` 32 pairs at a time, libwebp's `UPSAMPLE_32PIXELS` on 256 bits.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn upsample_pairs(near: &[u8], far: &[u8], out: &mut [u8]) -> usize {
+    let n = near.len().min(far.len());
+    let pairs = (out.len().saturating_sub(1) / 2).min(n.saturating_sub(1));
+    let mut j = 0;
+    let load = |p: &[u8], k: usize| _mm256_loadu_si256(p.as_ptr().add(k).cast());
+    let one = _mm256_set1_epi8(1);
+    while j + 32 <= pairs && j + 33 <= n {
+        let (a, b) = (load(near, j), load(near, j + 1));
+        let (c, d) = (load(far, j), load(far, j + 1));
+        let s = _mm256_avg_epu8(a, d);
+        let t = _mm256_avg_epu8(b, c);
+        let st = _mm256_xor_si256(s, t);
+        let ad = _mm256_xor_si256(a, d);
+        let bc = _mm256_xor_si256(b, c);
+        let lsb = _mm256_and_si256(_mm256_or_si256(_mm256_or_si256(ad, bc), st), one);
+        let k = _mm256_sub_epi8(_mm256_avg_epu8(s, t), lsb);
+        let get_m = |ij: __m256i, x: __m256i| {
+            let lsb = _mm256_and_si256(
+                _mm256_or_si256(_mm256_and_si256(ij, st), _mm256_xor_si256(k, x)),
+                one,
+            );
+            _mm256_sub_epi8(_mm256_avg_epu8(k, x), lsb)
+        };
+        let even = _mm256_avg_epu8(a, get_m(bc, t));
+        let odd = _mm256_avg_epu8(b, get_m(ad, s));
+        let (lo, hi) = (_mm256_unpacklo_epi8(even, odd), _mm256_unpackhi_epi8(even, odd));
+        let p = out.as_mut_ptr().add(2 * j + 1);
+        store_lo(p, lo);
+        store_lo(p.add(16), hi);
+        store_hi(p.add(32), lo);
+        store_hi(p.add(48), hi);
+        j += 32;
+    }
+    j
+}
+
 #[cfg(test)]
 mod tests {
     use rand::{Rng, SeedableRng};
@@ -151,6 +189,27 @@ mod tests {
                 };
                 assert_eq!(a[..done * bpp], b[..done * bpp], "bpp {bpp} len {len}");
             }
+        }
+    }
+
+    #[test]
+    fn upsampled_pairs_match_sse2() {
+        if !crate::wide::has_avx2() {
+            return;
+        }
+        let mut rng = rand::rngs::StdRng::seed_from_u64(10);
+        for round in 0usize..600 {
+            let width = 1 + round % 300;
+            let n = width.div_ceil(2);
+            let mut sample = || if round % 3 == 0 { rng.gen_range(0..2) * 255 } else { rng.gen() };
+            let near: Vec<u8> = (0..n).map(|_| sample()).collect();
+            let far: Vec<u8> = (0..n).map(|_| sample()).collect();
+            let mut a = vec![0u8; width];
+            let mut b = vec![0u8; width];
+            // SAFETY: the CPU has AVX2.
+            let done = unsafe { super::upsample_pairs(&near, &far, &mut a) };
+            super::super::sse2::upsample_pairs_from(&near, &far, &mut b, 0);
+            assert_eq!(a[1..1 + 2 * done], b[1..1 + 2 * done], "{width}");
         }
     }
 }

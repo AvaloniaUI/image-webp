@@ -726,9 +726,18 @@ pub(crate) fn transform_add_two(blocks: &[i16], dst: &mut [u8], pos: usize, stri
 /// The interpolated pixels `out[2 * j + 1]` and `out[2 * j + 2]` of the leading chroma pairs
 /// `j` of `upsample_chroma_row`, 8 pairs at a time. Returns how many pairs it did.
 pub(crate) fn upsample_pairs(near: &[u8], far: &[u8], out: &mut [u8]) -> usize {
+    let mut j = 0;
+    if crate::wide::has_avx2() {
+        // SAFETY: the CPU has AVX2.
+        j = unsafe { super::avx2::upsample_pairs(near, far, out) };
+    }
+    upsample_pairs_from(near, far, out, j)
+}
+
+/// `upsample_pairs` with the pairs before `j` already done.
+pub(crate) fn upsample_pairs_from(near: &[u8], far: &[u8], out: &mut [u8], mut j: usize) -> usize {
     let n = near.len().min(far.len());
     let pairs = (out.len().saturating_sub(1) / 2).min(n.saturating_sub(1));
-    let mut j = 0;
     unsafe {
         let zero = _mm_setzero_si128();
         let k8 = _mm_set1_epi16(8);
