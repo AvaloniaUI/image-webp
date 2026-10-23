@@ -210,6 +210,32 @@ pub(crate) fn itransform_disto(
     }
 }
 
+/// The forward transform of `src - r` quantized with `mtx` into `levels`, then
+/// `itransform_disto` of the result. Returns `non_zero_mask(levels)` and the metrics.
+#[inline]
+pub(crate) fn reconstruct4x4_disto(
+    src: &[u8],
+    r: &[u8],
+    mtx: &Matrix,
+    levels: &mut [i16; 16],
+    dst: &mut [u8],
+    w: Option<&[u16; 16]>,
+) -> (u32, i32, i32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (nz, sse, t) = super::sse2::reconstruct4x4_disto(src, r, mtx, levels, dst, w);
+        (nz, sse, t.abs() >> 5)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let mut tmp = [0i16; 16];
+        ftransform(src, r, &mut tmp);
+        quantize_block(&mut tmp, levels, mtx);
+        let (sse, t) = itransform_disto(r, &tmp, dst, src, w);
+        (non_zero_mask(levels), sse, t)
+    }
+}
+
 #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn itransform_portable(r: &[u8], input: &[i16], dst: &mut [u8], two: bool) {
     itransform_one(r, &input[..16], dst);
@@ -866,6 +892,11 @@ fn quantize_block_portable(input: &mut [i16], out: &mut [i16], mtx: &Matrix) -> 
     levels.iter().any(|&l| l != 0)
 }
 
+/// Bit `n` set when `levels[n]` is not zero.
+pub(crate) fn non_zero_mask(levels: &[i16; 16]) -> u32 {
+    (levels.iter().enumerate()).fold(0, |m, (n, &l)| m | u32::from(l != 0) << n)
+}
+
 pub(crate) fn quantize2_blocks(input: &mut [i16], out: &mut [i16], mtx: &Matrix) -> u32 {
     let nz0 = quantize_block(&mut input[..16], &mut out[..16], mtx);
     let nz1 = quantize_block(&mut input[16..32], &mut out[16..32], mtx);
@@ -1134,6 +1165,16 @@ mod reference {
             itransform_one(&b, &two[..16], &mut e2);
             itransform_one(&b[4..], &two[16..], &mut e2[4..]);
             assert_eq!(e1, e2);
+            for w in [None, Some(&w)] {
+                let mut levels = [0i16; 16];
+                let got = super::reconstruct4x4_disto(&a, &b, &mtx, &mut levels, &mut d1, w);
+                let (mut c, mut l) = ([0i16; 16], [0i16; 16]);
+                super::ftransform(&a, &b, &mut c);
+                super::quantize_block(&mut c, &mut l, &mtx);
+                let (sse, t) = super::itransform_disto(&b, &c, &mut d2, &a, w);
+                let nz = super::non_zero_mask(&l);
+                assert_eq!((got, levels, d1), ((nz, sse, t), l, d2));
+            }
             assert_eq!(super::sse16x8(&a, &b), sse(&a, &b, 16, 8));
         }
     }

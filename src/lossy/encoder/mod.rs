@@ -1393,11 +1393,18 @@ impl<'a> Encoder<'a> {
         i64::from(r)
     }
 
-    fn cost_luma4(&self, levels: &[i16; 16]) -> i64 {
+    /// The rate of `levels`, whose last non-zero one is `last`.
+    fn cost_luma4(&self, levels: &[i16; 16], last: i32) -> i64 {
         let x = self.it.i4 & 3;
         let y = self.it.i4 >> 2;
         let ctx = (self.it.top_nz[x] + self.it.left_nz[y]) as usize;
-        i64::from(Residual::new(0, 3, levels).cost(ctx, &self.proba))
+        let res = Residual {
+            first: 0,
+            last,
+            coeffs: levels,
+            coeff_type: 3,
+        };
+        i64::from(res.cost(ctx, &self.proba))
     }
 
     fn cost_uv(&mut self, uv_levels: &[[i16; 16]; 8]) -> i64 {
@@ -1534,26 +1541,40 @@ impl<'a> Encoder<'a> {
             self.make_intra4_preds();
             for mode in 0..NUM_BMODES {
                 let mut tmp_levels = [0i16; 16];
-                let (coeffs, nz) = self.quantize_intra4(&mut tmp_levels, mode);
-                let it = &mut self.it;
-                let dst = if best_in_tmp {
-                    &mut it.yuv_out2[src_off..]
+                let w = (tlambda != 0).then_some(&WEIGHT_Y);
+                let (non_zero, d, disto) = if self.it.do_trellis {
+                    let (coeffs, _) = self.quantize_intra4(&mut tmp_levels, mode);
+                    let it = &mut self.it;
+                    let dst = if best_in_tmp {
+                        &mut it.yuv_out2[src_off..]
+                    } else {
+                        &mut it.i4_tmp[..]
+                    };
+                    let r = &it.yuv_p[I4_MODE_OFFSETS[mode]..];
+                    let (d, disto) = itransform_disto(r, &coeffs, dst, &it.yuv_in[src_off..], w);
+                    (non_zero_mask(&tmp_levels), d, disto)
                 } else {
-                    &mut it.i4_tmp[..]
+                    let it = &mut self.it;
+                    let dst = if best_in_tmp {
+                        &mut it.yuv_out2[src_off..]
+                    } else {
+                        &mut it.i4_tmp[..]
+                    };
+                    reconstruct4x4_disto(
+                        &it.yuv_in[src_off..],
+                        &it.yuv_p[I4_MODE_OFFSETS[mode]..],
+                        &self.dqm[seg].y1,
+                        &mut tmp_levels,
+                        dst,
+                        w,
+                    )
                 };
-                let (d, disto) = itransform_disto(
-                    &it.yuv_p[I4_MODE_OFFSETS[mode]..],
-                    &coeffs,
-                    dst,
-                    &it.yuv_in[src_off..],
-                    (tlambda != 0).then_some(&WEIGHT_Y),
-                );
                 let mut tmp = Score::INIT;
-                tmp.nz = u32::from(nz) << i4;
+                tmp.nz = u32::from(non_zero != 0) << i4;
                 tmp.d = i64::from(d);
                 tmp.sd = i64::from(mult_8b(tlambda, disto));
                 tmp.h = i64::from(mode_costs[mode]);
-                tmp.r = if mode > 0 && is_flat_fn(&tmp_levels, 1, FLATNESS_LIMIT_I4) {
+                tmp.r = if mode > 0 && (non_zero & !1).count_ones() as i32 <= FLATNESS_LIMIT_I4 {
                     FLATNESS_PENALTY
                 } else {
                     0
@@ -1563,7 +1584,7 @@ impl<'a> Encoder<'a> {
                 if best_mode >= 0 && tmp.score >= rd_i4.score {
                     continue;
                 }
-                tmp.r += self.cost_luma4(&tmp_levels);
+                tmp.r += self.cost_luma4(&tmp_levels, 31 - non_zero.leading_zeros() as i32);
                 tmp.set_rd_score(lambda);
 
                 if best_mode < 0 || tmp.score < rd_i4.score {
