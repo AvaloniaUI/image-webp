@@ -2,6 +2,8 @@
 //!
 //! [Lossless spec](https://developers.google.com/speed/webp/docs/webp_lossless_bitstream_specification)
 
+#[cfg(target_arch = "x86_64")]
+mod avx2;
 mod huffman;
 #[cfg(target_arch = "aarch64")]
 mod neon;

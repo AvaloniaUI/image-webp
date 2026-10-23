@@ -155,6 +155,10 @@ pub(crate) fn predict(mode: u8, image_data: &mut [u8], range: Range<usize>, widt
 pub(crate) fn color_transform_row(row: &mut [u8], block: usize, mults: &[u8]) {
     let n = row.len() / 4;
     assert!(mults.len() >= n.div_ceil(block) * 4);
+    if crate::wide::has_avx2() {
+        // SAFETY: the CPU supports AVX2, and `mults` has a triple for each block.
+        return unsafe { super::avx2::color_transform_row(row, block, mults) };
+    }
     for (b, m) in row.chunks_mut(block * 4).zip(mults.chunks_exact(4)) {
         unsafe { color_transform(b.as_mut_ptr(), b.len() / 4, m[0], m[1], m[2]) }
     }
@@ -163,7 +167,7 @@ pub(crate) fn color_transform_row(row: &mut [u8], block: usize, mults: &[u8]) {
 /// libwebp's `TransformColorInverse_SSE2`, with red and blue where RGBA keeps them: the deltas
 /// `(t * c) >> 5` of signed bytes are the high halves of the 16-bit products of `c << 8` and `t << 3`.
 #[inline(always)]
-unsafe fn color_transform(p: *mut u8, n: usize, red_to_blue: u8, green_to_blue: u8, green_to_red: u8) {
+pub(crate) unsafe fn color_transform(p: *mut u8, n: usize, red_to_blue: u8, green_to_blue: u8, green_to_red: u8) {
     let cst = |m: u8| i32::from(((m as i8 as i16) << 3) as u16);
     let mults_rb = _mm_set1_epi32(cst(green_to_blue) << 16 | cst(green_to_red));
     let mults_b2 = _mm_set1_epi32(cst(red_to_blue));
