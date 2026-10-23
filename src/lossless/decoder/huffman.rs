@@ -188,6 +188,30 @@ impl HuffmanTree {
         matches!(self.0, HuffmanTreeInner::Single(_))
     }
 
+    /// The symbol `bits` start with and its length.
+    #[inline(always)]
+    pub(crate) fn symbol(&self, bits: u64) -> (u16, u32) {
+        match &self.0 {
+            HuffmanTreeInner::Tree { primary_table, secondary_table, table_mask } => {
+                let entry = primary_table[usize::from(bits as u16 & table_mask)];
+                let length = entry >> 12;
+                if length <= u16::from(MAX_TABLE_BITS) {
+                    return (entry & 0xfff, u32::from(length));
+                }
+                Self::secondary_symbol(secondary_table, bits, entry)
+            }
+            HuffmanTreeInner::Single(symbol) => (*symbol, 0),
+        }
+    }
+
+    #[inline(never)]
+    fn secondary_symbol(secondary_table: &[u16], bits: u64, entry: u16) -> (u16, u32) {
+        let mask = (1 << ((entry >> 12) - u16::from(MAX_TABLE_BITS))) - 1;
+        let index = usize::from(entry & 0xfff) + ((bits as usize >> MAX_TABLE_BITS) & mask);
+        let secondary = secondary_table[index];
+        (secondary >> 4, u32::from(secondary & 0xf))
+    }
+
     #[inline(never)]
     fn read_symbol_slowpath<R: BufRead>(
         secondary_table: &[u16],

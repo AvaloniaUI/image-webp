@@ -436,6 +436,16 @@ impl<R: BufRead> LosslessDecoder<R> {
         let mut next_block_start = st.next_block_start;
 
         while index < until {
+            if self.bit_reader.bit_pos < LBITS && !self.bit_reader.eos {
+                let at_entry = index;
+                let fast = Fast { width, num_values, base, last, until };
+                (index, next_block_start) =
+                    fast.run(&mut self.bit_reader, huffman_info, &mut st.huff_index, data, index, next_block_start)?;
+                tree = &huffman_info.huffman_code_groups[st.huff_index];
+                if index >= until || index != at_entry {
+                    continue;
+                }
+            }
             self.bit_reader.fill()?;
             let at = (index - base) * 4;
 
@@ -682,6 +692,176 @@ impl<R: BufRead> LosslessDecoder<R> {
             }
             dist.try_into().unwrap()
         }
+    }
+}
+
+/// The pixel loop with the bits in locals, which the pixel stores could alias and keep in memory
+/// otherwise. It stops 16 bytes short of the end of the read-ahead, so every fill is one load and
+/// no code runs past the stream: the bits and the end of the stream stay libwebp's. It also stops
+/// at `until`, and ahead of a group of single-symbol codes, which the caller fills as runs.
+struct Fast {
+    width: usize,
+    num_values: usize,
+    base: usize,
+    last: usize,
+    until: usize,
+}
+
+/// `VP8LFillBitWindow` with at least eight bytes left.
+#[inline(always)]
+fn fill(buf: &[u8], val: &mut u64, pos: &mut u32, at: &mut usize) {
+    let w = u64::from_le_bytes(buf[*at..*at + 8].try_into().unwrap());
+    let shift = *pos & !7;
+    *val = (*val >> shift) | (w << 1) << (LBITS - 1 - shift);
+    *at += (shift / 8) as usize;
+    *pos &= 7;
+}
+
+/// `GetCopyDistance`, up to 18 extra bits.
+#[inline(always)]
+fn prefix(val: u64, pos: &mut u32, symbol: u16) -> usize {
+    if symbol < 4 {
+        return usize::from(symbol) + 1;
+    }
+    let extra = u32::from(symbol - 2) >> 1;
+    let offset = (2 + (usize::from(symbol) & 1)) << extra;
+    let bits = (val >> *pos) as usize & ((1 << extra) - 1);
+    *pos += extra;
+    offset + bits + 1
+}
+
+impl Fast {
+    #[inline(always)]
+    fn run<R: BufRead>(
+        &self,
+        br: &mut BitReader<R>,
+        huffman: &mut HuffmanInfo,
+        huff_index: &mut usize,
+        data: &mut [u8],
+        mut index: usize,
+        mut next_block_start: usize,
+    ) -> Result<(usize, usize), DecodingError> {
+        let HuffmanInfo { xsize, color_cache, image, bits, mask, huffman_code_groups, .. } = huffman;
+        let mut group = &huffman_code_groups[*huff_index];
+        let (mut val, mut pos, mut at) = (br.val, br.bit_pos, br.at);
+        let buf = &br.buf[..];
+        let Some(at_limit) = buf.len().checked_sub(17) else {
+            return Ok((index, next_block_start));
+        };
+        let mut stop = next_block_start.min(self.until);
+        let result = loop {
+            if index >= stop || at > at_limit {
+                if index >= self.until || at > at_limit {
+                    break Ok(());
+                }
+                let (x, y) = (index % self.width, index / self.width);
+                let group_index = if *bits == 0 {
+                    0
+                } else {
+                    usize::from(image[(y >> *bits) * usize::from(*xsize) + (x >> *bits)])
+                };
+                let tree = &huffman_code_groups[group_index];
+                if tree[..4].iter().all(|t| t.is_single_node()) {
+                    break Ok(());
+                }
+                next_block_start = (x | usize::from(*mask)).min(self.width - 1) + y * self.width + 1;
+                stop = next_block_start.min(self.until);
+                *huff_index = group_index;
+                group = tree;
+            }
+            fill(buf, &mut val, &mut pos, &mut at);
+            let (code, n) = group[GREEN].symbol(val >> pos);
+            pos += n;
+            let o = (index - self.base) * 4;
+            if code < 256 {
+                let (red, n) = group[RED].symbol(val >> pos);
+                pos += n;
+                // Blue and alpha take up to 30 bits, and the next fill wants fewer than 64 read.
+                if pos > LBITS - 31 {
+                    fill(buf, &mut val, &mut pos, &mut at);
+                }
+                let (blue, n) = group[BLUE].symbol(val >> pos);
+                pos += n;
+                let (alpha, n) = group[ALPHA].symbol(val >> pos);
+                pos += n;
+                let pixel = u32::from_le_bytes([red as u8, code as u8, blue as u8, alpha as u8]);
+                data[o..o + 4].copy_from_slice(&pixel.to_le_bytes());
+                if let Some(cache) = color_cache.as_mut() {
+                    cache.insert(pixel);
+                }
+                index += 1;
+            } else if code < 256 + 24 {
+                match self.copy::<R>(buf, group, data, color_cache, index, code, (val, pos, at)) {
+                    Ok((length, bits)) => {
+                        (val, pos, at) = bits;
+                        index += length;
+                    }
+                    Err(e) => break Err(e),
+                }
+            } else {
+                let Some(cache) = color_cache.as_mut() else {
+                    break Err(DecodingError::BitStreamError);
+                };
+                let color = cache.lookup(usize::from(code - 280));
+                data[o..o + 4].copy_from_slice(&color.to_le_bytes());
+                cache.insert(color);
+                index += 1;
+            }
+        };
+        (br.val, br.bit_pos, br.at) = (val, pos, at);
+        result.map(|()| (index, next_block_start))
+    }
+
+    /// A backward reference of length code `code`: its length, and the bits after it. Out of line,
+    /// so the literal loop keeps its registers.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn copy<R: BufRead>(
+        &self,
+        buf: &[u8],
+        group: &HuffmanCodeGroup,
+        data: &mut [u8],
+        color_cache: &mut Option<ColorCache>,
+        index: usize,
+        code: u16,
+        (mut val, mut pos, mut at): (u64, u32, usize),
+    ) -> Result<(usize, (u64, u32, usize)), DecodingError> {
+        let length = prefix(val, &mut pos, code - 256);
+        let (dist_symbol, n) = group[DIST].symbol(val >> pos);
+        pos += n;
+        fill(buf, &mut val, &mut pos, &mut at);
+        let dist_code = prefix(val, &mut pos, dist_symbol);
+        let dist = LosslessDecoder::<R>::plane_code_to_distance(self.width as u16, dist_code);
+        if index < dist || self.num_values - index < length {
+            return Err(DecodingError::BitStreamError);
+        }
+        let o = (index - self.base) * 4;
+        if dist == 1 {
+            let value: [u8; 4] = data[o - 4..][..4].try_into().unwrap();
+            for px in data[o..o + length * 4].chunks_exact_mut(4) {
+                px.copy_from_slice(&value);
+            }
+        } else {
+            if index + length + 3 <= self.last {
+                let start = o - dist * 4;
+                data.copy_within(start..start + 16, o);
+                if length > 4 || dist < 4 {
+                    for i in (0..length * 4).step_by((dist * 4).min(16)).skip(1) {
+                        data.copy_within(start + i..start + i + 16, o + i);
+                    }
+                }
+            } else {
+                for i in o..o + length * 4 {
+                    data[i] = data[i - dist * 4];
+                }
+            }
+            if let Some(cache) = color_cache.as_mut() {
+                for pixel in data[o..][..length * 4].chunks_exact(4) {
+                    cache.insert(u32::from_le_bytes(pixel.try_into().unwrap()));
+                }
+            }
+        }
+        Ok((length, (val, pos, at)))
     }
 }
 
