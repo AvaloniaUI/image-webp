@@ -340,6 +340,33 @@ pub(crate) fn ftransform2(src: &[u8], r: &[u8], out: &mut [i16]) {
     }
 }
 
+/// `ftransform2` of the two pairs of blocks side by side at `src - r`, the left pair into
+/// `lo` and the right one into `hi`.
+#[inline]
+#[allow(unsafe_code)]
+pub(crate) fn ftransform4(src: &[u8], r: &[u8], lo: &mut [i16], hi: &mut [i16]) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::wide::has_avx2() {
+        // SAFETY: the CPU supports AVX2.
+        return unsafe { super::avx2::ftransform4(src, r, lo, hi) };
+    }
+    ftransform2(src, r, lo);
+    ftransform2(&src[8..], &r[8..], hi);
+}
+
+/// `itransform` of the two pairs of blocks `lo` and `hi`, side by side, into `dst`.
+#[inline]
+#[allow(unsafe_code)]
+pub(crate) fn itransform4(r: &[u8], lo: &[i16], hi: &[i16], dst: &mut [u8]) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::wide::has_avx2() {
+        // SAFETY: the CPU supports AVX2.
+        return unsafe { super::avx2::itransform4(r, lo, hi, dst) };
+    }
+    itransform(r, lo, dst, true);
+    itransform(&r[8..], hi, &mut dst[8..], true);
+}
+
 #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn ftransform2_portable(src: &[u8], r: &[u8], out: &mut [i16]) {
     ftransform_portable(src, r, &mut out[..16]);
@@ -850,7 +877,13 @@ fn tdisto4x4_portable(a: &[u8], b: &[u8], w: &[u16; 16]) -> i32 {
     (sb - sa).abs() >> 5
 }
 
+#[allow(unsafe_code)]
 pub(crate) fn tdisto16x16(a: &[u8], b: &[u8], w: &[u16; 16]) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    if crate::wide::has_avx2() {
+        // SAFETY: the CPU supports AVX2.
+        return unsafe { super::avx2::tdisto16x16(a, b, w) };
+    }
     let mut d = 0;
     for y in (0..16 * BPS).step_by(4 * BPS) {
         for x in (0..16).step_by(4) {

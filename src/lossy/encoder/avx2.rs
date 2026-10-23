@@ -367,6 +367,138 @@ pub(crate) unsafe fn reconstruct4x4_disto_x2(
     }
 }
 
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn load16(p: &[u8], off: usize) -> __m256i {
+    _mm256_cvtepu8_epi16(_mm_loadu_si128(p[off..off + 16].as_ptr().cast()))
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn load_i16x16(p: &[i16]) -> __m256i {
+    _mm256_loadu_si256(p[..16].as_ptr().cast())
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn store_i16x16(p: &mut [i16], v: __m256i) {
+    _mm256_storeu_si256(p[..16].as_mut_ptr().cast(), v)
+}
+
+/// `sse2::ftransform2` of the two pairs of 4x4 blocks side by side at `src - r`, the left
+/// pair into `lo` and the right one into `hi`, 32 coefficients each.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn ftransform4(src: &[u8], r: &[u8], lo: &mut [i16], hi: &mut [i16]) {
+    let src = &src[..3 * BPS + 16];
+    let r = &r[..3 * BPS + 16];
+    let d0 = _mm256_sub_epi16(load16(src, 0), load16(r, 0));
+    let d1 = _mm256_sub_epi16(load16(src, BPS), load16(r, BPS));
+    let d2 = _mm256_sub_epi16(load16(src, 2 * BPS), load16(r, 2 * BPS));
+    let d3 = _mm256_sub_epi16(load16(src, 3 * BPS), load16(r, 3 * BPS));
+    let (v01l, v32l) =
+        ftransform_pass1(_mm256_unpacklo_epi32(d0, d1), _mm256_unpacklo_epi32(d2, d3));
+    let (v01h, v32h) =
+        ftransform_pass1(_mm256_unpackhi_epi32(d0, d1), _mm256_unpackhi_epi32(d2, d3));
+    let [l0, l8] = ftransform_pass2(v01l, v32l);
+    let [h0, h8] = ftransform_pass2(v01h, v32h);
+    store_i16x16(&mut lo[..16], _mm256_permute2x128_si256::<0x20>(l0, l8));
+    store_i16x16(&mut lo[16..32], _mm256_permute2x128_si256::<0x20>(h0, h8));
+    store_i16x16(&mut hi[..16], _mm256_permute2x128_si256::<0x31>(l0, l8));
+    store_i16x16(&mut hi[16..32], _mm256_permute2x128_si256::<0x31>(h0, h8));
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn itransform_two_pass<const SHIFT: bool>(
+    x0: __m256i,
+    x1: __m256i,
+    x2: __m256i,
+    x3: __m256i,
+    dc_add: i16,
+) -> [__m256i; 4] {
+    let k1 = _mm256_set1_epi16(20091);
+    let k2 = _mm256_set1_epi16(-30068);
+    let dc = _mm256_add_epi16(x0, _mm256_set1_epi16(dc_add));
+    let a = _mm256_add_epi16(dc, x2);
+    let b = _mm256_sub_epi16(dc, x2);
+    let c = _mm256_add_epi16(
+        _mm256_sub_epi16(x1, x3),
+        _mm256_sub_epi16(_mm256_mulhi_epi16(x1, k2), _mm256_mulhi_epi16(x3, k1)),
+    );
+    let d = _mm256_add_epi16(
+        _mm256_add_epi16(x1, x3),
+        _mm256_add_epi16(_mm256_mulhi_epi16(x1, k1), _mm256_mulhi_epi16(x3, k2)),
+    );
+    let mut t = [
+        _mm256_add_epi16(a, d),
+        _mm256_add_epi16(b, c),
+        _mm256_sub_epi16(b, c),
+        _mm256_sub_epi16(a, d),
+    ];
+    if SHIFT {
+        for v in &mut t {
+            *v = _mm256_srai_epi16::<3>(*v);
+        }
+    }
+    transpose_2_4x4(t[0], t[1], t[2], t[3])
+}
+
+/// `sse2::itransform_two` of the pairs of blocks `lo` and `hi` (32 coefficients each) added
+/// to the 16-pixel rows of `r`, into `dst`.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn itransform4(r: &[u8], lo: &[i16], hi: &[i16], dst: &mut [u8]) {
+    let r = &r[..3 * BPS + 16];
+    let dst = &mut dst[..3 * BPS + 16];
+    let (b0, b1) = (load_i16x16(&lo[..16]), load_i16x16(&lo[16..32]));
+    let (b2, b3) = (load_i16x16(&hi[..16]), load_i16x16(&hi[16..32]));
+    let tmp0 = _mm256_permute2x128_si256::<0x20>(b0, b2);
+    let tmp1 = _mm256_permute2x128_si256::<0x31>(b0, b2);
+    let tmp2 = _mm256_permute2x128_si256::<0x20>(b1, b3);
+    let tmp3 = _mm256_permute2x128_si256::<0x31>(b1, b3);
+    let t = itransform_two_pass::<false>(
+        _mm256_unpacklo_epi64(tmp0, tmp2),
+        _mm256_unpackhi_epi64(tmp0, tmp2),
+        _mm256_unpacklo_epi64(tmp1, tmp3),
+        _mm256_unpackhi_epi64(tmp1, tmp3),
+        0,
+    );
+    let t = itransform_two_pass::<true>(t[0], t[1], t[2], t[3], 4);
+    for y in [0, 2] {
+        let a = _mm256_add_epi16(load16(r, y * BPS), t[y]);
+        let b = _mm256_add_epi16(load16(r, (y + 1) * BPS), t[y + 1]);
+        let px = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_packus_epi16(a, b));
+        let row0 = &mut dst[y * BPS..y * BPS + 16];
+        _mm_storeu_si128(row0.as_mut_ptr().cast(), _mm256_castsi256_si128(px));
+        let row1 = &mut dst[(y + 1) * BPS..(y + 1) * BPS + 16];
+        _mm_storeu_si128(row1.as_mut_ptr().cast(), _mm256_extracti128_si256::<1>(px));
+    }
+}
+
+/// `dsp::tdisto16x16`: the 4x4 blocks two per register, each lane `sse2::ttransform`.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn tdisto16x16(a: &[u8], b: &[u8], w: &[u16; 16]) -> i32 {
+    let a = &a[..15 * BPS + 16];
+    let b = &b[..15 * BPS + 16];
+    let mut acc = _mm256_setzero_si256();
+    for y in (0..16).step_by(4) {
+        let mut rows = [[_mm256_setzero_si256(); 4]; 2];
+        for i in 0..4 {
+            let off = (y + i) * BPS;
+            let va = _mm_loadu_si128(a[off..off + 16].as_ptr().cast());
+            let vb = _mm_loadu_si128(b[off..off + 16].as_ptr().cast());
+            rows[0][i] = _mm256_cvtepu8_epi16(_mm_unpacklo_epi32(va, vb));
+            rows[1][i] = _mm256_cvtepu8_epi16(_mm_unpackhi_epi32(va, vb));
+        }
+        let t01 = ttransform_rows(rows[0], w);
+        let t23 = ttransform_rows(rows[1], w);
+        let h = _mm256_hadd_epi32(t01, t23);
+        let h = _mm256_hadd_epi32(h, h);
+        acc = _mm256_add_epi32(acc, _mm256_srai_epi32::<5>(_mm256_abs_epi32(h)));
+    }
+    let acc: [i32; 8] = core::mem::transmute(acc);
+    acc[0] + acc[1] + acc[4] + acc[5]
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::dsp::{bias, I4Recon, Matrix, BPS, QFIX};
@@ -446,6 +578,47 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn row_kernels_match_sse2() {
+        if !crate::wide::has_avx2() {
+            return;
+        }
+        use super::super::sse2;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(8);
+        let w = [38u16, 32, 20, 9, 32, 28, 17, 7, 20, 17, 10, 4, 9, 7, 4, 2];
+        for round in 0..5000 {
+            let mut a = [0u8; 16 * BPS];
+            let mut b = [0u8; 16 * BPS];
+            random_pixels(&mut rng, round, &mut a);
+            random_pixels(&mut rng, round + 1, &mut b);
+
+            let (mut lo, mut hi) = ([0i16; 32], [0i16; 32]);
+            unsafe { super::ftransform4(&a, &b, &mut lo, &mut hi) };
+            let (mut lo2, mut hi2) = ([0i16; 32], [0i16; 32]);
+            sse2::ftransform2(&a, &b, &mut lo2);
+            sse2::ftransform2(&a[8..], &b[8..], &mut hi2);
+            assert_eq!((lo, hi), (lo2, hi2));
+
+            let mut coeffs = [0i16; 64];
+            for c in &mut coeffs {
+                *c = rng.gen_range(-2048..=2048) >> [0, 3, 6, 9][round % 4];
+            }
+            let (mut d1, mut d2) = ([0u8; 4 * BPS], [0u8; 4 * BPS]);
+            unsafe { super::itransform4(&b, &coeffs[..32], &coeffs[32..], &mut d1) };
+            sse2::itransform_two(&b, &coeffs[..32], &mut d2);
+            sse2::itransform_two(&b[8..], &coeffs[32..], &mut d2[8..]);
+            assert_eq!(d1, d2);
+
+            let mut t = 0;
+            for y in (0..16 * BPS).step_by(4 * BPS) {
+                for x in (0..16).step_by(4) {
+                    t += sse2::ttransform(&a[x + y..], &b[x + y..], &w).abs() >> 5;
+                }
+            }
+            assert_eq!(unsafe { super::tdisto16x16(&a, &b, &w) }, t);
         }
     }
 }

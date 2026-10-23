@@ -1125,11 +1125,14 @@ impl<'a> Encoder<'a> {
         let mut tmp = [[0i16; 16]; 16];
         let mut dc_tmp = [0i16; 16];
 
-        for n in (0..16).step_by(2) {
-            ftransform2(
-                &src[SCAN[n]..],
-                &r[SCAN[n]..],
-                tmp[n..n + 2].as_flattened_mut(),
+        for (y, row) in tmp.chunks_exact_mut(4).enumerate() {
+            let (lo, hi) = row.split_at_mut(2);
+            let off = y * 4 * BPS;
+            ftransform4(
+                &src[off..],
+                &r[off..],
+                lo.as_flattened_mut(),
+                hi.as_flattened_mut(),
             );
         }
         ftransform_wht(tmp.as_flattened(), &mut dc_tmp);
@@ -1178,13 +1181,13 @@ impl<'a> Encoder<'a> {
         } else {
             &mut it.yuv_out[..]
         };
-        for n in (0..16).step_by(2) {
-            itransform(
-                &r[SCAN[n]..],
+        for y in 0..4 {
+            let (off, n) = (y * 4 * BPS, 4 * y);
+            let (lo, hi) = (
                 tmp[n..n + 2].as_flattened(),
-                &mut dst[Y_OFF + SCAN[n]..],
-                true,
+                tmp[n + 2..n + 4].as_flattened(),
             );
+            itransform4(&r[off..], lo, hi, &mut dst[Y_OFF + off..]);
         }
         nz
     }
@@ -1310,13 +1313,16 @@ impl<'a> Encoder<'a> {
         {
             let r = &self.it.yuv_p[UV_MODE_OFFSETS[mode]..];
             let src = &self.it.yuv_in[U_OFF..];
-            for n in (0..8).step_by(2) {
-                ftransform2(
-                    &src[SCAN_UV[n]..],
-                    &r[SCAN_UV[n]..],
-                    tmp[n..n + 2].as_flattened_mut(),
-                );
-            }
+            let (top, bottom) = tmp.split_at_mut(4);
+            let (u0, u1) = top.split_at_mut(2);
+            let (v0, v1) = bottom.split_at_mut(2);
+            ftransform4(src, r, u0.as_flattened_mut(), v0.as_flattened_mut());
+            ftransform4(
+                &src[4 * BPS..],
+                &r[4 * BPS..],
+                u1.as_flattened_mut(),
+                v1.as_flattened_mut(),
+            );
         }
         let dqm = &self.dqm[seg];
         let uv = &dqm.uv;
@@ -1363,13 +1369,10 @@ impl<'a> Encoder<'a> {
         } else {
             &mut it.yuv_out[..]
         };
-        for n in (0..8).step_by(2) {
-            itransform(
-                &r[SCAN_UV[n]..],
-                tmp[n..n + 2].as_flattened(),
-                &mut dst[U_OFF + SCAN_UV[n]..],
-                true,
-            );
+        for (y, (u, v)) in [(0, 4), (2, 6)].into_iter().enumerate() {
+            let off = y * 4 * BPS;
+            let (u, v) = (tmp[u..u + 2].as_flattened(), tmp[v..v + 2].as_flattened());
+            itransform4(&r[off..], u, v, &mut dst[U_OFF + off..]);
         }
         nz << 16
     }
