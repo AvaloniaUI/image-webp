@@ -117,6 +117,39 @@ unsafe fn rgb_from_rgba8(rgba: &[u8], rgb: &mut [u8]) -> usize {
     i
 }
 
+/// Inserts the first whole eights of the RGBA pixels `pixels` into a colour cache of `bits`
+/// bits, in order, where the CPU has AVX2: the number of pixels done. The eight hashes are
+/// taken at once, the stores one at a time, so a later pixel still wins a shared slot.
+pub(crate) fn color_cache_insert(cache: &mut [u32; 1 << 11], bits: u8, pixels: &[u8]) -> usize {
+    if !crate::wide::has_avx2() {
+        return 0;
+    }
+    // SAFETY: the CPU supports AVX2.
+    unsafe { color_cache_insert8(cache, bits, pixels) }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn color_cache_insert8(cache: &mut [u32; 1 << 11], bits: u8, pixels: &[u8]) -> usize {
+    // RGBA to libwebp's ARGB words.
+    #[rustfmt::skip]
+    let argb = _mm256_setr_epi8(
+        2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15,
+        2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15,
+    );
+    let shift = _mm_cvtsi32_si128(32 - i32::from(bits));
+    let mut slots = [0u32; 8];
+    let (quads, _) = pixels.as_chunks::<32>();
+    for q in quads {
+        let v = _mm256_loadu_si256(q.as_ptr().cast());
+        let hash = _mm256_mullo_epi32(_mm256_shuffle_epi8(v, argb), _mm256_set1_epi32(0x1e35a7bd));
+        _mm256_storeu_si256(slots.as_mut_ptr().cast(), _mm256_srl_epi32(hash, shift));
+        for (&slot, px) in slots.iter().zip(q.as_chunks::<4>().0) {
+            cache[slot as usize & ((1 << 11) - 1)] = u32::from_le_bytes(*px);
+        }
+    }
+    quads.len() * 8
+}
+
 /// The eight-pixel kernel alone, for the tests.
 #[cfg(test)]
 #[target_feature(enable = "avx2")]
@@ -152,6 +185,30 @@ mod tests {
                 let want: Vec<u8> = rgba.chunks_exact(4).take(done).flat_map(|p| p[..3].to_vec()).collect();
                 assert_eq!(rgb[..done * 3], want[..], "n {n} slack {slack}");
                 assert!(rgb[n * 3..].iter().all(|&b| b == 0xa5), "n {n} slack {slack}");
+            }
+        }
+    }
+
+    #[test]
+    fn color_cache_insert_matches_the_scalar_one() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(16);
+        for bits in 1..=11u8 {
+            for n in [0, 1, 7, 8, 9, 16, 33, 200] {
+                // Few colours, so slots are shared and the order of the stores shows.
+                let pixels: Vec<u8> = (0..n * 4).map(|_| rng.gen_range(0..3)).collect();
+                let mut want = Box::new([0u32; 1 << 11]);
+                for px in pixels.chunks_exact(4) {
+                    let argb = u32::from_le_bytes(px.try_into().unwrap()).swap_bytes().rotate_right(8);
+                    want[(0x1e35a7bdu32.wrapping_mul(argb) >> (32 - bits)) as usize] = u32::from_le_bytes(px.try_into().unwrap());
+                }
+                let mut got = Box::new([0u32; 1 << 11]);
+                let done = super::color_cache_insert(&mut got, bits, &pixels);
+                assert_eq!(done, if crate::wide::has_avx2() { n / 8 * 8 } else { 0 });
+                for px in pixels[done * 4..].chunks_exact(4) {
+                    let argb = u32::from_le_bytes(px.try_into().unwrap()).swap_bytes().rotate_right(8);
+                    got[(0x1e35a7bdu32.wrapping_mul(argb) >> (32 - bits)) as usize] = u32::from_le_bytes(px.try_into().unwrap());
+                }
+                assert!(want == got, "bits {bits} n {n}");
             }
         }
     }

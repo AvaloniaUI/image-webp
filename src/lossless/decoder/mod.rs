@@ -947,9 +947,7 @@ impl Fast {
                 }
             }
             if let Some(cache) = color_cache.as_mut() {
-                for pixel in data[o..][..length * 4].chunks_exact(4) {
-                    cache.insert(u32::from_le_bytes(pixel.try_into().unwrap()));
-                }
+                cache.insert_all(&data[o..][..length * 4]);
             }
         }
         Ok((length, (val, pos, at)))
@@ -1312,6 +1310,20 @@ impl ColorCache {
         let argb = rgba.swap_bytes().rotate_right(8);
         let index = (0x1e35a7bdu32.wrapping_mul(argb)) >> (32 - self.color_cache_bits);
         self.color_cache[index as usize & ((1 << 11) - 1)] = rgba;
+    }
+
+    /// Inserts the RGBA pixels `pixels` in order.
+    #[inline(always)]
+    fn insert_all(&mut self, pixels: &[u8]) {
+        #[cfg(target_arch = "x86_64")]
+        let pixels = if pixels.len() >= 32 {
+            &pixels[avx2::color_cache_insert(&mut self.color_cache, self.color_cache_bits, pixels) * 4..]
+        } else {
+            pixels
+        };
+        for pixel in pixels.as_chunks::<4>().0 {
+            self.insert(u32::from_le_bytes(*pixel));
+        }
     }
 
     #[inline(always)]
