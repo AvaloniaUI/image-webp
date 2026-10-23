@@ -99,45 +99,59 @@ pub(crate) fn luma_kind(n: usize, block: &[i16; 16]) -> u8 {
 }
 
 /// Adds the inverse transform of luma `block` (16 coefficients), of `kind`, to the 4x4 pixels
-/// at `pos` of `dst`, as libwebp's `DoTransform`.
+/// at `pos` of `dst`, as libwebp's `DoTransform`, and clears `block`.
 #[inline]
-pub(crate) fn add_coeffs(dst: &mut [u8], block: &[i16], kind: u8, pos: usize, stride: usize) {
+pub(crate) fn add_coeffs(dst: &mut [u8], block: &mut [i16], kind: u8, pos: usize, stride: usize) {
+    let block = &mut block[..16];
     match kind {
-        NO_COEFFS => {}
-        DC_ONLY => add_dc((i32::from(block[0]) + 4) >> 3, dst, pos, stride),
+        NO_COEFFS => return,
+        DC_ONLY => {
+            add_dc((i32::from(block[0]) + 4) >> 3, dst, pos, stride);
+            block[0] = 0;
+            return;
+        }
         #[cfg(target_arch = "aarch64")]
         AC3 => super::simd::transform_ac3_add(block, dst, pos, stride),
         #[cfg(not(target_arch = "aarch64"))]
         AC3 => transform_ac3_add(block, dst, pos, stride),
         _ => transform_add(block, dst, pos, stride),
     }
+    block.fill(0);
 }
 
 /// Adds the inverse transforms of the four `blocks` of a chroma plane, of `kinds`, to its 8x8
 /// pixels at `pos` of `dst`. As libwebp's `DoUVTransform` on x86, a plane with AC coefficients
 /// in any block takes the full transform on all four, two at a time. On aarch64 its NEON
-/// transform gives an empty or DC-only block the pixels of [`add_dc`].
+/// transform gives an empty or DC-only block the pixels of [`add_dc`]. Clears `blocks`.
 #[inline(always)]
 pub(crate) fn add_coeffs_uv(
     dst: &mut [u8],
-    blocks: &[i16],
+    blocks: &mut [i16],
     kinds: &[u8],
     pos: usize,
     stride: usize,
 ) {
+    let blocks = &mut blocks[..64];
     #[cfg(target_arch = "x86_64")]
     if kinds[..4].contains(&FULL) {
         super::simd::transform_add_two(&blocks[..32], dst, pos, stride);
-        super::simd::transform_add_two(&blocks[32..64], dst, pos + 4 * stride, stride);
+        super::simd::transform_add_two(&blocks[32..], dst, pos + 4 * stride, stride);
+        blocks.fill(0);
         return;
     }
     for (i, &kind) in kinds[..4].iter().enumerate() {
-        let block = &blocks[i * 16..][..16];
+        let block = &mut blocks[i * 16..][..16];
         let pos = pos + (i / 2) * 4 * stride + (i % 2) * 4;
         match kind {
             NO_COEFFS => {}
-            DC_ONLY => add_dc((i32::from(block[0]) + 4) >> 3, dst, pos, stride),
-            _ => transform_add(block, dst, pos, stride),
+            DC_ONLY => {
+                add_dc((i32::from(block[0]) + 4) >> 3, dst, pos, stride);
+                block[0] = 0;
+            }
+            _ => {
+                transform_add(block, dst, pos, stride);
+                block.fill(0);
+            }
         }
     }
 }
@@ -348,7 +362,7 @@ mod tests {
             transform_add_portable(&block, &mut a, 1, stride);
             transform_ac3_add(&block, &mut b, 1, stride);
             assert_eq!(a, b, "{block:?}");
-            add_coeffs(&mut c, &block, luma_kind(3, &block), 1, stride);
+            add_coeffs(&mut c, &mut block.clone(), luma_kind(3, &block), 1, stride);
             assert_eq!(a, c, "{block:?}");
         }
     }
@@ -363,7 +377,7 @@ mod tests {
             blocks[16 + 1] = 1;
             let dst: Vec<u8> = (0..8 * stride).map(|i| (i * 37) as u8).collect();
             let (mut a, mut b) = (dst.clone(), dst);
-            add_coeffs_uv(&mut a, &blocks, &[DC_ONLY, FULL, 0, 0], 1, stride);
+            add_coeffs_uv(&mut a, &mut blocks.clone(), &[DC_ONLY, FULL, 0, 0], 1, stride);
             crate::lossy::simd::transform_add(&blocks[..16], &mut b, 1, stride);
             crate::lossy::simd::transform_add(&blocks[16..32], &mut b, 5, stride);
             assert_eq!(a, b, "dc {dc}");
@@ -405,17 +419,18 @@ mod tests {
             let n = coeffs(&mut rng, &mut block);
             let dst: Vec<u8> = (0..8 * BPS).map(|_| rng.gen()).collect();
             let (mut a, mut b) = (dst.clone(), dst);
-            add_coeffs(&mut a, &block, luma_kind(n, &block), 0, BPS);
             let src = block;
+            add_coeffs(&mut a, &mut block, luma_kind(n, &src), 0, BPS);
+            assert_eq!(block, [0; 16]);
             unsafe {
                 match n {
                     4.. => VP8Transform.unwrap()(src.as_ptr(), b.as_mut_ptr(), 0),
                     2 | 3 => VP8TransformAC3.unwrap()(src.as_ptr(), b.as_mut_ptr()),
-                    _ if block[0] != 0 => VP8TransformDC.unwrap()(src.as_ptr(), b.as_mut_ptr()),
+                    _ if src[0] != 0 => VP8TransformDC.unwrap()(src.as_ptr(), b.as_mut_ptr()),
                     _ => {}
                 }
             }
-            assert_eq!(a, b, "luma n {n} {block:?}");
+            assert_eq!(a, b, "luma n {n} {src:?}");
 
             let mut blocks = [0i16; 64];
             let mut kinds = [NO_COEFFS; 4];
@@ -432,8 +447,9 @@ mod tests {
             }
             let dst: Vec<u8> = (0..8 * BPS).map(|_| rng.gen()).collect();
             let (mut a, mut b) = (dst.clone(), dst);
-            add_coeffs_uv(&mut a, &blocks, &kinds, 0, BPS);
             let src = blocks;
+            add_coeffs_uv(&mut a, &mut blocks, &kinds, 0, BPS);
+            assert_eq!(blocks, [0; 64]);
             unsafe {
                 if kinds.contains(&FULL) {
                     VP8TransformUV.unwrap()(src.as_ptr(), b.as_mut_ptr());
@@ -441,7 +457,7 @@ mod tests {
                     VP8TransformDCUV.unwrap()(src.as_ptr(), b.as_mut_ptr());
                 }
             }
-            assert_eq!(a, b, "chroma {kinds:?} {blocks:?}");
+            assert_eq!(a, b, "chroma {kinds:?} {src:?}");
         }
     }
 }

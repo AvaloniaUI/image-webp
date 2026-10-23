@@ -85,7 +85,7 @@ fn avg2(this: u8, right: u8) -> u8 {
 pub(crate) fn predict_4x4(
     ws: &mut [u8; LUMA_BLOCK_SIZE],
     modes: &[IntraMode; 16],
-    resdata: &[i16; 384],
+    resdata: &mut [i16; 384],
     kinds: &[u8; 24],
 ) {
     let stride = LUMA_STRIDE;
@@ -110,7 +110,7 @@ pub(crate) fn predict_4x4(
 
             super::transform::add_coeffs(
                 ws,
-                &resdata[i * 16..][..16],
+                &mut resdata[i * 16..][..16],
                 kinds[i],
                 y0 * stride + x0,
                 stride,

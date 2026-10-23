@@ -520,7 +520,7 @@ impl<'a> Vp8Decoder<'a> {
         mbx: usize,
         mby: usize,
         mb: &MacroBlock,
-        resdata: &[i16; 384],
+        resdata: &mut [i16; 384],
         kinds: &[u8; 24],
     ) {
         let stride = 1usize + 16 + 4;
@@ -541,11 +541,18 @@ impl<'a> Vp8Decoder<'a> {
                 for x in 0usize..4 {
                     let i = x + y * 4;
                     let pos = (1 + y * 4) * stride + 1 + x * 4;
-                    transform::add_coeffs(ws, &resdata[i * 16..][..16], kinds[i], pos, stride);
+                    transform::add_coeffs(ws, &mut resdata[i * 16..][..16], kinds[i], pos, stride);
                 }
             }
         }
+    }
 
+    /// Copies the reconstructed luma of macroblock `mbx`, `mby` out of the workspace, apart
+    /// from its prediction so that the stores of the last transforms have left.
+    fn store_luma(&mut self, mbx: usize, mby: usize) {
+        let stride = LUMA_STRIDE;
+        let mw = self.mbwidth as usize;
+        let ws = &self.ws_y;
         self.top_border_y[mbx * 16..][..16].copy_from_slice(&ws[16 * stride + 1..][..16]);
 
         let lw = mw * 16;
@@ -561,7 +568,7 @@ impl<'a> Vp8Decoder<'a> {
         mbx: usize,
         mby: usize,
         mb: &MacroBlock,
-        resdata: &[i16; 384],
+        resdata: &mut [i16; 384],
         kinds: &[u8; 24],
     ) {
         let stride = 1usize + 8;
@@ -592,8 +599,8 @@ impl<'a> Vp8Decoder<'a> {
         }
 
         let pos = stride + 1;
-        transform::add_coeffs_uv(uws, &resdata[16 * 16..][..64], &kinds[16..20], pos, stride);
-        transform::add_coeffs_uv(vws, &resdata[20 * 16..][..64], &kinds[20..24], pos, stride);
+        transform::add_coeffs_uv(uws, &mut resdata[16 * 16..][..64], &kinds[16..20], pos, stride);
+        transform::add_coeffs_uv(vws, &mut resdata[20 * 16..][..64], &kinds[20..24], pos, stride);
 
         self.top_border_u[mbx * 8..][..8].copy_from_slice(&uws[8 * stride + 1..][..8]);
         self.top_border_v[mbx * 8..][..8].copy_from_slice(&vws[8 * stride + 1..][..8]);
@@ -832,13 +839,9 @@ impl<'a> Vp8Decoder<'a> {
                 top[1..].fill(0);
             }
 
-            self.intra_predict_luma(mbx, mby, &mb, &blocks, &kinds);
-            self.intra_predict_chroma(mbx, mby, &mb, &blocks, &kinds);
-            for (block, &kind) in blocks.chunks_exact_mut(16).zip(&kinds) {
-                if kind != transform::NO_COEFFS {
-                    block.fill(0);
-                }
-            }
+            self.intra_predict_luma(mbx, mby, &mb, &mut blocks, &kinds);
+            self.intra_predict_chroma(mbx, mby, &mb, &mut blocks, &kinds);
+            self.store_luma(mbx, mby);
             row.push(mb);
         }
         Ok(())

@@ -661,21 +661,27 @@ unsafe fn transform_rows(rows: [__m128i; 4]) -> [__m128i; 4] {
 
 /// libwebp's `Transform_SSE2` for one block: the inverse transform of `block` (16
 /// coefficients that fit 16 bits) added to the 4x4 pixels at `pos` of `dst`.
+#[inline(always)]
 pub(crate) fn transform_add(block: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
     let block = &block[..16];
     check(dst.len(), pos, 0, 3 * stride + 4);
     unsafe {
         let row = |r: usize| _mm_loadl_epi64(block.as_ptr().add(4 * r).cast());
-        let t = transform_rows([row(0), row(1), row(2), row(3)]);
+        let [t0, t1, t2, t3] = transform_rows([row(0), row(1), row(2), row(3)]);
         let zero = _mm_setzero_si128();
-        let mut p = dst.as_mut_ptr().add(pos);
-        for t in t {
-            let d = _mm_unpacklo_epi8(_mm_cvtsi32_si128(p.cast::<i32>().read_unaligned()), zero);
-            let d = _mm_add_epi16(d, t);
-            p.cast::<i32>()
-                .write_unaligned(_mm_cvtsi128_si32(_mm_packus_epi16(d, d)));
-            p = p.add(stride);
-        }
+        let p = dst.as_mut_ptr().add(pos);
+        let ld = |k: usize| _mm_cvtsi32_si128(p.add(k * stride).cast::<i32>().read_unaligned());
+        let d01 = _mm_unpacklo_epi8(_mm_unpacklo_epi32(ld(0), ld(1)), zero);
+        let d23 = _mm_unpacklo_epi8(_mm_unpacklo_epi32(ld(2), ld(3)), zero);
+        // Two rows a pack: LLVM narrows a pack of which it keeps one half with extra clamps.
+        let r = _mm_packus_epi16(
+            _mm_add_epi16(d01, _mm_unpacklo_epi64(t0, t1)),
+            _mm_add_epi16(d23, _mm_unpacklo_epi64(t2, t3)),
+        );
+        store4(p, r);
+        store4(p.add(stride), _mm_srli_si128::<4>(r));
+        store4(p.add(2 * stride), _mm_srli_si128::<8>(r));
+        store4(p.add(3 * stride), _mm_srli_si128::<12>(r));
     }
 }
 
@@ -815,13 +821,12 @@ pub(crate) fn add_dc(dc: i32, dst: &mut [u8], pos: usize, stride: usize) {
     check(dst.len(), pos, 0, 3 * stride + 4);
     unsafe {
         let dc = _mm_set1_epi16(dc as i16);
-        let zero = _mm_setzero_si128();
+        let up = _mm_packus_epi16(dc, dc);
+        let down = _mm_packus_epi16(_mm_sub_epi16(_mm_setzero_si128(), dc), dc);
         let mut p = dst.as_mut_ptr().add(pos);
         for _ in 0..4 {
-            let d = _mm_unpacklo_epi8(_mm_cvtsi32_si128(p.cast::<i32>().read_unaligned()), zero);
-            let d = _mm_add_epi16(d, dc);
-            p.cast::<i32>()
-                .write_unaligned(_mm_cvtsi128_si32(_mm_packus_epi16(d, d)));
+            let d = _mm_cvtsi32_si128(p.cast::<i32>().read_unaligned());
+            store4(p, _mm_subs_epu8(_mm_adds_epu8(d, up), down));
             p = p.add(stride);
         }
     }
