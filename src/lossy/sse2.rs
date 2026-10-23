@@ -158,7 +158,7 @@ unsafe fn do_filter6(
 }
 
 #[inline(always)]
-unsafe fn rd32(b: *const u8) -> i32 {
+pub(super) unsafe fn rd32(b: *const u8) -> i32 {
     b.cast::<i32>().read_unaligned()
 }
 
@@ -186,7 +186,7 @@ unsafe fn load8x4(b: *const u8, stride: usize) -> (__m128i, __m128i) {
 
 /// Columns 0..4 of 8 rows from `r0` and 8 rows from `r8`, one register per column.
 #[inline(always)]
-unsafe fn load16x4(r0: *const u8, r8: *const u8, stride: usize) -> [__m128i; 4] {
+pub(super) unsafe fn load16x4(r0: *const u8, r8: *const u8, stride: usize) -> [__m128i; 4] {
     let (t1, t2) = load8x4(r0, stride);
     let (p0, q1) = load8x4(r8, stride);
     [
@@ -198,7 +198,7 @@ unsafe fn load16x4(r0: *const u8, r8: *const u8, stride: usize) -> [__m128i; 4] 
 }
 
 #[inline(always)]
-unsafe fn store4x4(mut x: __m128i, dst: *mut u8, stride: usize) {
+pub(super) unsafe fn store4x4(mut x: __m128i, dst: *mut u8, stride: usize) {
     for i in 0..4 {
         dst.add(i * stride)
             .cast::<i32>()
@@ -208,7 +208,7 @@ unsafe fn store4x4(mut x: __m128i, dst: *mut u8, stride: usize) {
 }
 
 #[inline(always)]
-unsafe fn store16x4(c: [__m128i; 4], r0: *mut u8, r8: *mut u8, stride: usize) {
+pub(super) unsafe fn store16x4(c: [__m128i; 4], r0: *mut u8, r8: *mut u8, stride: usize) {
     let [p1, p0, q0, q1] = c;
     let p0_s = _mm_unpacklo_epi8(p1, p0);
     let p1_s = _mm_unpackhi_epi8(p1, p0);
@@ -221,22 +221,22 @@ unsafe fn store16x4(c: [__m128i; 4], r0: *mut u8, r8: *mut u8, stride: usize) {
 }
 
 #[inline(always)]
-unsafe fn load16(b: *const u8) -> __m128i {
+pub(super) unsafe fn load16(b: *const u8) -> __m128i {
     _mm_loadu_si128(b.cast())
 }
 
 #[inline(always)]
-unsafe fn store16(b: *mut u8, x: __m128i) {
+pub(super) unsafe fn store16(b: *mut u8, x: __m128i) {
     _mm_storeu_si128(b.cast(), x)
 }
 
 #[inline(always)]
-unsafe fn load_uv(u: *const u8, v: *const u8) -> __m128i {
+pub(super) unsafe fn load_uv(u: *const u8, v: *const u8) -> __m128i {
     _mm_unpacklo_epi64(_mm_loadl_epi64(u.cast()), _mm_loadl_epi64(v.cast()))
 }
 
 #[inline(always)]
-unsafe fn store_uv(x: __m128i, u: *mut u8, v: *mut u8) {
+pub(super) unsafe fn store_uv(x: __m128i, u: *mut u8, v: *mut u8) {
     _mm_storel_epi64(u.cast(), x);
     _mm_storel_epi64(v.cast(), _mm_srli_si128::<8>(x));
 }
