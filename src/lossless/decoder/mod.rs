@@ -610,6 +610,13 @@ impl<R: BufRead> LosslessDecoder<R> {
         let data = &mut window.data[..];
         let mut pos = *index;
         while pos < until {
+            if self.bit_reader.bit_pos < LBITS && !self.bit_reader.eos {
+                let at_entry = pos;
+                pos = alpha_fast(&mut self.bit_reader, huffman_info, usize::from(width), end, data, base, pos, until)?;
+                if pos >= until || pos != at_entry {
+                    continue;
+                }
+            }
             let (x, y) = (pos % usize::from(width), pos / usize::from(width));
             let tree = &huffman_info.huffman_code_groups[huffman_info.get_huff_index(x as u16, y as u16)];
             self.bit_reader.fill()?;
@@ -734,6 +741,80 @@ fn prefix(val: u64, pos: &mut u32, symbol: u16) -> usize {
     let bits = (val >> *pos) as usize & ((1 << extra) - 1);
     *pos += extra;
     offset + bits + 1
+}
+
+/// [`decode_alpha_8b`](LosslessDecoder::decode_alpha_8b) with the bits in locals, short of the
+/// end of the read-ahead as [`Fast`], where no code reaches the end of the stream. Two literals
+/// are read per fill: the second is only looked up, and taken if it is a literal too.
+#[allow(clippy::too_many_arguments)]
+fn alpha_fast<R: BufRead>(
+    br: &mut BitReader<R>,
+    huffman: &HuffmanInfo,
+    width: usize,
+    end: usize,
+    data: &mut [u8],
+    base: usize,
+    mut index: usize,
+    until: usize,
+) -> Result<usize, DecodingError> {
+    let (mut val, mut pos, mut at) = (br.val, br.bit_pos, br.at);
+    let buf = &br.buf[..];
+    let Some(at_limit) = buf.len().checked_sub(17) else {
+        return Ok(index);
+    };
+    let mut group = &huffman.huffman_code_groups[0];
+    let mut stop = index;
+    let result = loop {
+        if index >= stop || at > at_limit {
+            if index >= until || at > at_limit {
+                break Ok(());
+            }
+            let (x, y) = (index % width, index / width);
+            group = &huffman.huffman_code_groups[huffman.get_huff_index(x as u16, y as u16)];
+            stop = ((x | usize::from(huffman.mask)).min(width - 1) + y * width + 1).min(until);
+        }
+        fill(buf, &mut val, &mut pos, &mut at);
+        let (code, n) = group[GREEN].symbol(val >> pos);
+        pos += n;
+        if code < 256 {
+            data[index - base] = code as u8;
+            index += 1;
+            if index < stop {
+                let (code, n) = group[GREEN].symbol(val >> pos);
+                if code < 256 {
+                    pos += n;
+                    data[index - base] = code as u8;
+                    index += 1;
+                }
+            }
+        } else if code < 256 + 24 {
+            let length = prefix(val, &mut pos, code - 256);
+            let (dist_symbol, n) = group[DIST].symbol(val >> pos);
+            pos += n;
+            fill(buf, &mut val, &mut pos, &mut at);
+            let dist_code = prefix(val, &mut pos, dist_symbol);
+            let dist = LosslessDecoder::<R>::plane_code_to_distance(width as u16, dist_code);
+            if index < dist || end - index < length {
+                break Err(DecodingError::BitStreamError);
+            }
+            let o = index - base;
+            if dist == 1 {
+                let value = data[o - 1];
+                data[o..o + length].fill(value);
+            } else if dist >= length {
+                data.copy_within(o - dist..o - dist + length, o);
+            } else {
+                for i in o..o + length {
+                    data[i] = data[i - dist];
+                }
+            }
+            index += length;
+        } else {
+            break Err(DecodingError::BitStreamError);
+        }
+    };
+    (br.val, br.bit_pos, br.at) = (val, pos, at);
+    result.map(|()| index)
 }
 
 impl Fast {
