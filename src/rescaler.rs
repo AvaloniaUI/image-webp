@@ -658,6 +658,24 @@ mod sse2 {
         let n = dst.len();
         assert!(irow.len() >= n && frow.len() >= n);
         let mut i = 0;
+        if crate::wide::has_avx2() {
+            // SAFETY: the CPU has AVX2.
+            i = unsafe { super::avx2::export_shrink(dst, irow, frow, yscale, fxy_scale) };
+        }
+        export_shrink_from(dst, irow, frow, yscale, fxy_scale, i)
+    }
+
+    /// `export_shrink` with the samples before `i` already written.
+    pub(super) fn export_shrink_from(
+        dst: &mut [u8],
+        irow: &mut [u32],
+        frow: &[u32],
+        yscale: u32,
+        fxy_scale: u32,
+        mut i: usize,
+    ) -> usize {
+        let n = dst.len();
+        assert!(irow.len() >= n && frow.len() >= n);
         // SAFETY: every load and store ends within the first `n` samples of the rows.
         unsafe {
             let (round, floor) = (_mm_set1_epi64x(1 << 31), _mm_setzero_si128());
@@ -686,6 +704,70 @@ mod sse2 {
                 _mm_storeu_si128(dst.as_mut_ptr().add(i).cast(), bytes);
                 i += 16;
             }
+        }
+        i
+    }
+}
+
+/// The SSE2 kernels of `mod sse2` 256 bits wide.
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)]
+mod avx2 {
+    use core::arch::x86_64::*;
+
+    #[inline(always)]
+    unsafe fn mult_fix(v: __m256i, scale: __m256i, round: __m256i) -> __m256i {
+        let even = _mm256_srli_epi64::<32>(_mm256_add_epi64(_mm256_mul_epu32(v, scale), round));
+        let odd = _mm256_add_epi64(_mm256_mul_epu32(_mm256_srli_epi64::<32>(v), scale), round);
+        _mm256_blend_epi32::<0b1010_1010>(even, odd)
+    }
+
+    #[inline(always)]
+    unsafe fn clip(v: __m256i) -> __m256i {
+        _mm256_min_epu32(v, _mm256_set1_epi32(255))
+    }
+
+    /// `sse2::export_shrink` 32 samples at a time; returns how many it wrote.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn export_shrink(
+        dst: &mut [u8],
+        irow: &mut [u32],
+        frow: &[u32],
+        yscale: u32,
+        fxy_scale: u32,
+    ) -> usize {
+        let n = dst.len();
+        assert!(irow.len() >= n && frow.len() >= n);
+        let mut i = 0;
+        let (round, floor) = (_mm256_set1_epi64x(1 << 31), _mm256_setzero_si256());
+        let (ys, fxy) = (
+            _mm256_set1_epi64x(i64::from(yscale)),
+            _mm256_set1_epi64x(i64::from(fxy_scale)),
+        );
+        let order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        while i + 32 <= n {
+            let mut d = [floor; 4];
+            for (g, d) in d.iter_mut().enumerate() {
+                let ip = irow.as_mut_ptr().add(i + 8 * g).cast::<__m256i>();
+                let v = _mm256_loadu_si256(ip);
+                let frac = match yscale {
+                    0 => floor,
+                    _ => mult_fix(
+                        _mm256_loadu_si256(frow.as_ptr().add(i + 8 * g).cast()),
+                        ys,
+                        floor,
+                    ),
+                };
+                _mm256_storeu_si256(ip, frac);
+                *d = clip(mult_fix(_mm256_sub_epi32(v, frac), fxy, round));
+            }
+            let bytes = _mm256_packus_epi16(
+                _mm256_packs_epi32(d[0], d[1]),
+                _mm256_packs_epi32(d[2], d[3]),
+            );
+            let bytes = _mm256_permutevar8x32_epi32(bytes, order);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i).cast(), bytes);
+            i += 32;
         }
         i
     }
@@ -1104,6 +1186,31 @@ mod tests {
                         "{channels} channels, {sw} -> {dw}"
                     );
                 }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[allow(unsafe_code)]
+    #[test]
+    fn avx2_export_matches_sse2() {
+        if !crate::wide::has_avx2() {
+            return;
+        }
+        let mut rng = Rng(11);
+        for n in [0, 1, 31, 32, 33, 64, 95, 200] {
+            for case in 0..64 {
+                let frow: Vec<u32> = (0..n).map(|_| (rng.next() % (1 << 30)) as u32).collect();
+                let irow: Vec<u32> = frow.iter().map(|&f| f + (rng.next() % 4096) as u32).collect();
+                let yscale = if case % 4 == 0 { 0 } else { rng.next() as u32 };
+                let fxy_scale = rng.next() as u32;
+                let (mut a, mut b) = (vec![0u8; n], vec![0u8; n]);
+                let (mut ia, mut ib) = (irow.clone(), irow);
+                // SAFETY: the CPU has AVX2.
+                let done = unsafe { avx2::export_shrink(&mut a, &mut ia, &frow, yscale, fxy_scale) };
+                assert_eq!(done, n / 32 * 32);
+                sse2::export_shrink_from(&mut b, &mut ib, &frow, yscale, fxy_scale, 0);
+                assert_eq!((&a[..done], &ia[..done]), (&b[..done], &ib[..done]), "{n}");
             }
         }
     }
