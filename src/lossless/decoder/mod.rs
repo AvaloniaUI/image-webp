@@ -1151,8 +1151,14 @@ impl<R: BufRead> AlphaBands<R> {
             AlphaBands::Argb { bands, greens, first } => {
                 if y >= *first + greens.len() / w {
                     let (y0, band) = bands.next_band()?.ok_or(DecodingError::BitStreamError)?;
-                    greens.clear();
-                    greens.extend(band.chunks_exact(4).map(|p| p[1]));
+                    greens.resize(band.len() / 4, 0);
+                    #[cfg(target_arch = "x86_64")]
+                    let done = avx2::extract_green(band, greens);
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let done = 0;
+                    for (g, p) in greens[done..].iter_mut().zip(band[done * 4..].as_chunks::<4>().0) {
+                        *g = p[1];
+                    }
                     *first = usize::from(y0);
                 }
                 row.copy_from_slice(&greens[(y - *first) * w..][..w]);

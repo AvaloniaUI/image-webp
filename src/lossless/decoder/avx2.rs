@@ -150,6 +150,33 @@ unsafe fn color_cache_insert8(cache: &mut [u32; 1 << 11], bits: u8, pixels: &[u8
     quads.len() * 8
 }
 
+/// libwebp's `WebPExtractGreen` over the first whole 32s of the RGBA pixels `rgba` into
+/// `green`, where the CPU has AVX2: the number of pixels done.
+pub(crate) fn extract_green(rgba: &[u8], green: &mut [u8]) -> usize {
+    if !crate::wide::has_avx2() {
+        return 0;
+    }
+    // SAFETY: the CPU supports AVX2.
+    unsafe { extract_green32(rgba, green) }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn extract_green32(rgba: &[u8], green: &mut [u8]) -> usize {
+    let n = (rgba.len() / 4).min(green.len());
+    let (src, dst) = (rgba.as_ptr(), green.as_mut_ptr());
+    let mut i = 0;
+    while i + 32 <= n {
+        let p = src.add(4 * i);
+        let g = |k: usize| _mm256_and_si256(_mm256_srli_epi32::<8>(load8(p.add(32 * k))), _mm256_set1_epi32(0xff));
+        let bytes = _mm256_packus_epi16(_mm256_packus_epi32(g(0), g(1)), _mm256_packus_epi32(g(2), g(3)));
+        // The packs interleave the four eights a lane each; dword k of lane l holds eight k's
+        // pixels 4l to 4l + 3.
+        store8(dst.add(i), _mm256_permutevar8x32_epi32(bytes, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7)));
+        i += 32;
+    }
+    i
+}
+
 /// The eight-pixel kernel alone, for the tests.
 #[cfg(test)]
 #[target_feature(enable = "avx2")]
@@ -210,6 +237,19 @@ mod tests {
                 }
                 assert!(want == got, "bits {bits} n {n}");
             }
+        }
+    }
+
+    #[test]
+    fn extract_green_matches_the_scalar_one() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(17);
+        for n in [0, 1, 7, 8, 9, 31, 32, 33, 64, 95, 200] {
+            let rgba = random(&mut rng, n * 4);
+            let mut green = vec![0xa5; n + 3];
+            let done = super::extract_green(&rgba, &mut green);
+            assert_eq!(done, if crate::wide::has_avx2() { n / 32 * 32 } else { 0 });
+            assert!(green[..done].iter().zip(rgba.chunks_exact(4)).all(|(&g, p)| g == p[1]), "n {n}");
+            assert!(green[done..].iter().all(|&b| b == 0xa5));
         }
     }
 
