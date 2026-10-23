@@ -291,6 +291,21 @@ pub(crate) fn quantize_block(input: &mut [i16], out: &mut [i16], mtx: &Matrix) -
     }
 }
 
+/// The position of the last non-zero coefficient of `coeffs`, or -1: four mask bits per
+/// coefficient narrowed into one word.
+#[inline]
+pub(crate) fn last_non_zero(coeffs: &[i16]) -> i32 {
+    let coeffs = &coeffs[..16];
+    unsafe {
+        let lo = vld1q_s16(coeffs.as_ptr());
+        let hi = vld1q_s16(coeffs.as_ptr().add(8));
+        let nz = vcombine_u8(vmovn_u16(vtstq_s16(lo, lo)), vmovn_u16(vtstq_s16(hi, hi)));
+        let narrowed = vshrn_n_u16::<4>(vreinterpretq_u16_u8(nz));
+        let bits = vget_lane_u64::<0>(vreinterpret_u64_u8(narrowed));
+        (63 - bits.leading_zeros() as i32) >> 2
+    }
+}
+
 const LOOKUP1: [u8; 64] = [
     0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 12, 12, //
     3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0, //

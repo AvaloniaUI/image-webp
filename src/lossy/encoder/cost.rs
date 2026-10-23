@@ -210,7 +210,9 @@ impl<'a> Residual<'a> {
     pub(crate) fn new(first: usize, coeff_type: usize, coeffs: &'a [i16]) -> Self {
         #[cfg(target_arch = "x86_64")]
         let last = super::sse2::last_non_zero(coeffs);
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        let last = super::neon::last_non_zero(coeffs);
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let last = coeffs[..16]
             .iter()
             .rposition(|&c| c != 0)
