@@ -100,7 +100,7 @@ fn coeffs(
     ctx: usize,
     first: usize,
     dq: [i32; 2],
-    out: &mut [i32; 16],
+    out: &mut [i16; 16],
 ) -> usize {
     let mut n = first;
     let mut p = &probs[n][ctx];
@@ -125,7 +125,7 @@ fn coeffs(
             v
         };
         let v = if b.sign() { -v } else { v };
-        out[usize::from(ZIGZAG[n]) & 15] = i32::from((v * dq[usize::from(n > 0)]) as i16);
+        out[usize::from(ZIGZAG[n]) & 15] = (v * dq[usize::from(n > 0)]) as i16;
         n += 1;
     }
     16
@@ -553,7 +553,7 @@ impl ArithmeticDecoder {
         ctx: usize,
         first: usize,
         dq: [i32; 2],
-        out: &mut [i32; 16],
+        out: &mut [i16; 16],
     ) -> Result<usize, DecodingError> {
         let dc = out[0];
         let mut fast = self.fast();
@@ -574,7 +574,7 @@ impl ArithmeticDecoder {
         ctx: usize,
         first: usize,
         dq: [i32; 2],
-        out: &mut [i32; 16],
+        out: &mut [i16; 16],
     ) -> Result<usize, DecodingError> {
         let mut res = self.start_accumulated_result();
         let n = coeffs(

@@ -661,14 +661,11 @@ unsafe fn transform_rows(rows: [__m128i; 4]) -> [__m128i; 4] {
 
 /// libwebp's `Transform_SSE2` for one block: the inverse transform of `block` (16
 /// coefficients that fit 16 bits) added to the 4x4 pixels at `pos` of `dst`.
-pub(crate) fn transform_add(block: &[i32], dst: &mut [u8], pos: usize, stride: usize) {
+pub(crate) fn transform_add(block: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
     let block = &block[..16];
     check(dst.len(), pos, 0, 3 * stride + 4);
     unsafe {
-        let row = |r: usize| {
-            let v = _mm_loadu_si128(block.as_ptr().add(4 * r).cast());
-            _mm_packs_epi32(v, v)
-        };
+        let row = |r: usize| _mm_loadl_epi64(block.as_ptr().add(4 * r).cast());
         let t = transform_rows([row(0), row(1), row(2), row(3)]);
         let zero = _mm_setzero_si128();
         let mut p = dst.as_mut_ptr().add(pos);
@@ -684,14 +681,14 @@ pub(crate) fn transform_add(block: &[i32], dst: &mut [u8], pos: usize, stride: u
 
 /// libwebp's `Transform_SSE2` for two blocks side by side (`do_two`): the inverse transforms of
 /// `blocks` (32 coefficients that fit 16 bits) added to the 8x4 pixels at `pos` of `dst`.
-pub(crate) fn transform_add_two(blocks: &[i32], dst: &mut [u8], pos: usize, stride: usize) {
+pub(crate) fn transform_add_two(blocks: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
     let blocks = &blocks[..32];
     check(dst.len(), pos, 0, 3 * stride + 8);
     unsafe {
         let row = |r: usize| {
-            let a = _mm_loadu_si128(blocks.as_ptr().add(4 * r).cast());
-            let b = _mm_loadu_si128(blocks.as_ptr().add(16 + 4 * r).cast());
-            _mm_packs_epi32(a, b)
+            let a = _mm_loadl_epi64(blocks.as_ptr().add(4 * r).cast());
+            let b = _mm_loadl_epi64(blocks.as_ptr().add(16 + 4 * r).cast());
+            _mm_unpacklo_epi64(a, b)
         };
         let t = transform_rows([row(0), row(1), row(2), row(3)]);
         let zero = _mm_setzero_si128();

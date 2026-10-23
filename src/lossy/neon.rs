@@ -629,11 +629,11 @@ unsafe fn add_row(p: *mut u8, t: int16x4_t) {
 
 /// libwebp's `TransformOne_NEON`: the inverse transform of `block` (16 coefficients that fit 16
 /// bits) in saturating 16 bits, added to the 4x4 pixels at `pos` of `dst`.
-pub(crate) fn transform_add(block: &[i32], dst: &mut [u8], pos: usize, stride: usize) {
+pub(crate) fn transform_add(block: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
     let block = &block[..16];
     check(dst.len(), pos, 0, 3 * stride + 4);
     unsafe {
-        let row = |r: usize| vqmovn_s32(vld1q_s32(block.as_ptr().add(4 * r)));
+        let row = |r: usize| vld1_s16(block.as_ptr().add(4 * r));
         let t = transpose4x4(transform_pass([row(0), row(1), row(2), row(3)]));
         let t = transpose4x4(transform_pass(t));
         let p = dst.as_mut_ptr().add(pos);
@@ -645,15 +645,15 @@ pub(crate) fn transform_add(block: &[i32], dst: &mut [u8], pos: usize, stride: u
 
 /// libwebp's `TransformAC3_NEON`: the inverse transform of `block`, whose only coefficients are
 /// 0, 1 and 4, in saturating 16 bits, added to the 4x4 pixels at `pos` of `dst`.
-pub(crate) fn transform_ac3_add(block: &[i32], dst: &mut [u8], pos: usize, stride: usize) {
+pub(crate) fn transform_ac3_add(block: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
     let block = &block[..16];
     check(dst.len(), pos, 0, 3 * stride + 4);
-    let mul1 = |a: i32| (((a * 20091) >> 16) + a) as i16;
-    let mul2 = |a: i32| ((a * 35468) >> 16) as i16;
+    let mul1 = |a: i16| (((i32::from(a) * 20091) >> 16) + i32::from(a)) as i16;
+    let mul2 = |a: i16| ((i32::from(a) * 35468) >> 16) as i16;
     let (c1, d1) = (mul2(block[1]), mul1(block[1]));
     let cd = [d1, c1, c1.wrapping_neg(), d1.wrapping_neg()];
     unsafe {
-        let b = vqadd_s16(vdup_n_s16(block[0] as i16), vld1_s16(cd.as_ptr()));
+        let b = vqadd_s16(vdup_n_s16(block[0]), vld1_s16(cd.as_ptr()));
         let (c4, d4) = (vdup_n_s16(mul2(block[4])), vdup_n_s16(mul1(block[4])));
         let rows = [
             vqadd_s16(b, d4),

@@ -85,7 +85,7 @@ fn avg2(this: u8, right: u8) -> u8 {
 pub(crate) fn predict_4x4(
     ws: &mut [u8; LUMA_BLOCK_SIZE],
     modes: &[IntraMode; 16],
-    resdata: &[i32; 384],
+    resdata: &[i16; 384],
     kinds: &[u8; 24],
 ) {
     let stride = LUMA_STRIDE;

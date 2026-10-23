@@ -520,7 +520,7 @@ impl<'a> Vp8Decoder<'a> {
         mbx: usize,
         mby: usize,
         mb: &MacroBlock,
-        resdata: &[i32; 384],
+        resdata: &[i16; 384],
         kinds: &[u8; 24],
     ) {
         let stride = 1usize + 16 + 4;
@@ -561,7 +561,7 @@ impl<'a> Vp8Decoder<'a> {
         mbx: usize,
         mby: usize,
         mb: &MacroBlock,
-        resdata: &[i32],
+        resdata: &[i16; 384],
         kinds: &[u8; 24],
     ) {
         let stride = 1usize + 8;
@@ -611,27 +611,6 @@ impl<'a> Vp8Decoder<'a> {
         }
     }
 
-    fn read_coefficients(
-        &mut self,
-        block: &mut [i32; 16],
-        p: usize,
-        plane: Plane,
-        complexity: usize,
-        dcq: i16,
-        acq: i16,
-    ) -> Result<usize, DecodingError> {
-        assert!(complexity <= 2);
-        let first = usize::from(plane == Plane::YCoeff1);
-        let probs = &self.pos_probs[plane as usize];
-        self.partitions[p].read_coeffs(
-            probs,
-            complexity,
-            first,
-            [i32::from(dcq), i32::from(acq)],
-            block,
-        )
-    }
-
     /// Reads the coefficients of a macroblock into `blocks` (zero on entry) and the kind of
     /// inverse transform each block needs into `kinds`.
     fn read_residual_data(
@@ -639,10 +618,14 @@ impl<'a> Vp8Decoder<'a> {
         mb: &mut MacroBlock,
         mbx: usize,
         p: usize,
-        blocks: &mut [i32; 384],
+        blocks: &mut [i16; 384],
         kinds: &mut [u8; 24],
     ) -> Result<(), DecodingError> {
-        let sindex = mb.segmentid as usize;
+        let seg = &self.segment[mb.segmentid as usize];
+        let probs = &self.pos_probs;
+        let d = &mut self.partitions[p];
+        let mut top = self.top[mbx].complexity;
+        let mut lefts = self.left.complexity;
         let mut plane = if mb.luma_mode == LumaMode::B {
             Plane::YCoeff0
         } else {
@@ -650,71 +633,67 @@ impl<'a> Vp8Decoder<'a> {
         };
 
         if plane == Plane::Y2 {
-            let complexity = self.top[mbx].complexity[0] + self.left.complexity[0];
-            let mut block = [0i32; 16];
-            let dcq = self.segment[sindex].y2dc;
-            let acq = self.segment[sindex].y2ac;
-            let n = self.read_coefficients(&mut block, p, plane, complexity as usize, dcq, acq)?;
+            let complexity = usize::from(top[0] + lefts[0]);
+            let mut block = [0i16; 16];
+            let dq = [i32::from(seg.y2dc), i32::from(seg.y2ac)];
+            let n = d.read_coeffs(&probs[plane as usize], complexity, 0, dq, &mut block)?;
 
-            self.left.complexity[0] = u8::from(n > 0);
-            self.top[mbx].complexity[0] = u8::from(n > 0);
+            lefts[0] = u8::from(n > 0);
+            top[0] = u8::from(n > 0);
 
+            let mut block = block.map(i32::from);
             transform::iwht4x4(&mut block);
 
             for k in 0usize..16 {
-                blocks[16 * k] = i32::from(block[k] as i16);
+                blocks[16 * k] = block[k] as i16;
             }
 
             plane = Plane::YCoeff1;
         }
         let first = usize::from(plane == Plane::YCoeff1);
+        let dq = [i32::from(seg.ydc), i32::from(seg.yac)];
 
         for y in 0usize..4 {
-            let mut left = self.left.complexity[y + 1];
+            let mut left = lefts[y + 1];
             for x in 0usize..4 {
                 let i = x + y * 4;
-                let block: &mut [i32; 16] = (&mut blocks[i * 16..][..16]).try_into().unwrap();
+                let block: &mut [i16; 16] = (&mut blocks[i * 16..][..16]).try_into().unwrap();
 
-                let complexity = self.top[mbx].complexity[x + 1] + left;
-                let dcq = self.segment[sindex].ydc;
-                let acq = self.segment[sindex].yac;
-
-                let n = self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
+                let complexity = usize::from(top[x + 1] + left);
+                let n = d.read_coeffs(&probs[plane as usize], complexity, first, dq, block)?;
                 kinds[i] = transform::luma_kind(n, block);
 
                 left = u8::from(n > first);
-                self.top[mbx].complexity[x + 1] = left;
+                top[x + 1] = left;
             }
 
-            self.left.complexity[y + 1] = left;
+            lefts[y + 1] = left;
         }
 
-        plane = Plane::Chroma;
-
+        let dq = [i32::from(seg.uvdc), i32::from(seg.uvac)];
+        let probs = &probs[Plane::Chroma as usize];
         for &j in &[5usize, 7usize] {
             for y in 0usize..2 {
-                let mut left = self.left.complexity[y + j];
+                let mut left = lefts[y + j];
 
                 for x in 0usize..2 {
                     let i = x + y * 2 + if j == 5 { 16 } else { 20 };
-                    let block: &mut [i32; 16] = (&mut blocks[i * 16..][..16]).try_into().unwrap();
+                    let block: &mut [i16; 16] = (&mut blocks[i * 16..][..16]).try_into().unwrap();
 
-                    let complexity = self.top[mbx].complexity[x + j] + left;
-                    let dcq = self.segment[sindex].uvdc;
-                    let acq = self.segment[sindex].uvac;
-
-                    let n =
-                        self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
+                    let complexity = usize::from(top[x + j] + left);
+                    let n = d.read_coeffs(probs, complexity, 0, dq, block)?;
                     kinds[i] = transform::kind(n, block[0]);
 
                     left = u8::from(n > 0);
-                    self.top[mbx].complexity[x + j] = left;
+                    top[x + j] = left;
                 }
 
-                self.left.complexity[y + j] = left;
+                lefts[y + j] = left;
             }
         }
 
+        self.top[mbx].complexity = top;
+        self.left.complexity = lefts;
         mb.non_zero_dct = kinds.iter().any(|&k| k != transform::NO_COEFFS);
         Ok(())
     }
@@ -836,7 +815,7 @@ impl<'a> Vp8Decoder<'a> {
         let p = mby % self.num_partitions as usize;
         self.left = PreviousMacroBlock::default();
         row.clear();
-        let mut blocks = [0i32; 384];
+        let mut blocks = [0i16; 384];
         for mbx in 0..self.mbwidth as usize {
             let mut mb = self.read_macroblock_header(mbx)?;
             let mut kinds = [transform::NO_COEFFS; 24];
@@ -844,15 +823,13 @@ impl<'a> Vp8Decoder<'a> {
                 self.partitions[p].top_up(&mut *self.source)?;
                 self.read_residual_data(&mut mb, mbx, p, &mut blocks, &mut kinds)?;
             } else {
+                let top = &mut self.top[mbx].complexity;
                 if mb.luma_mode != LumaMode::B {
                     self.left.complexity[0] = 0;
-                    self.top[mbx].complexity[0] = 0;
+                    top[0] = 0;
                 }
-
-                for i in 1usize..9 {
-                    self.left.complexity[i] = 0;
-                    self.top[mbx].complexity[i] = 0;
-                }
+                self.left.complexity[1..].fill(0);
+                top[1..].fill(0);
             }
 
             self.intra_predict_luma(mbx, mby, &mb, &blocks, &kinds);
