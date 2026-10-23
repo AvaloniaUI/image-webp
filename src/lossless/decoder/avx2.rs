@@ -81,6 +81,42 @@ pub(crate) unsafe fn add_green(p: *mut u8, n: usize) -> usize {
     i
 }
 
+/// Drops the alpha of the first whole eights of the pixels of `rgba` into `rgb`, where the CPU
+/// has AVX2: the number of pixels done.
+pub(crate) fn rgb_from_rgba(rgba: &[u8], rgb: &mut [u8]) -> usize {
+    if !crate::wide::has_avx2() {
+        return 0;
+    }
+    // SAFETY: the CPU supports AVX2.
+    unsafe { rgb_from_rgba8(rgba, rgb) }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn rgb_from_rgba8(rgba: &[u8], rgb: &mut [u8]) -> usize {
+    let n = (rgba.len() / 4).min(rgb.len() / 3);
+    let (src, dst) = (rgba.as_ptr(), rgb.as_mut_ptr());
+    #[rustfmt::skip]
+    let pack = _mm256_setr_epi8(
+        0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1,
+        0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1,
+    );
+    let lanes = _mm256_setr_epi32(0, 1, 2, 4, 5, 6, 7, 7);
+    let mut i = 0;
+    while i + 8 <= n {
+        let v = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(load8(src.add(4 * i)), pack), lanes);
+        let d = dst.add(3 * i);
+        // The 24 bytes, as 32 where the next eight overwrite the last 8.
+        if 3 * i + 32 <= 3 * n {
+            store8(d, v);
+        } else {
+            _mm_storeu_si128(d.cast(), _mm256_castsi256_si128(v));
+            _mm_storel_epi64(d.add(16).cast(), _mm256_extracti128_si256::<1>(v));
+        }
+        i += 8;
+    }
+    i
+}
+
 /// The eight-pixel kernel alone, for the tests.
 #[cfg(test)]
 #[target_feature(enable = "avx2")]
@@ -102,6 +138,22 @@ mod tests {
             data.iter_mut().for_each(|b| *b = (*b % 4).wrapping_sub(2));
         }
         data
+    }
+
+    #[test]
+    fn rgb_from_rgba_drops_the_alpha() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(15);
+        for n in [0, 1, 7, 8, 9, 15, 16, 17, 31, 64, 67] {
+            let rgba = random(&mut rng, n * 4);
+            for slack in [0, 1, 8, 9] {
+                let mut rgb = vec![0xa5; n * 3 + slack];
+                let done = super::rgb_from_rgba(&rgba, &mut rgb);
+                assert_eq!(done, if crate::wide::has_avx2() { n / 8 * 8 } else { 0 });
+                let want: Vec<u8> = rgba.chunks_exact(4).take(done).flat_map(|p| p[..3].to_vec()).collect();
+                assert_eq!(rgb[..done * 3], want[..], "n {n} slack {slack}");
+                assert!(rgb[n * 3..].iter().all(|&b| b == 0xa5), "n {n} slack {slack}");
+            }
+        }
     }
 
     #[test]

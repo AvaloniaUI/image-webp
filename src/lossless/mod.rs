@@ -2,6 +2,8 @@ mod decoder;
 pub(crate) mod encoder;
 
 pub(crate) use decoder::{AlphaBands, LosslessBands, LosslessDecoder};
+#[cfg(target_arch = "x86_64")]
+pub(crate) use decoder::rgb_from_rgba;
 
 /// Allows fine-tuning some encoder parameters.
 ///

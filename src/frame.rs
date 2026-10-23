@@ -267,6 +267,11 @@ impl<'a> FrameDecoder<'a> {
 
 /// Drops the alpha of the RGBA pixels `rgba` into `rgb`, four pixels a step as three words.
 fn rgb_from_rgba(rgba: &[u8], rgb: &mut [u8]) {
+    #[cfg(target_arch = "x86_64")]
+    let (rgba, rgb) = {
+        let done = crate::lossless::rgb_from_rgba(rgba, rgb);
+        (&rgba[done * 4..], &mut rgb[done * 3..])
+    };
     let (quads, rest) = rgba.as_chunks::<16>();
     let (triples, tail) = rgb.as_chunks_mut::<12>();
     for (q, t) in quads.iter().zip(triples) {
