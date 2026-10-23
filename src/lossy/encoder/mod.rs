@@ -1186,14 +1186,28 @@ impl<'a> Encoder<'a> {
         nz
     }
 
-    /// Reconstructs 4x4 block `i4` with `mode` into `dst` (an offset in `yuv_out` /
-    /// `yuv_out2` / `i4_tmp` as chosen by `target`).
+    /// Reconstructs 4x4 block `i4` with `mode` into `yuv_out` or `yuv_out2`.
     fn reconstruct_intra4(
         &mut self,
         levels: &mut [i16; 16],
         mode: usize,
         target: I4Target,
     ) -> bool {
+        let (coeffs, nz) = self.quantize_intra4(levels, mode);
+        let src_off = Y_OFF + SCAN[self.it.i4];
+        let it = &mut self.it;
+        let r = &it.yuv_p[I4_MODE_OFFSETS[mode]..];
+        let dst = match target {
+            I4Target::Out => &mut it.yuv_out[src_off..],
+            I4Target::Out2 => &mut it.yuv_out2[src_off..],
+        };
+        itransform(r, &coeffs, dst, false);
+        nz
+    }
+
+    /// The levels of 4x4 block `i4` predicted with `mode`, returning the dequantized
+    /// coefficients and whether a level is non-zero.
+    fn quantize_intra4(&self, levels: &mut [i16; 16], mode: usize) -> ([i16; 16], bool) {
         let dqm = &self.dqm[self.mb().segment as usize];
         let src_off = Y_OFF + SCAN[self.it.i4];
         let mut tmp = [0i16; 16];
@@ -1218,15 +1232,7 @@ impl<'a> Encoder<'a> {
         } else {
             quantize_block(&mut tmp, levels, &dqm.y1)
         };
-        let it = &mut self.it;
-        let r = &it.yuv_p[I4_MODE_OFFSETS[mode]..];
-        let dst = match target {
-            I4Target::Out => &mut it.yuv_out[src_off..],
-            I4Target::Out2 => &mut it.yuv_out2[src_off..],
-            I4Target::Tmp => &mut it.i4_tmp[..],
-        };
-        itransform(r, &tmp, dst, false);
-        nz
+        (tmp, nz)
     }
 
     fn quantize_single(v: &mut i16, mtx: &Matrix) -> i32 {
@@ -1528,27 +1534,24 @@ impl<'a> Encoder<'a> {
             self.make_intra4_preds();
             for mode in 0..NUM_BMODES {
                 let mut tmp_levels = [0i16; 16];
-                let target = if best_in_tmp {
-                    I4Target::Out2
+                let (coeffs, nz) = self.quantize_intra4(&mut tmp_levels, mode);
+                let it = &mut self.it;
+                let dst = if best_in_tmp {
+                    &mut it.yuv_out2[src_off..]
                 } else {
-                    I4Target::Tmp
+                    &mut it.i4_tmp[..]
                 };
-                let nz = self.reconstruct_intra4(&mut tmp_levels, mode, target);
+                let (d, disto) = itransform_disto(
+                    &it.yuv_p[I4_MODE_OFFSETS[mode]..],
+                    &coeffs,
+                    dst,
+                    &it.yuv_in[src_off..],
+                    (tlambda != 0).then_some(&WEIGHT_Y),
+                );
                 let mut tmp = Score::INIT;
                 tmp.nz = u32::from(nz) << i4;
-                {
-                    let src = &self.it.yuv_in[src_off..];
-                    let dst: &[u8] = match target {
-                        I4Target::Tmp => &self.it.i4_tmp[..],
-                        _ => &self.it.yuv_out2[src_off..],
-                    };
-                    tmp.d = i64::from(sse4x4(src, dst));
-                    tmp.sd = if tlambda != 0 {
-                        i64::from(mult_8b(tlambda, tdisto4x4(src, dst, &WEIGHT_Y)))
-                    } else {
-                        0
-                    };
-                }
+                tmp.d = i64::from(d);
+                tmp.sd = i64::from(mult_8b(tlambda, disto));
                 tmp.h = i64::from(mode_costs[mode]);
                 tmp.r = if mode > 0 && is_flat_fn(&tmp_levels, 1, FLATNESS_LIMIT_I4) {
                     FLATNESS_PENALTY
@@ -2198,7 +2201,6 @@ fn walk_residuals(
 enum I4Target {
     Out,
     Out2,
-    Tmp,
 }
 
 fn get_alpha((max_value, last_non_zero): (i32, i32)) -> i32 {

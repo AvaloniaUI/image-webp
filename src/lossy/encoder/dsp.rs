@@ -188,6 +188,28 @@ pub(crate) fn itransform(r: &[u8], input: &[i16], dst: &mut [u8], two: bool) {
     }
 }
 
+/// `itransform` of one block into `dst`, returning `sse4x4(src, dst)` and, with `w`,
+/// `tdisto4x4(src, dst, w)` (else 0).
+#[inline]
+pub(crate) fn itransform_disto(
+    r: &[u8],
+    input: &[i16],
+    dst: &mut [u8],
+    src: &[u8],
+    w: Option<&[u16; 16]>,
+) -> (i32, i32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (sse, t) = super::sse2::itransform_one_disto(r, input, dst, src, w);
+        (sse, t.abs() >> 5)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        itransform(r, input, dst, false);
+        (sse4x4(src, dst), w.map_or(0, |w| tdisto4x4(src, dst, w)))
+    }
+}
+
 #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn itransform_portable(r: &[u8], input: &[i16], dst: &mut [u8], two: bool) {
     itransform_one(r, &input[..16], dst);
@@ -1099,6 +1121,13 @@ mod reference {
             assert_eq!(d1, d2);
             super::itransform_portable(&b, &in1, &mut d1, false);
             assert_eq!(d1, d2);
+            let mut d3 = [0u8; 4 * BPS];
+            for w in [None, Some(&w)] {
+                let disto = super::itransform_disto(&b, &in1, &mut d3, &a, w);
+                assert_eq!(d3, d2);
+                let t = w.map_or(0, |w| super::tdisto4x4(&a, &d2, w));
+                assert_eq!(disto, (super::sse4x4(&a, &d2), t));
+            }
             let two: Vec<i16> = in1.iter().chain(in2.iter()).copied().collect();
             let (mut e1, mut e2) = ([0u8; 4 * BPS], [0u8; 4 * BPS]);
             super::itransform(&b, &two, &mut e1, true);

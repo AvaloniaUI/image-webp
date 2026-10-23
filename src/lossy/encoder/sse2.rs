@@ -45,62 +45,108 @@ unsafe fn transpose_2_4x4(i0: __m128i, i1: __m128i, i2: __m128i, i3: __m128i) ->
 /// One inverse transform of `input` (16 coefficients) added to the 4x4 block `r`.
 #[inline]
 pub(crate) fn itransform_one(r: &[u8], input: &[i16], dst: &mut [u8]) {
+    unsafe {
+        itransform_one_rows(r, input, dst);
+    }
+}
+
+/// `itransform_one`, then the squared error of the result against the 4x4 block `src` and,
+/// with `w`, `ttransform(src, result, w)`.
+#[inline]
+pub(crate) fn itransform_one_disto(
+    r: &[u8],
+    input: &[i16],
+    dst: &mut [u8],
+    src: &[u8],
+    w: Option<&[u16; 16]>,
+) -> (i32, i32) {
+    let src = &src[..3 * BPS + 4];
+    unsafe {
+        let out = itransform_one_rows(r, input, dst);
+        let zero = _mm_setzero_si128();
+        let ld32 = |off: usize| {
+            _mm_cvtsi32_si128(i32::from_le_bytes(src[off..off + 4].try_into().unwrap()))
+        };
+        let s01 = _mm_unpacklo_epi8(_mm_unpacklo_epi32(ld32(0), ld32(BPS)), zero);
+        let s23 = _mm_unpacklo_epi8(_mm_unpacklo_epi32(ld32(2 * BPS), ld32(3 * BPS)), zero);
+        let o01 = _mm_unpacklo_epi8(out, zero);
+        let o23 = _mm_unpackhi_epi8(out, zero);
+        let d01 = _mm_sub_epi16(s01, o01);
+        let d23 = _mm_sub_epi16(s23, o23);
+        let sse = hsum(_mm_add_epi32(_mm_madd_epi16(d01, d01), _mm_madd_epi16(d23, d23)));
+        let disto = w.map_or(0, |w| {
+            ttransform_rows(
+                [
+                    _mm_unpacklo_epi64(s01, o01),
+                    _mm_unpackhi_epi64(s01, o01),
+                    _mm_unpacklo_epi64(s23, o23),
+                    _mm_unpackhi_epi64(s23, o23),
+                ],
+                w,
+            )
+        });
+        (sse, disto)
+    }
+}
+
+/// The inverse transform into `dst`, returning its four rows packed.
+#[inline(always)]
+unsafe fn itransform_one_rows(r: &[u8], input: &[i16], dst: &mut [u8]) -> __m128i {
     let input = &input[..16];
     let r = &r[..3 * BPS + 4];
     let dst = &mut dst[..3 * BPS + 4];
-    unsafe {
-        let k1k2 = _mm_set_epi16(-30068, -30068, -30068, -30068, 20091, 20091, 20091, 20091);
-        let k2k1 = _mm_set_epi16(20091, 20091, 20091, 20091, -30068, -30068, -30068, -30068);
-        let zero = _mm_setzero_si128();
-        let zero_four = _mm_set_epi16(0, 0, 0, 0, 4, 4, 4, 4);
-        let in01 = load_i16x8(input, 0);
-        let in23 = load_i16x8(input, 8);
+    let k1k2 = _mm_set_epi16(-30068, -30068, -30068, -30068, 20091, 20091, 20091, 20091);
+    let k2k1 = _mm_set_epi16(20091, 20091, 20091, 20091, -30068, -30068, -30068, -30068);
+    let zero = _mm_setzero_si128();
+    let zero_four = _mm_set_epi16(0, 0, 0, 0, 4, 4, 4, 4);
+    let in01 = load_i16x8(input, 0);
+    let in23 = load_i16x8(input, 8);
 
-        let pass = |x01: __m128i, x23: __m128i, round: __m128i, shift: bool| {
-            let x1 = _mm_unpackhi_epi64(x01, x01);
-            let x3 = _mm_unpackhi_epi64(x23, x23);
-            let x01 = _mm_add_epi16(x01, round);
-            let a_d3 = _mm_add_epi16(x01, x23);
-            let b_c3 = _mm_sub_epi16(x01, x23);
-            let c1d1 = _mm_mulhi_epi16(x1, k2k1);
-            let c2d2 = _mm_mulhi_epi16(x3, k1k2);
-            let c3 = _mm_unpackhi_epi64(b_c3, b_c3);
-            let c4 = _mm_sub_epi16(c1d1, c2d2);
-            let c = _mm_add_epi16(c3, c4);
-            let d4u = _mm_add_epi16(c1d1, c2d2);
-            let du = _mm_add_epi16(a_d3, d4u);
-            let d = _mm_unpackhi_epi64(du, du);
-            let comb_ab = _mm_unpacklo_epi64(a_d3, b_c3);
-            let comb_dc = _mm_unpacklo_epi64(d, c);
-            let mut tmp01 = _mm_add_epi16(comb_ab, comb_dc);
-            let tmp32 = _mm_sub_epi16(comb_ab, comb_dc);
-            let mut tmp23 = _mm_shuffle_epi32::<0b01_00_11_10>(tmp32);
-            if shift {
-                tmp01 = _mm_srai_epi16::<3>(tmp01);
-                tmp23 = _mm_srai_epi16::<3>(tmp23);
-            }
-            let t0 = _mm_unpacklo_epi16(tmp01, tmp23);
-            let t1 = _mm_unpackhi_epi16(tmp01, tmp23);
-            (_mm_unpacklo_epi16(t0, t1), _mm_unpackhi_epi16(t0, t1))
-        };
-        let (t01, t23) = pass(in01, in23, zero, false);
-        let (t01, t23) = pass(t01, t23, zero_four, true);
-
-        let ld32 =
-            |off: usize| _mm_cvtsi32_si128(i32::from_le_bytes(r[off..off + 4].try_into().unwrap()));
-        let ref01 = _mm_unpacklo_epi8(_mm_unpacklo_epi32(ld32(0), ld32(BPS)), zero);
-        let ref23 = _mm_unpacklo_epi8(_mm_unpacklo_epi32(ld32(2 * BPS), ld32(3 * BPS)), zero);
-        let out = _mm_packus_epi16(_mm_add_epi16(ref01, t01), _mm_add_epi16(ref23, t23));
-        let rows = [
-            out,
-            _mm_srli_si128::<4>(out),
-            _mm_srli_si128::<8>(out),
-            _mm_srli_si128::<12>(out),
-        ];
-        for (y, row) in rows.into_iter().enumerate() {
-            dst[y * BPS..y * BPS + 4].copy_from_slice(&_mm_cvtsi128_si32(row).to_le_bytes());
+    let pass = |x01: __m128i, x23: __m128i, round: __m128i, shift: bool| {
+        let x1 = _mm_unpackhi_epi64(x01, x01);
+        let x3 = _mm_unpackhi_epi64(x23, x23);
+        let x01 = _mm_add_epi16(x01, round);
+        let a_d3 = _mm_add_epi16(x01, x23);
+        let b_c3 = _mm_sub_epi16(x01, x23);
+        let c1d1 = _mm_mulhi_epi16(x1, k2k1);
+        let c2d2 = _mm_mulhi_epi16(x3, k1k2);
+        let c3 = _mm_unpackhi_epi64(b_c3, b_c3);
+        let c4 = _mm_sub_epi16(c1d1, c2d2);
+        let c = _mm_add_epi16(c3, c4);
+        let d4u = _mm_add_epi16(c1d1, c2d2);
+        let du = _mm_add_epi16(a_d3, d4u);
+        let d = _mm_unpackhi_epi64(du, du);
+        let comb_ab = _mm_unpacklo_epi64(a_d3, b_c3);
+        let comb_dc = _mm_unpacklo_epi64(d, c);
+        let mut tmp01 = _mm_add_epi16(comb_ab, comb_dc);
+        let tmp32 = _mm_sub_epi16(comb_ab, comb_dc);
+        let mut tmp23 = _mm_shuffle_epi32::<0b01_00_11_10>(tmp32);
+        if shift {
+            tmp01 = _mm_srai_epi16::<3>(tmp01);
+            tmp23 = _mm_srai_epi16::<3>(tmp23);
         }
+        let t0 = _mm_unpacklo_epi16(tmp01, tmp23);
+        let t1 = _mm_unpackhi_epi16(tmp01, tmp23);
+        (_mm_unpacklo_epi16(t0, t1), _mm_unpackhi_epi16(t0, t1))
+    };
+    let (t01, t23) = pass(in01, in23, zero, false);
+    let (t01, t23) = pass(t01, t23, zero_four, true);
+
+    let ld32 =
+        |off: usize| _mm_cvtsi32_si128(i32::from_le_bytes(r[off..off + 4].try_into().unwrap()));
+    let ref01 = _mm_unpacklo_epi8(_mm_unpacklo_epi32(ld32(0), ld32(BPS)), zero);
+    let ref23 = _mm_unpacklo_epi8(_mm_unpacklo_epi32(ld32(2 * BPS), ld32(3 * BPS)), zero);
+    let out = _mm_packus_epi16(_mm_add_epi16(ref01, t01), _mm_add_epi16(ref23, t23));
+    let rows = [
+        out,
+        _mm_srli_si128::<4>(out),
+        _mm_srli_si128::<8>(out),
+        _mm_srli_si128::<12>(out),
+    ];
+    for (y, row) in rows.into_iter().enumerate() {
+        dst[y * BPS..y * BPS + 4].copy_from_slice(&_mm_cvtsi128_si32(row).to_le_bytes());
     }
+    out
 }
 
 /// Two inverse transforms of `input` (32 coefficients) for side-by-side 4x4 blocks.
@@ -324,33 +370,39 @@ pub(crate) fn ttransform(a: &[u8], b: &[u8], w: &[u16; 16]) -> i32 {
                 zero,
             )
         };
-        let (t0, t1, t2, t3) = (ld(0), ld(1), ld(2), ld(3));
-        let butterfly = |t0: __m128i, t1: __m128i, t2: __m128i, t3: __m128i| {
-            let a0 = _mm_add_epi16(t0, t2);
-            let a1 = _mm_add_epi16(t1, t3);
-            let a2 = _mm_sub_epi16(t1, t3);
-            let a3 = _mm_sub_epi16(t0, t2);
-            [
-                _mm_add_epi16(a0, a1),
-                _mm_add_epi16(a3, a2),
-                _mm_sub_epi16(a3, a2),
-                _mm_sub_epi16(a0, a1),
-            ]
-        };
-        let b4 = butterfly(t0, t1, t2, t3);
-        let t = transpose_2_4x4(b4[0], b4[1], b4[2], b4[3]);
-        let b4 = butterfly(t[0], t[1], t[2], t[3]);
-        let w_0 = _mm_loadu_si128(w.as_ptr().cast());
-        let w_8 = _mm_loadu_si128(w.as_ptr().add(8).cast());
-        let abs = |v: __m128i| _mm_max_epi16(v, _mm_sub_epi16(zero, v));
-        let a_b0 = abs(_mm_unpacklo_epi64(b4[0], b4[1]));
-        let a_b2 = abs(_mm_unpacklo_epi64(b4[2], b4[3]));
-        let b_b0 = abs(_mm_unpackhi_epi64(b4[0], b4[1]));
-        let b_b2 = abs(_mm_unpackhi_epi64(b4[2], b4[3]));
-        let sa = _mm_add_epi32(_mm_madd_epi16(a_b0, w_0), _mm_madd_epi16(a_b2, w_8));
-        let sb = _mm_add_epi32(_mm_madd_epi16(b_b0, w_0), _mm_madd_epi16(b_b2, w_8));
-        hsum(_mm_sub_epi32(sa, sb))
+        ttransform_rows([ld(0), ld(1), ld(2), ld(3)], w)
     }
+}
+
+/// `ttransform` of rows holding the 16-bit pixels of row `y` of `a` then of `b`.
+#[inline(always)]
+unsafe fn ttransform_rows([t0, t1, t2, t3]: [__m128i; 4], w: &[u16; 16]) -> i32 {
+    let zero = _mm_setzero_si128();
+    let butterfly = |t0: __m128i, t1: __m128i, t2: __m128i, t3: __m128i| {
+        let a0 = _mm_add_epi16(t0, t2);
+        let a1 = _mm_add_epi16(t1, t3);
+        let a2 = _mm_sub_epi16(t1, t3);
+        let a3 = _mm_sub_epi16(t0, t2);
+        [
+            _mm_add_epi16(a0, a1),
+            _mm_add_epi16(a3, a2),
+            _mm_sub_epi16(a3, a2),
+            _mm_sub_epi16(a0, a1),
+        ]
+    };
+    let b4 = butterfly(t0, t1, t2, t3);
+    let t = transpose_2_4x4(b4[0], b4[1], b4[2], b4[3]);
+    let b4 = butterfly(t[0], t[1], t[2], t[3]);
+    let w_0 = _mm_loadu_si128(w.as_ptr().cast());
+    let w_8 = _mm_loadu_si128(w.as_ptr().add(8).cast());
+    let abs = |v: __m128i| _mm_max_epi16(v, _mm_sub_epi16(zero, v));
+    let a_b0 = abs(_mm_unpacklo_epi64(b4[0], b4[1]));
+    let a_b2 = abs(_mm_unpacklo_epi64(b4[2], b4[3]));
+    let b_b0 = abs(_mm_unpackhi_epi64(b4[0], b4[1]));
+    let b_b2 = abs(_mm_unpackhi_epi64(b4[2], b4[3]));
+    let sa = _mm_add_epi32(_mm_madd_epi16(a_b0, w_0), _mm_madd_epi16(a_b2, w_8));
+    let sb = _mm_add_epi32(_mm_madd_epi16(b_b0, w_0), _mm_madd_epi16(b_b2, w_8));
+    hsum(_mm_sub_epi32(sa, sb))
 }
 
 #[inline]
