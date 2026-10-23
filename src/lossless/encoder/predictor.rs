@@ -934,6 +934,7 @@ impl Tile {
 
     /// Histogram of `transformed`, counted in four interleaved sub-histograms so that
     /// runs of one value do not serialize on a single bin.
+    #[inline(always)]
     fn histogram(&self) -> [u32; 256] {
         let mut h = [[0u32; 256]; 4];
         let chunks = self.transformed.chunks_exact(4);
@@ -956,26 +957,30 @@ impl Tile {
 
     fn red_histogram(&mut self, green_to_red: u8) -> [u32; 256] {
         let m = i16::from(green_to_red as i8);
-        for ((o, &g), &r) in self.transformed.iter_mut().zip(&self.green).zip(&self.red) {
-            *o = (r as u8).wrapping_sub(((m * i16::from(g)) >> 5) as u8);
-        }
-        self.histogram()
+        crate::wide::wide(|| {
+            for ((o, &g), &r) in self.transformed.iter_mut().zip(&self.green).zip(&self.red) {
+                *o = (r as u8).wrapping_sub(((m * i16::from(g)) >> 5) as u8);
+            }
+            self.histogram()
+        })
     }
 
     fn blue_histogram(&mut self, green_to_blue: u8, red_to_blue: u8) -> [u32; 256] {
         let (mg, mr) = (i16::from(green_to_blue as i8), i16::from(red_to_blue as i8));
-        for (((o, &g), &r), &b) in self
-            .transformed
-            .iter_mut()
-            .zip(&self.green)
-            .zip(&self.red)
-            .zip(&self.blue)
-        {
-            *o = b
-                .wrapping_sub(((mg * i16::from(g)) >> 5) as u8)
-                .wrapping_sub(((mr * i16::from(r)) >> 5) as u8);
-        }
-        self.histogram()
+        crate::wide::wide(|| {
+            for (((o, &g), &r), &b) in self
+                .transformed
+                .iter_mut()
+                .zip(&self.green)
+                .zip(&self.red)
+                .zip(&self.blue)
+            {
+                *o = b
+                    .wrapping_sub(((mg * i16::from(g)) >> 5) as u8)
+                    .wrapping_sub(((mr * i16::from(r)) >> 5) as u8);
+            }
+            self.histogram()
+        })
     }
 }
 
