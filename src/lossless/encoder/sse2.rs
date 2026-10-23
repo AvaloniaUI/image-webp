@@ -102,6 +102,10 @@ pub(super) fn sub_batch<const M: usize>(cur: &[u32], up: &[u32], out: &mut [u32]
     let n = out.len() & !3;
     assert!(cur.len() > n && up.len() >= n + 2);
     let mut i = 0;
+    if crate::wide::has_avx2() {
+        // SAFETY: the CPU supports AVX2.
+        i = unsafe { super::avx2::sub_batch::<M>(cur, up, out) };
+    }
     // SAFETY: SSE2 is part of x86_64; the loads read cur[i..i + 5] and up[i..i + 6] and the
     // store writes out[i..i + 4], all in bounds for i + 4 <= n by the assert above.
     unsafe {
@@ -121,6 +125,10 @@ pub(super) fn sub_batch_opaque<const M: usize>(cur: &[u32], up: &[u32], out: &mu
     let n = out.len() & !3;
     assert!(cur.len() > n && up.len() >= n + 2);
     let mut i = 0;
+    if crate::wide::has_avx2() {
+        // SAFETY: the CPU supports AVX2.
+        i = unsafe { super::avx2::sub_batch_opaque::<M>(cur, up, out) };
+    }
     // SAFETY: as in `sub_batch`.
     unsafe {
         while i < n {

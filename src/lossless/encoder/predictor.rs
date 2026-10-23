@@ -82,7 +82,7 @@ fn select(a: u32, b: u32, c: u32) -> u32 {
 
 /// `VP8LPredictors[M]` with `left` = `row[x - 1]` and `top[-1..=1]` from `upper[x - 1..=x + 1]`.
 #[inline(always)]
-fn predict<const M: usize>(left: u32, tl: u32, t: u32, tr: u32) -> u32 {
+pub(super) fn predict<const M: usize>(left: u32, tl: u32, t: u32, tr: u32) -> u32 {
     match M {
         0 => ARGB_BLACK,
         1 => left,

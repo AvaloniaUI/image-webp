@@ -6,6 +6,8 @@
 //! BSD 3-Clause license and patent grant, reproduced in LICENSE-LIBWEBP.
 
 mod alpha;
+#[cfg(target_arch = "x86_64")]
+mod avx2;
 mod backward_refs;
 mod bit_writer;
 mod cost;
