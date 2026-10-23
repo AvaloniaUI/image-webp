@@ -338,6 +338,7 @@ fn prediction_cost_spatial_histogram(
 /// `UpdateHisto` over a tile's residuals. A channel that is constant across the tile is
 /// counted with one add; the others rotate between four histograms so that runs of one
 /// value do not serialize on a single bin.
+#[inline(always)]
 fn update_histo(histo: &mut [u32; HISTO_SIZE], residuals: &[u32]) {
     let first = residuals[0];
     let diff = residuals.iter().fold(0, |acc, &r| acc | (r ^ first));
@@ -473,7 +474,7 @@ fn compute_residuals_for_tile(
             let off = (subsampling_index * NUM_PRED_MODES + mode) * HISTO_SIZE;
             let histo: &mut [u32; HISTO_SIZE] =
                 (&mut all_argb[off..off + HISTO_SIZE]).try_into().unwrap();
-            update_histo(histo, &residuals);
+            crate::wide::wide(|| update_histo(histo, &residuals));
         }
     }
     scratch.residuals = residuals;
