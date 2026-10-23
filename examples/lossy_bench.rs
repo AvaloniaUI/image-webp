@@ -1,7 +1,7 @@
 //! Encodes a large image built by tiling an RGB or RGBA PNG, with image-webp or libwebp, for timing and
 //! peak-memory measurement (`/usr/bin/time -v` / `-l`).
 //!
-//! cargo run --release --example lossy_bench -- ours|ours-rows|libwebp in.png [WxH] [quality] [method]
+//! cargo run --release --example lossy_bench -- ours|ours-rows|libwebp in.png [WxH] [quality] [method] [reps]
 //!
 //! `ours-rows` generates the rows as the encoder asks for them, without the whole image.
 
@@ -38,6 +38,7 @@ fn main() {
         .unwrap_or((6000usize, 4000usize));
     let quality: u8 = args.get(4).map_or(80, |q| q.parse().unwrap());
     let method: u8 = args.get(5).map_or(4, |m| m.parse().unwrap());
+    let reps: usize = args.get(6).map_or(1, |r| r.parse().unwrap());
 
     // Mirror-tile so that tile edges stay continuous.
     let tile_row = |y: usize, row: &mut [u8]| {
@@ -59,66 +60,71 @@ fn main() {
         rgb
     };
 
-    let t = Instant::now();
-    let size = match which {
-        "ours" => {
-            let mut out = Vec::new();
-            let mut encoder = WebPEncoder::new(&mut out);
-            let mut params = EncoderParams::default();
-            params.use_lossy = true;
-            params.lossy_quality = quality;
-            params.lossy_method = method;
-            encoder.set_params(params);
-            encoder.encode(&rgb, w as u32, h as u32, color).unwrap();
-            out.len()
-        }
-        "ours-rows" => {
-            let mut out = Vec::new();
-            let mut encoder = WebPEncoder::new(&mut out);
-            let mut params = EncoderParams::default();
-            params.use_lossy = true;
-            params.lossy_quality = quality;
-            params.lossy_method = method;
-            encoder.set_params(params);
-            encoder
-                .encode_rows(w as u32, h as u32, color, |y, row| {
-                    tile_row(y as usize, row)
-                })
-                .unwrap();
-            out.len()
-        }
-        "libwebp" => unsafe {
-            let mut config = std::mem::zeroed::<sys::WebPConfig>();
-            sys::WebPConfigInitInternal(
-                &mut config,
-                sys::WebPPreset::WEBP_PRESET_DEFAULT,
-                f32::from(quality),
-                sys::WEBP_ENCODER_ABI_VERSION as i32,
-            );
-            config.method = i32::from(method);
-            let mut pic = std::mem::zeroed::<sys::WebPPicture>();
-            sys::WebPPictureInitInternal(&mut pic, sys::WEBP_ENCODER_ABI_VERSION as i32);
-            pic.width = w as i32;
-            pic.height = h as i32;
-            if bpp == 4 {
-                sys::WebPPictureImportRGBA(&mut pic, rgb.as_ptr(), (w * 4) as i32);
-            } else {
-                sys::WebPPictureImportRGB(&mut pic, rgb.as_ptr(), (w * 3) as i32);
+    let mut best = f64::MAX;
+    let mut size = 0;
+    for _ in 0..reps {
+        let t = Instant::now();
+        size = match which {
+            "ours" => {
+                let mut out = Vec::new();
+                let mut encoder = WebPEncoder::new(&mut out);
+                let mut params = EncoderParams::default();
+                params.use_lossy = true;
+                params.lossy_quality = quality;
+                params.lossy_method = method;
+                encoder.set_params(params);
+                encoder.encode(&rgb, w as u32, h as u32, color).unwrap();
+                out.len()
             }
-            let mut writer = std::mem::zeroed::<sys::WebPMemoryWriter>();
-            sys::WebPMemoryWriterInit(&mut writer);
-            pic.writer = Some(sys::WebPMemoryWrite);
-            pic.custom_ptr = (&mut writer as *mut sys::WebPMemoryWriter).cast();
-            assert_ne!(sys::WebPEncode(&config, &mut pic), 0);
-            let size = writer.size;
-            sys::WebPMemoryWriterClear(&mut writer);
-            sys::WebPPictureFree(&mut pic);
-            size
-        },
-        _ => panic!("ours, ours-rows or libwebp"),
-    };
+            "ours-rows" => {
+                let mut out = Vec::new();
+                let mut encoder = WebPEncoder::new(&mut out);
+                let mut params = EncoderParams::default();
+                params.use_lossy = true;
+                params.lossy_quality = quality;
+                params.lossy_method = method;
+                encoder.set_params(params);
+                encoder
+                    .encode_rows(w as u32, h as u32, color, |y, row| {
+                        tile_row(y as usize, row)
+                    })
+                    .unwrap();
+                out.len()
+            }
+            "libwebp" => unsafe {
+                let mut config = std::mem::zeroed::<sys::WebPConfig>();
+                sys::WebPConfigInitInternal(
+                    &mut config,
+                    sys::WebPPreset::WEBP_PRESET_DEFAULT,
+                    f32::from(quality),
+                    sys::WEBP_ENCODER_ABI_VERSION as i32,
+                );
+                config.method = i32::from(method);
+                let mut pic = std::mem::zeroed::<sys::WebPPicture>();
+                sys::WebPPictureInitInternal(&mut pic, sys::WEBP_ENCODER_ABI_VERSION as i32);
+                pic.width = w as i32;
+                pic.height = h as i32;
+                if bpp == 4 {
+                    sys::WebPPictureImportRGBA(&mut pic, rgb.as_ptr(), (w * 4) as i32);
+                } else {
+                    sys::WebPPictureImportRGB(&mut pic, rgb.as_ptr(), (w * 3) as i32);
+                }
+                let mut writer = std::mem::zeroed::<sys::WebPMemoryWriter>();
+                sys::WebPMemoryWriterInit(&mut writer);
+                pic.writer = Some(sys::WebPMemoryWrite);
+                pic.custom_ptr = (&mut writer as *mut sys::WebPMemoryWriter).cast();
+                assert_ne!(sys::WebPEncode(&config, &mut pic), 0);
+                let size = writer.size;
+                sys::WebPMemoryWriterClear(&mut writer);
+                sys::WebPPictureFree(&mut pic);
+                size
+            },
+            _ => panic!("ours, ours-rows or libwebp"),
+        };
+        best = best.min(t.elapsed().as_secs_f64());
+    }
     println!(
         "{which} {w}x{h} q{quality} m{method}: {size} B in {:.0} ms",
-        t.elapsed().as_secs_f64() * 1e3
+        best * 1e3
     );
 }

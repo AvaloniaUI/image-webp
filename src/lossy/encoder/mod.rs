@@ -15,11 +15,12 @@ mod sse2;
 mod tables;
 
 use bit_writer::BitWriter;
-use cost::{bit_cost, level_cost, Proba, Residual, TokenBuffer};
+use cost::{bit_cost, CostTable, Proba, Residual, TokenBuffer, MAX_VARIABLE_LEVEL};
 use csp::Source;
 use dsp::*;
 use tables::{
     AC_TABLE, AC_TABLE2, BMODES_PROBA, DC_TABLE, ENC_BANDS, FIXED_COSTS_I4, LEVELS_FROM_DELTA,
+    LEVEL_FIXED_COSTS,
 };
 
 const NUM_MB_SEGMENTS: usize = 4;
@@ -2365,10 +2366,9 @@ fn trellis_quantize_block(
         level: i16,
     }
     #[derive(Clone, Copy)]
-    struct ScoreState {
+    struct ScoreState<'a> {
         score: i64,
-        /// (n, ctx) of the cost table
-        costs: (usize, usize),
+        costs: &'a CostTable,
     }
 
     let rd_score =
@@ -2378,7 +2378,7 @@ fn trellis_quantize_block(
     let mut nodes = [[Node::default(); NUM_NODES]; 16];
     let mut ss = [[ScoreState {
         score: 0,
-        costs: (0, 0),
+        costs: proba.costs(coeff_type, first, ctx0),
     }; NUM_NODES]; 2];
     let (mut cur, mut prev) = (0usize, 1usize);
     let mut best_path = [-1i32; 3];
@@ -2405,10 +2405,7 @@ fn trellis_quantize_block(
         } else {
             0
         };
-        ss[cur][m] = ScoreState {
-            score: rd_score(rate, 0),
-            costs: (first, ctx0),
-        };
+        ss[cur][m].score = rd_score(rate, 0);
     }
 
     for n in first..(last + 1).max(0) as usize {
@@ -2422,12 +2419,13 @@ fn trellis_quantize_block(
         let thresh_level = quantdiv(coeff0, iq, bias(0x80)).min(MAX_LEVEL);
 
         std::mem::swap(&mut cur, &mut prev);
+        let prev_states = ss[prev];
 
         for m in 0..NUM_NODES {
             let level = level0 + m as i32 - MIN_DELTA;
             let ctx = level.clamp(0, 2) as usize;
             let band = ENC_BANDS[n + 1] as usize;
-            ss[cur][m].costs = (n + 1, ctx);
+            ss[cur][m].costs = proba.costs(coeff_type, n + 1, ctx);
             if level < 0 || level > thresh_level {
                 ss[cur][m].score = MAX_COST;
                 continue;
@@ -2441,20 +2439,20 @@ fn trellis_quantize_block(
             let delta_error = i64::from(delta_error);
             let base_score = rd_score(0, delta_error);
 
-            let cost_of = |s: &ScoreState| {
-                let table = proba.costs(coeff_type, s.costs.0, s.costs.1);
-                i64::from(level_cost(table, level as usize))
-            };
-            let mut best_cur_score = ss[prev][0].score + rd_score(cost_of(&ss[prev][0]), 0);
+            // The level's fixed cost is the same for every predecessor, so it is added once.
+            let variable = (level as usize).min(MAX_VARIABLE_LEVEL);
+            let score_of = |s: &ScoreState| s.score + rd_score(i64::from(s.costs[variable]), 0);
+            let mut best_cur_score = score_of(&prev_states[0]);
             let mut best_prev = 0i8;
             for p in 1..NUM_NODES {
-                let score = ss[prev][p].score + rd_score(cost_of(&ss[prev][p]), 0);
+                let score = score_of(&prev_states[p]);
                 if score < best_cur_score {
                     best_cur_score = score;
                     best_prev = p as i8;
                 }
             }
-            best_cur_score += base_score;
+            best_cur_score +=
+                rd_score(i64::from(LEVEL_FIXED_COSTS[level as usize]), 0) + base_score;
             nodes[n][m] = Node {
                 prev: best_prev,
                 sign,

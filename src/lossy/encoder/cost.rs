@@ -32,11 +32,6 @@ pub(crate) fn bit_cost(bit: bool, proba: u8) -> i32 {
 }
 
 #[inline]
-pub(crate) fn level_cost(table: &CostTable, level: usize) -> i32 {
-    i32::from(LEVEL_FIXED_COSTS[level]) + i32::from(table[level.min(MAX_VARIABLE_LEVEL)])
-}
-
-#[inline]
 pub(crate) fn record_stats(bit: bool, stats: &mut u32) -> bool {
     let mut p = *stats;
     if p >= 0xfffe_0000 {
