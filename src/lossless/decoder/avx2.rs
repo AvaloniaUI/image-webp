@@ -61,6 +61,26 @@ pub(crate) unsafe fn color_transform_row(row: &mut [u8], block: usize, mults: &[
     }
 }
 
+/// libwebp's `AddGreenToBlueAndRed_AVX2` over the first whole eights of the `n` pixels at `p`.
+///
+/// # Safety
+/// The CPU supports AVX2, and `n` pixels at `p`.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn add_green(p: *mut u8, n: usize) -> usize {
+    #[rustfmt::skip]
+    let green = _mm256_setr_epi8(
+        1, -1, 1, -1, 5, -1, 5, -1, 9, -1, 9, -1, 13, -1, 13, -1,
+        1, -1, 1, -1, 5, -1, 5, -1, 9, -1, 9, -1, 13, -1, 13, -1,
+    );
+    let mut i = 0;
+    while i + 8 <= n {
+        let v = load8(p.add(4 * i));
+        store8(p.add(4 * i), _mm256_add_epi8(v, _mm256_shuffle_epi8(v, green)));
+        i += 8;
+    }
+    i
+}
+
 /// The eight-pixel kernel alone, for the tests.
 #[cfg(test)]
 #[target_feature(enable = "avx2")]
@@ -104,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn color_transform_matches_the_portable_one() {
+    fn color_transform_and_add_green_match_the_portable_ones() {
         if !crate::wide::has_avx2() {
             return;
         }
@@ -119,6 +139,12 @@ mod tests {
                 let done = unsafe { super::color_transform8_alone(b.as_mut_ptr(), n, mults) };
                 assert_eq!(done, n / 8 * 8);
                 assert_eq!(a[..done * 4], b[..done * 4], "width {width} {mults:?}");
+                assert_eq!(data[done * 4..], b[done * 4..]);
+                let (mut a, mut b) = (data.clone(), data.clone());
+                scalar::apply_subtract_green_portable(&mut a);
+                let done = unsafe { super::add_green(b.as_mut_ptr(), n) };
+                assert_eq!(done, n / 8 * 8);
+                assert_eq!(a[..done * 4], b[..done * 4]);
                 assert_eq!(data[done * 4..], b[done * 4..]);
             }
         }

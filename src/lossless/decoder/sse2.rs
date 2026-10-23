@@ -202,6 +202,10 @@ pub(crate) fn add_green(image_data: &mut [u8]) {
     };
     unsafe {
         let mut i = 0;
+        if crate::wide::has_avx2() {
+            // SAFETY: the CPU supports AVX2, and `image_data` holds `n` pixels.
+            i = super::avx2::add_green(p, n);
+        }
         while i + 4 <= n {
             store4(p.add(4 * i), step(load4(p.add(4 * i))));
             i += 4;
