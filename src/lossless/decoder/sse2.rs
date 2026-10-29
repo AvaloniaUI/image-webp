@@ -155,10 +155,6 @@ pub(crate) fn predict(mode: u8, image_data: &mut [u8], range: Range<usize>, widt
 pub(crate) fn color_transform_row(row: &mut [u8], block: usize, mults: &[u8]) {
     let n = row.len() / 4;
     assert!(mults.len() >= n.div_ceil(block) * 4);
-    if crate::wide::has_avx2() {
-        // SAFETY: the CPU supports AVX2, and `mults` has a triple for each block.
-        return unsafe { super::avx2::color_transform_row(row, block, mults) };
-    }
     for (b, m) in row.chunks_mut(block * 4).zip(mults.chunks_exact(4)) {
         unsafe { color_transform(b.as_mut_ptr(), b.len() / 4, m[0], m[1], m[2]) }
     }
@@ -202,10 +198,6 @@ pub(crate) fn add_green(image_data: &mut [u8]) {
     };
     unsafe {
         let mut i = 0;
-        if crate::wide::has_avx2() {
-            // SAFETY: the CPU supports AVX2, and `image_data` holds `n` pixels.
-            i = super::avx2::add_green(p, n);
-        }
         while i + 4 <= n {
             store4(p.add(4 * i), step(load4(p.add(4 * i))));
             i += 4;

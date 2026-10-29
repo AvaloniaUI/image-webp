@@ -429,11 +429,6 @@ impl AlphaAhead {
 
 /// Sets the alpha of the RGBA pixels `row` to `alpha`.
 fn put_alpha(row: &mut [u8], alpha: &[u8]) {
-    #[cfg(target_arch = "x86_64")]
-    let (row, alpha) = {
-        let done = crate::lossless::dispatch_alpha(alpha, row);
-        (&mut row[done * 4..], &alpha[done..])
-    };
     for (px, &a) in row.as_chunks_mut::<4>().0.iter_mut().zip(alpha) {
         px[3] = a;
     }
@@ -441,11 +436,6 @@ fn put_alpha(row: &mut [u8], alpha: &[u8]) {
 
 /// Drops the alpha of the RGBA pixels `rgba` into `rgb`, four pixels a step as three words.
 fn rgb_from_rgba(rgba: &[u8], rgb: &mut [u8]) {
-    #[cfg(target_arch = "x86_64")]
-    let (rgba, rgb) = {
-        let done = crate::lossless::rgb_from_rgba(rgba, rgb);
-        (&rgba[done * 4..], &mut rgb[done * 3..])
-    };
     let (quads, rest) = rgba.as_chunks::<16>();
     let (triples, tail) = rgb.as_chunks_mut::<12>();
     for (q, t) in quads.iter().zip(triples) {

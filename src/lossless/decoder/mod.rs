@@ -2,10 +2,6 @@
 //!
 //! [Lossless spec](https://developers.google.com/speed/webp/docs/webp_lossless_bitstream_specification)
 
-#[cfg(target_arch = "x86_64")]
-mod avx2;
-#[cfg(target_arch = "x86_64")]
-pub(crate) use avx2::{dispatch_alpha, rgb_from_rgba};
 mod huffman;
 #[cfg(target_arch = "aarch64")]
 mod neon;
@@ -1152,11 +1148,7 @@ impl<R: BufRead> AlphaBands<R> {
                 if y >= *first + greens.len() / w {
                     let (y0, band) = bands.next_band()?.ok_or(DecodingError::BitStreamError)?;
                     greens.resize(band.len() / 4, 0);
-                    #[cfg(target_arch = "x86_64")]
-                    let done = avx2::extract_green(band, greens);
-                    #[cfg(not(target_arch = "x86_64"))]
-                    let done = 0;
-                    for (g, p) in greens[done..].iter_mut().zip(band[done * 4..].as_chunks::<4>().0) {
+                    for (g, p) in greens.iter_mut().zip(band.as_chunks::<4>().0) {
                         *g = p[1];
                     }
                     *first = usize::from(y0);
@@ -1321,12 +1313,6 @@ impl ColorCache {
     /// Inserts the RGBA pixels `pixels` in order.
     #[inline(always)]
     fn insert_all(&mut self, pixels: &[u8]) {
-        #[cfg(target_arch = "x86_64")]
-        let pixels = if pixels.len() >= 32 {
-            &pixels[avx2::color_cache_insert(&mut self.color_cache, self.color_cache_bits, pixels) * 4..]
-        } else {
-            pixels
-        };
         for pixel in pixels.as_chunks::<4>().0 {
             self.insert(u32::from_le_bytes(*pixel));
         }

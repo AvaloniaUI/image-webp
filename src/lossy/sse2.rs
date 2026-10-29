@@ -562,12 +562,7 @@ pub(crate) fn yuv_to_rgb_row<const BPP: usize>(
     v: &[u8],
     out: &mut [u8],
 ) -> usize {
-    let mut i = 0;
-    if crate::wide::has_avx2() {
-        // SAFETY: the CPU has AVX2.
-        i = unsafe { super::avx2::yuv_to_rgb_row::<BPP>(y, u, v, out) };
-    }
-    yuv_to_rgb_row_from::<BPP>(y, u, v, out, i)
+    yuv_to_rgb_row_from::<BPP>(y, u, v, out, 0)
 }
 
 /// `yuv_to_rgb_row` with the pixels before `i` already converted.
@@ -726,12 +721,7 @@ pub(crate) fn transform_add_two(blocks: &[i16], dst: &mut [u8], pos: usize, stri
 /// The interpolated pixels `out[2 * j + 1]` and `out[2 * j + 2]` of the leading chroma pairs
 /// `j` of `upsample_chroma_row`, 8 pairs at a time. Returns how many pairs it did.
 pub(crate) fn upsample_pairs(near: &[u8], far: &[u8], out: &mut [u8]) -> usize {
-    let mut j = 0;
-    if crate::wide::has_avx2() {
-        // SAFETY: the CPU has AVX2.
-        j = unsafe { super::avx2::upsample_pairs(near, far, out) };
-    }
-    upsample_pairs_from(near, far, out, j)
+    upsample_pairs_from(near, far, out, 0)
 }
 
 /// `upsample_pairs` with the pairs before `j` already done.

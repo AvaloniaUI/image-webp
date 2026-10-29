@@ -11,8 +11,6 @@ use prediction::*;
 use arithmetic_decoder::{by_position, ArithmeticDecoder, ModeProbs, PlaneProbs};
 
 mod arithmetic_decoder;
-#[cfg(target_arch = "x86_64")]
-mod avx2;
 mod common;
 mod loop_filter;
 #[cfg(target_arch = "aarch64")]
@@ -1449,22 +1447,6 @@ fn filter_macroblock(p: &mut PlaneRefs, mbx: usize, mby: usize, f: MbFilter) {
         }
     } else {
         let uv = (mby * 8).wrapping_sub(p.uv_base) * cw + mbx * 8;
-        #[cfg(target_arch = "x86_64")]
-        if avx2::filter_normal(
-            p.y,
-            y,
-            lw,
-            p.u,
-            p.v,
-            uv,
-            cw,
-            [mbx > 0, f.subblocks, mby > 0],
-            limit,
-            ilevel,
-            hev,
-        ) {
-            return;
-        }
         if mbx > 0 {
             loop_filter::h16(p.y, y, lw, limit + 4, ilevel, hev);
             loop_filter::h8(p.u, p.v, uv, cw, limit + 4, ilevel, hev);
