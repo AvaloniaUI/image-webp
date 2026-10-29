@@ -13,9 +13,9 @@ categories = ["multimedia::images", "multimedia::encoding", "encoding"]
 include = ["/src", "LICENSE-APACHE", "LICENSE-LIBWEBP", "LICENSE-MIT", "README.md"]
 
 [dependencies]
-safe_unaligned_simd = "0.2.5"
 byteorder-lite = "0.1.0"
 quick-error = "2.0.1"
+safe_unaligned_simd = "0.2.5"
 
 [dev-dependencies]
 paste = "1.0.14"
@@ -28,6 +28,8 @@ default = ["encoder", "rescaler-simd"]
 # The lossy, lossless and alpha encoders, with their SSE2, AVX2 and NEON kernels.
 encoder = []
 # SSE2, AVX2 and NEON kernels for scaled decoding; without them the rescaler runs portable
-# code. They use `unsafe` loads and stores and AVX2 detection.
+# code. They use `unsafe` loads and stores and AVX2 detection. The decoder kernels load and
+# store through slices; their only `unsafe` is the call into each kernel's SSE2 or NEON
+# body, which both targets have in their baseline.
 rescaler-simd = []
 _benchmarks = []
