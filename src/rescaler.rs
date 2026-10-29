@@ -40,6 +40,7 @@ pub(crate) struct Rescaler {
     /// the weight its last one carries into the next output. Most take `run_count` source pixels.
     starts: Vec<u32>,
     weights: Vec<u32>,
+    #[cfg_attr(not(feature = "rescaler-simd"), allow(dead_code))]
     run_count: usize,
     x_add: i32,
     x_sub: i32,
@@ -230,11 +231,11 @@ impl Rescaler {
     fn import_shrink_n<const N: usize>(&mut self, src: &[u8]) {
         let src = &src[..self.src_width * N];
         let (x_sub, fx_scale) = (self.x_sub as u32, self.fx_scale);
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", feature = "rescaler-simd"))]
         use sse2::shrink_spans;
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", feature = "rescaler-simd"))]
         use neon::shrink_spans;
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "rescaler-simd"))]
         if shrink_spans(
             src,
             N,
@@ -269,9 +270,9 @@ impl Rescaler {
                 let b = frac((-self.y_accum) as u64, self.y_sub as u64);
                 ((ONE - u64::from(b)) as u32, b)
             });
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", feature = "rescaler-simd"))]
             let done = neon::export_expand(dst, &self.frow, &self.irow, self.fy_scale, ab);
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(not(all(target_arch = "aarch64", feature = "rescaler-simd")))]
             let done = 0;
             let rows = dst.iter_mut().zip(&self.frow).zip(&self.irow).skip(done);
             match ab {
@@ -290,11 +291,11 @@ impl Rescaler {
             }
         } else if self.fxy_scale != 0 {
             let yscale = self.fy_scale.wrapping_mul((-self.y_accum) as u32);
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(all(target_arch = "x86_64", feature = "rescaler-simd"))]
             let done = sse2::export_shrink(dst, &mut self.irow, &self.frow, yscale, self.fxy_scale);
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", feature = "rescaler-simd"))]
             let done = neon::export_shrink(dst, &mut self.irow, &self.frow, yscale, self.fxy_scale);
-            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            #[cfg(not(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "rescaler-simd")))]
             let done = 0;
             export_shrink(
                 &mut dst[done..],
@@ -353,11 +354,11 @@ fn shrink_whole_n<const N: usize>(
     out: &mut [u32],
     mut sum: Option<&mut [u32]>,
 ) {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "rescaler-simd"))]
     let done = sse2::shrink_whole(src, N, k, x_sub, out, sum.as_deref_mut());
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", feature = "rescaler-simd"))]
     let done = neon::shrink_whole(src, N, k, x_sub, out, sum.as_deref_mut());
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "rescaler-simd")))]
     let done = 0;
     let pixels = src
         .chunks_exact(N * k)
@@ -407,7 +408,7 @@ fn shrink_span<const N: usize>(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "rescaler-simd"))]
 #[allow(unsafe_code)]
 mod sse2 {
     use core::arch::x86_64::*;
@@ -745,7 +746,7 @@ mod sse2 {
 }
 
 /// The SSE2 kernels of `mod sse2` 256 bits wide.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "rescaler-simd"))]
 #[allow(unsafe_code)]
 mod avx2 {
     use super::sse2;
@@ -963,7 +964,7 @@ mod avx2 {
 /// libwebp's NEON exports (`rescaler_neon.c`), which differ from its C ones over the samples that
 /// whole groups of 8 cover: they multiply by half the scale with `vqrdmulh`, on the samples as
 /// signed, subtract saturating and narrow through 16 bits. The rest of a row takes the C ones.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "rescaler-simd"))]
 #[allow(unsafe_code)]
 mod neon {
     use core::arch::aarch64::*;
@@ -1377,7 +1378,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "rescaler-simd"))]
     #[allow(unsafe_code)]
     #[test]
     fn avx2_whole_shrinks_match_the_sums() {
@@ -1402,7 +1403,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "rescaler-simd"))]
     #[allow(unsafe_code)]
     #[test]
     fn avx2_export_matches_sse2() {

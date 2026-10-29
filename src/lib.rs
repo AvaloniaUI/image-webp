@@ -15,8 +15,11 @@ pub use decoder::{
 };
 pub use ahead::Runner;
 pub use frame::FrameDecoder;
+#[cfg(feature = "encoder")]
 pub use animation::{AnimationEncoder, AnimationParams};
+#[cfg(feature = "encoder")]
 pub use encoder::{encode_alpha_chunk, ColorType, EncodingError, WebPEncoder};
+#[cfg(feature = "encoder")]
 pub use lossless::EncoderParams;
 pub use wide::detect_cpu;
 
@@ -26,8 +29,10 @@ impl<R: std::io::Read + std::io::Seek> ReadSeek for R {}
 
 mod ahead;
 mod alpha_blending;
+#[cfg(feature = "encoder")]
 mod animation;
 mod decoder;
+#[cfg(feature = "encoder")]
 mod encoder;
 mod extended;
 mod frame;
@@ -53,12 +58,14 @@ pub mod vp8 {
 }
 
 /// The `ALPH` chunk payload of an alpha plane at `method`, for benchmarks.
+#[cfg(feature = "encoder")]
 #[doc(hidden)]
 pub fn bench_encode_alpha(alpha: &[u8], width: u32, height: u32, method: u8) -> usize {
     lossless::encoder::encode_alpha(alpha, width, height, method).len()
 }
 
 /// The unfiltered VP8L stream of an alpha plane at `method`, for benchmarks.
+#[cfg(feature = "encoder")]
 #[doc(hidden)]
 pub fn bench_encode_alpha_plane(alpha: &[u8], width: u32, height: u32, method: u8) -> usize {
     lossless::encoder::bench_alpha_plane(alpha, width, height, method)

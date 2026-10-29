@@ -27,9 +27,12 @@ pub(crate) use simd::{unfilter_gradient, unfilter_horizontal};
 #[cfg(target_arch = "x86_64")]
 use sse2 as simd;
 mod transform;
+#[cfg(feature = "encoder")]
 pub(crate) mod encoder;
 mod yuv;
-pub(crate) use yuv::{fill_row_yuv, upsample_chroma_row};
+pub(crate) use yuv::fill_row_yuv;
+#[cfg(feature = "encoder")]
+pub(crate) use yuv::upsample_chroma_row;
 
 #[derive(Default, Clone, Copy)]
 struct MacroBlock {

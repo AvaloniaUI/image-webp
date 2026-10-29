@@ -250,7 +250,7 @@ pub(crate) fn read_alpha_chunk<'a>(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "encoder"))]
 mod tests {
     use super::*;
     use crate::lossless::encoder::encode_alpha_filtered;

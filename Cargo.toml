@@ -23,4 +23,10 @@ rand = "0.8.5"
 libwebp-sys = { version = "0.14", default-features = false, features = ["std"] }
 
 [features]
+default = ["encoder", "rescaler-simd"]
+# The lossy, lossless and alpha encoders, with their SSE2, AVX2 and NEON kernels.
+encoder = []
+# SSE2, AVX2 and NEON kernels for scaled decoding; without them the rescaler runs portable
+# code. They use `unsafe` loads and stores and AVX2 detection.
+rescaler-simd = []
 _benchmarks = []
