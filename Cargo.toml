@@ -13,6 +13,7 @@ categories = ["multimedia::images", "multimedia::encoding", "encoding"]
 include = ["/src", "LICENSE-APACHE", "LICENSE-LIBWEBP", "LICENSE-MIT", "README.md"]
 
 [dependencies]
+safe_unaligned_simd = "0.2.5"
 byteorder-lite = "0.1.0"
 quick-error = "2.0.1"
 
