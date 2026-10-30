@@ -1,45 +1,75 @@
 //! SSE2 decoder kernels ported from libwebp's `dsp/dec_sse2.c`, bit-exact with the portable
-//! ones. SSE2 is part of x86_64, so no runtime detection is needed and the register
-//! operations are safe to call. Memory goes through slices: each wrapper checks the bounds
+//! ones. They build where SSE2 is in the target's baseline (x86_64, and x86 targets that
+//! enable it), so no runtime detection is needed and the register operations are safe to call;
+//! on wasm32 with simd128 they build on `crate::sse2_wasm`, which implements the intrinsics. Memory goes through slices: each wrapper checks the bounds
 //! its loads and stores rely on (`p` is the offset of the first pixel past the edge), and
 //! the loads and stores index the slice, through `safe_unaligned_simd` for 16 bytes.
 //!
 //! libwebp: Copyright Google Inc., BSD 3-Clause, see LICENSE-LIBWEBP.
 #![forbid(unsafe_code)]
 
-// Every entry enters its kernel with the SSE2 token of the target's baseline, which this
-// keeps present.
-const _: () = assert!(cfg!(target_feature = "sse2"));
+// Every entry enters its kernel with the instruction-set token of the target's baseline, which
+// this keeps present: SSE2 on x86, simd128 on wasm32.
+const _: () = assert!(cfg!(any(
+    all(target_feature = "sse2", target_feature = "fxsr"),
+    all(target_arch = "wasm32", target_feature = "simd128")
+)));
 
 /// The SSE2 token of the target's baseline.
+#[cfg(not(target_arch = "wasm32"))]
 #[inline(always)]
 fn baseline() -> fearless_simd::x86::Sse2 {
     fearless_simd::Level::baseline().as_sse2().unwrap()
 }
 
+/// The simd128 token of the target's baseline.
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn baseline() -> fearless_simd::wasm32::WasmSimd128 {
+    fearless_simd::Level::baseline().as_wasm_simd128().unwrap()
+}
+
+/// A `fearless_simd::kernel!` entered with the token `baseline` returns.
+macro_rules! entry {
+    (fn $name:ident($token:ident: Sse2 $(, $arg:ident: $ty:ty)* $(,)?) $(-> $ret:ty)? { $($body:tt)* }) => {
+        #[cfg(not(target_arch = "wasm32"))]
+        fearless_simd::kernel! { fn $name($token: Sse2 $(, $arg: $ty)*) $(-> $ret)? { $($body)* } }
+        #[cfg(target_arch = "wasm32")]
+        fearless_simd::kernel! { fn $name($token: WasmSimd128 $(, $arg: $ty)*) $(-> $ret)? { $($body)* } }
+    };
+}
+
+#[cfg(target_arch = "x86")]
+use core::arch::x86::*;
+#[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
+#[cfg(target_arch = "x86")]
+use safe_unaligned_simd::x86 as mem;
+#[cfg(target_arch = "x86_64")]
 use safe_unaligned_simd::x86_64 as mem;
+#[cfg(target_arch = "wasm32")]
+use crate::sse2_wasm::*;
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn check(len: usize, p: usize, back: usize, fwd: usize) {
     assert!(p >= back && p.checked_add(fwd).is_some_and(|end| end <= len));
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn abs_diff(p: __m128i, q: __m128i) -> __m128i {
     _mm_or_si128(_mm_subs_epu8(q, p), _mm_subs_epu8(p, q))
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn flip(x: __m128i) -> __m128i {
     _mm_xor_si128(x, _mm_set1_epi8(-128))
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn signed_shift8b(x: __m128i) -> __m128i {
     let zero = _mm_setzero_si128();
     let lo = _mm_srai_epi16::<11>(_mm_unpacklo_epi8(zero, x));
@@ -48,7 +78,7 @@ fn signed_shift8b(x: __m128i) -> __m128i {
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn not_hev(p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i, hev_thresh: u8) -> __m128i {
     let t_max = _mm_max_epu8(abs_diff(p1, p0), abs_diff(q1, q0));
     let t_max_h = _mm_subs_epu8(t_max, _mm_set1_epi8(hev_thresh as i8));
@@ -56,7 +86,7 @@ fn not_hev(p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i, hev_thresh: u8) -
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn base_delta(p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i) -> __m128i {
     let p1_q1 = _mm_subs_epi8(p1, q1);
     let q0_p0 = _mm_subs_epi8(q0, p0);
@@ -66,7 +96,7 @@ fn base_delta(p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i) -> __m128i {
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn do_simple_filter(p0: &mut __m128i, q0: &mut __m128i, fl: __m128i) {
     let v3 = signed_shift8b(_mm_adds_epi8(fl, _mm_set1_epi8(3)));
     let v4 = signed_shift8b(_mm_adds_epi8(fl, _mm_set1_epi8(4)));
@@ -75,7 +105,7 @@ fn do_simple_filter(p0: &mut __m128i, q0: &mut __m128i, fl: __m128i) {
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn update_2_pixels(pi: &mut __m128i, qi: &mut __m128i, a0_lo: __m128i, a0_hi: __m128i) {
     let delta = _mm_packs_epi16(_mm_srai_epi16::<7>(a0_lo), _mm_srai_epi16::<7>(a0_hi));
     *pi = flip(_mm_adds_epi8(*pi, delta));
@@ -83,7 +113,7 @@ fn update_2_pixels(pi: &mut __m128i, qi: &mut __m128i, a0_lo: __m128i, a0_hi: __
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn needs_filter(p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i, thresh: u8) -> __m128i {
     let t3 = _mm_srli_epi16::<1>(_mm_and_si128(abs_diff(p1, q1), _mm_set1_epi8(-2)));
     let t4 = abs_diff(p0, q0);
@@ -93,7 +123,7 @@ fn needs_filter(p1: __m128i, p0: __m128i, q0: __m128i, q1: __m128i, thresh: u8) 
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn do_filter2(p1: __m128i, p0: &mut __m128i, q0: &mut __m128i, q1: __m128i, thresh: u8) {
     let mask = needs_filter(p1, *p0, *q0, q1, thresh);
     let (mut sp0, mut sq0) = (flip(*p0), flip(*q0));
@@ -104,7 +134,7 @@ fn do_filter2(p1: __m128i, p0: &mut __m128i, q0: &mut __m128i, q1: __m128i, thre
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn do_filter4(
     p1: &mut __m128i,
     p0: &mut __m128i,
@@ -137,7 +167,7 @@ fn do_filter4(
 
 #[inline]
 #[allow(clippy::too_many_arguments)]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn do_filter6(
     p2: &mut __m128i,
     p1: &mut __m128i,
@@ -185,58 +215,58 @@ fn do_filter6(
 
 /// The `N` bytes of `b` from `at`.
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn bytes<const N: usize>(b: &[u8], at: usize) -> &[u8; N] {
     b[at..at + N].try_into().unwrap()
 }
 
 /// The `N` bytes of `b` from `at`, to write.
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn bytes_mut<const N: usize>(b: &mut [u8], at: usize) -> &mut [u8; N] {
     (&mut b[at..at + N]).try_into().unwrap()
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 pub(super) fn rd32(b: &[u8], at: usize) -> i32 {
     i32::from_ne_bytes(*bytes(b, at))
 }
 
 /// 8 bytes of `b` from `at` in the low half.
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn load8(b: &[u8], at: usize) -> __m128i {
-    _mm_cvtsi64_si128(i64::from_ne_bytes(*bytes(b, at)))
+    mem::_mm_loadu_si64(bytes::<8>(b, at))
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 pub(super) fn load16(b: &[u8], at: usize) -> __m128i {
     mem::_mm_loadu_si128(bytes::<16>(b, at))
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn store4(b: &mut [u8], at: usize, x: __m128i) {
     *bytes_mut(b, at) = _mm_cvtsi128_si32(x).to_ne_bytes();
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn store8(b: &mut [u8], at: usize, x: __m128i) {
-    *bytes_mut(b, at) = _mm_cvtsi128_si64(x).to_ne_bytes();
+    mem::_mm_storeu_si64(bytes_mut(b, at), x);
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 pub(super) fn store16(b: &mut [u8], at: usize, x: __m128i) {
     mem::_mm_storeu_si128(bytes_mut::<16>(b, at), x)
 }
 
 /// 8 rows of 4 pixels of `b` from `at`, transposed: columns 0 and 1 in `p`, 2 and 3 in `q`.
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn load8x4(b: &[u8], at: usize, stride: usize) -> (__m128i, __m128i) {
     let r = |k: usize| rd32(b, at + k * stride);
     let a0 = _mm_set_epi32(r(6), r(2), r(4), r(0));
@@ -251,7 +281,7 @@ fn load8x4(b: &[u8], at: usize, stride: usize) -> (__m128i, __m128i) {
 /// Columns 0..4 of 8 rows of `b0` from `at0` and 8 rows of `b8` from `at8`, one register per
 /// column.
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 pub(super) fn load16x4(b0: &[u8], at0: usize, b8: &[u8], at8: usize, stride: usize) -> [__m128i; 4] {
     let (t1, t2) = load8x4(b0, at0, stride);
     let (p0, q1) = load8x4(b8, at8, stride);
@@ -264,7 +294,7 @@ pub(super) fn load16x4(b0: &[u8], at0: usize, b8: &[u8], at8: usize, stride: usi
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 pub(super) fn store4x4(mut x: __m128i, b: &mut [u8], at: usize, stride: usize) {
     for i in 0..4 {
         store4(b, at + i * stride, x);
@@ -275,7 +305,7 @@ pub(super) fn store4x4(mut x: __m128i, b: &mut [u8], at: usize, stride: usize) {
 /// The four columns `c` interleaved back into rows: rows 0..4, 4..8, 8..12 and 12..16 of 4
 /// pixels each, one register per four rows.
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn interleave16x4(c: [__m128i; 4]) -> [__m128i; 4] {
     let [p1, p0, q0, q1] = c;
     let p0_s = _mm_unpacklo_epi8(p1, p0);
@@ -292,7 +322,7 @@ fn interleave16x4(c: [__m128i; 4]) -> [__m128i; 4] {
 
 /// The columns `c` back into rows 0..8 of `b` at `at0` and rows 8..16 at `at8`.
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 pub(super) fn store16x4(c: [__m128i; 4], b: &mut [u8], at0: usize, at8: usize, stride: usize) {
     let [r0, r4, r8, r12] = interleave16x4(c);
     store4x4(r0, b, at0, stride);
@@ -303,7 +333,7 @@ pub(super) fn store16x4(c: [__m128i; 4], b: &mut [u8], at0: usize, at8: usize, s
 
 /// The columns `c` back into rows 0..8 of `u` and rows 0..8 of `v`, both at `at`.
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn store16x4_uv(c: [__m128i; 4], u: &mut [u8], v: &mut [u8], at: usize, stride: usize) {
     let [r0, r4, r8, r12] = interleave16x4(c);
     store4x4(r0, u, at, stride);
@@ -313,20 +343,20 @@ fn store16x4_uv(c: [__m128i; 4], u: &mut [u8], v: &mut [u8], at: usize, stride: 
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 pub(super) fn load_uv(u: &[u8], v: &[u8], at: usize) -> __m128i {
     _mm_unpacklo_epi64(load8(u, at), load8(v, at))
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 pub(super) fn store_uv(x: __m128i, u: &mut [u8], v: &mut [u8], at: usize) {
     store8(u, at, x);
     store8(v, at, _mm_srli_si128::<8>(x));
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn max_diff(m: __m128i, p3: __m128i, p2: __m128i, p1: __m128i, p0: __m128i) -> __m128i {
     let m = _mm_max_epu8(m, abs_diff(p1, p0));
     let m = _mm_max_epu8(m, abs_diff(p3, p2));
@@ -334,7 +364,7 @@ fn max_diff(m: __m128i, p3: __m128i, p2: __m128i, p1: __m128i, p0: __m128i) -> _
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn complex_mask(
     p1: __m128i,
     p0: __m128i,
@@ -351,7 +381,7 @@ fn complex_mask(
 
 #[inline]
 pub(crate) fn simple_v16(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
             simple_v16_sse2(buf, p, stride, thresh)
         }
@@ -359,7 +389,7 @@ pub(crate) fn simple_v16(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
     enter(baseline(), buf, p, stride, thresh)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn simple_v16_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
     check(buf.len(), p, 2 * stride, stride + 16);
     let p1 = load16(buf, p - 2 * stride);
@@ -373,7 +403,7 @@ fn simple_v16_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
 
 #[inline]
 pub(crate) fn simple_h16(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
             simple_h16_sse2(buf, p, stride, thresh)
         }
@@ -381,7 +411,7 @@ pub(crate) fn simple_h16(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
     enter(baseline(), buf, p, stride, thresh)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn simple_h16_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
     check(buf.len(), p, 2, 15 * stride + 2);
     let b = p - 2;
@@ -392,7 +422,7 @@ fn simple_h16_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
 
 #[inline]
 pub(crate) fn simple_v16i(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
             simple_v16i_sse2(buf, p, stride, thresh)
         }
@@ -400,7 +430,7 @@ pub(crate) fn simple_v16i(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
     enter(baseline(), buf, p, stride, thresh)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn simple_v16i_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
     for k in 1..4 {
         simple_v16(buf, p + 4 * k * stride, stride, thresh);
@@ -409,7 +439,7 @@ fn simple_v16i_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
 
 #[inline]
 pub(crate) fn simple_h16i(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
             simple_h16i_sse2(buf, p, stride, thresh)
         }
@@ -417,7 +447,7 @@ pub(crate) fn simple_h16i(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
     enter(baseline(), buf, p, stride, thresh)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn simple_h16i_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
     for k in 1..4 {
         simple_h16(buf, p + 4 * k, stride, thresh);
@@ -426,7 +456,7 @@ fn simple_h16i_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
 
 #[inline]
 pub(crate) fn v16(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
             v16_sse2(buf, p, stride, thresh, ithresh, hev)
         }
@@ -434,7 +464,7 @@ pub(crate) fn v16(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: 
     enter(baseline(), buf, p, stride, thresh, ithresh, hev)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn v16_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
     check(buf.len(), p, 4 * stride, 3 * stride + 16);
     let b = p - 4 * stride;
@@ -454,7 +484,7 @@ fn v16_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, he
 
 #[inline]
 pub(crate) fn h16(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
             h16_sse2(buf, p, stride, thresh, ithresh, hev)
         }
@@ -462,7 +492,7 @@ pub(crate) fn h16(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: 
     enter(baseline(), buf, p, stride, thresh, ithresh, hev)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn h16_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
     check(buf.len(), p, 4, 15 * stride + 4);
     let (q, b) = (p, p - 4);
@@ -480,7 +510,7 @@ fn h16_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, he
 
 #[inline]
 pub(crate) fn v16i(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
             v16i_sse2(buf, p, stride, thresh, ithresh, hev)
         }
@@ -488,7 +518,7 @@ pub(crate) fn v16i(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh:
     enter(baseline(), buf, p, stride, thresh, ithresh, hev)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn v16i_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
     check(buf.len(), p, 0, 15 * stride + 16);
     let mut b = p;
@@ -519,7 +549,7 @@ fn v16i_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, h
 
 #[inline]
 pub(crate) fn h16i(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
             h16i_sse2(buf, p, stride, thresh, ithresh, hev)
         }
@@ -527,7 +557,7 @@ pub(crate) fn h16i(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh:
     enter(baseline(), buf, p, stride, thresh, ithresh, hev)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn h16i_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
     check(buf.len(), p, 0, 15 * stride + 16);
     let mut b = p;
@@ -550,7 +580,7 @@ fn h16i_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, h
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(crate) fn v8(u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
             v8_sse2(u, v, p, stride, thresh, ithresh, hev)
         }
@@ -558,7 +588,7 @@ pub(crate) fn v8(u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8
     enter(baseline(), u, v, p, stride, thresh, ithresh, hev)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn v8_sse2(
     u: &mut [u8],
     v: &mut [u8],
@@ -588,7 +618,7 @@ fn v8_sse2(
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(crate) fn h8(u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
             h8_sse2(u, v, p, stride, thresh, ithresh, hev)
         }
@@ -596,7 +626,7 @@ pub(crate) fn h8(u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8
     enter(baseline(), u, v, p, stride, thresh, ithresh, hev)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn h8_sse2(
     u: &mut [u8],
     v: &mut [u8],
@@ -624,7 +654,7 @@ fn h8_sse2(
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(crate) fn v8i(u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
             v8i_sse2(u, v, p, stride, thresh, ithresh, hev)
         }
@@ -632,7 +662,7 @@ pub(crate) fn v8i(u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u
     enter(baseline(), u, v, p, stride, thresh, ithresh, hev)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn v8i_sse2(
     u: &mut [u8],
     v: &mut [u8],
@@ -659,7 +689,7 @@ fn v8i_sse2(
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(crate) fn h8i(u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
             h8i_sse2(u, v, p, stride, thresh, ithresh, hev)
         }
@@ -667,7 +697,7 @@ pub(crate) fn h8i(u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u
     enter(baseline(), u, v, p, stride, thresh, ithresh, hev)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn h8i_sse2(
     u: &mut [u8],
     v: &mut [u8],
@@ -689,14 +719,14 @@ fn h8i_sse2(
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn load_hi16(b: &[u8], at: usize) -> __m128i {
     _mm_unpacklo_epi8(_mm_setzero_si128(), load8(b, at))
 }
 
 /// libwebp's `YUV444ToRGB_SSE2`: 8 pixels to 16-bit R, G, B (to be saturated to 8 bits).
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn yuv444_to_rgb(y: &[u8], u: &[u8], v: &[u8], at: usize) -> [__m128i; 3] {
     let (y0, u0, v0) = (load_hi16(y, at), load_hi16(u, at), load_hi16(v, at));
     let y1 = _mm_mulhi_epu16(y0, _mm_set1_epi16(19077));
@@ -718,7 +748,7 @@ fn yuv444_to_rgb(y: &[u8], u: &[u8], v: &[u8], at: usize) -> [__m128i; 3] {
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn planar_to_24b_step(i: [__m128i; 6]) -> [__m128i; 6] {
     let m = _mm_set1_epi16(0x00ff);
     let even = |a, b| _mm_packus_epi16(_mm_and_si128(a, m), _mm_and_si128(b, m));
@@ -739,7 +769,7 @@ fn planar_to_24b_step(i: [__m128i; 6]) -> [__m128i; 6] {
 #[inline]
 pub(crate) fn yuv_to_rgb_row<const BPP: usize>(y: &[u8], u: &[u8], v: &[u8], out: &mut [u8]) -> usize {
     const { assert!(BPP == 3 || BPP == 4) };
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, bpp: usize, y: &[u8], u: &[u8], v: &[u8], out: &mut [u8]) -> usize {
             match bpp {
                 3 => yuv_to_rgb_row_sse2::<3>(y, u, v, out),
@@ -751,7 +781,7 @@ pub(crate) fn yuv_to_rgb_row<const BPP: usize>(y: &[u8], u: &[u8], v: &[u8], out
     enter(baseline(), BPP, y, u, v, out)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn yuv_to_rgb_row_sse2<const BPP: usize>(
     y: &[u8],
     u: &[u8],
@@ -765,7 +795,7 @@ fn yuv_to_rgb_row_sse2<const BPP: usize>(
 #[inline]
 pub(crate) fn yuv_to_rgb_row_from<const BPP: usize>(y: &[u8], u: &[u8], v: &[u8], out: &mut [u8], i: usize) -> usize {
     const { assert!(BPP == 3 || BPP == 4) };
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, bpp: usize, y: &[u8], u: &[u8], v: &[u8], out: &mut [u8], i: usize) -> usize {
             match bpp {
                 3 => yuv_to_rgb_row_from_sse2::<3>(y, u, v, out, i),
@@ -777,7 +807,7 @@ pub(crate) fn yuv_to_rgb_row_from<const BPP: usize>(y: &[u8], u: &[u8], v: &[u8]
     enter(baseline(), BPP, y, u, v, out, i)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn yuv_to_rgb_row_from_sse2<const BPP: usize>(
     y: &[u8],
     u: &[u8],
@@ -826,7 +856,7 @@ fn yuv_to_rgb_row_from_sse2<const BPP: usize>(
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn transpose_2_4x4(i0: __m128i, i1: __m128i, i2: __m128i, i3: __m128i) -> [__m128i; 4] {
     let t0_0 = _mm_unpacklo_epi16(i0, i1);
     let t0_1 = _mm_unpacklo_epi16(i2, i3);
@@ -847,7 +877,7 @@ fn transpose_2_4x4(i0: __m128i, i1: __m128i, i2: __m128i, i3: __m128i) -> [__m12
 /// The two passes of libwebp's `Transform_SSE2` on the coefficient rows of one or two blocks,
 /// side by side: the rows of pixel differences.
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn transform_rows(rows: [__m128i; 4]) -> [__m128i; 4] {
     let k1 = _mm_set1_epi16(20091);
     let k2 = _mm_set1_epi16(-30068);
@@ -883,18 +913,17 @@ fn transform_rows(rows: [__m128i; 4]) -> [__m128i; 4] {
 
 /// Four coefficients of `block` from `at` in the low half.
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn load_coeffs4(block: &[i16], at: usize) -> __m128i {
     let c: &[i16; 4] = block[at..at + 4].try_into().unwrap();
-    let bits = c.iter().rev().fold(0u64, |acc, &x| (acc << 16) | u64::from(x as u16));
-    _mm_cvtsi64_si128(bits as i64)
+    mem::_mm_loadu_si64(c)
 }
 
 /// libwebp's `Transform_SSE2` for one block: the inverse transform of `block` (16
 /// coefficients that fit 16 bits) added to the 4x4 pixels at `pos` of `dst`.
 #[inline]
 pub(crate) fn transform_add(block: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, block: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
             transform_add_sse2(block, dst, pos, stride)
         }
@@ -902,7 +931,7 @@ pub(crate) fn transform_add(block: &[i16], dst: &mut [u8], pos: usize, stride: u
     enter(baseline(), block, dst, pos, stride)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn transform_add_sse2(block: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
     let block = &block[..16];
     check(dst.len(), pos, 0, 3 * stride + 4);
@@ -927,7 +956,7 @@ fn transform_add_sse2(block: &[i16], dst: &mut [u8], pos: usize, stride: usize) 
 /// `blocks` (32 coefficients that fit 16 bits) added to the 8x4 pixels at `pos` of `dst`.
 #[inline]
 pub(crate) fn transform_add_two(blocks: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, blocks: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
             transform_add_two_sse2(blocks, dst, pos, stride)
         }
@@ -935,7 +964,7 @@ pub(crate) fn transform_add_two(blocks: &[i16], dst: &mut [u8], pos: usize, stri
     enter(baseline(), blocks, dst, pos, stride)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn transform_add_two_sse2(blocks: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
     let blocks = &blocks[..32];
     check(dst.len(), pos, 0, 3 * stride + 8);
@@ -955,7 +984,7 @@ fn transform_add_two_sse2(blocks: &[i16], dst: &mut [u8], pos: usize, stride: us
 /// `j` of `upsample_chroma_row`, 8 pairs at a time. Returns how many pairs it did.
 #[inline]
 pub(crate) fn upsample_pairs(near: &[u8], far: &[u8], out: &mut [u8]) -> usize {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, near: &[u8], far: &[u8], out: &mut [u8]) -> usize {
             upsample_pairs_sse2(near, far, out)
         }
@@ -963,7 +992,7 @@ pub(crate) fn upsample_pairs(near: &[u8], far: &[u8], out: &mut [u8]) -> usize {
     enter(baseline(), near, far, out)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn upsample_pairs_sse2(near: &[u8], far: &[u8], out: &mut [u8]) -> usize {
     upsample_pairs_from(near, far, out, 0)
 }
@@ -971,7 +1000,7 @@ fn upsample_pairs_sse2(near: &[u8], far: &[u8], out: &mut [u8]) -> usize {
 /// `upsample_pairs` with the pairs before `j` already done.
 #[inline]
 pub(crate) fn upsample_pairs_from(near: &[u8], far: &[u8], out: &mut [u8], j: usize) -> usize {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, near: &[u8], far: &[u8], out: &mut [u8], j: usize) -> usize {
             upsample_pairs_from_sse2(near, far, out, j)
         }
@@ -979,7 +1008,7 @@ pub(crate) fn upsample_pairs_from(near: &[u8], far: &[u8], out: &mut [u8], j: us
     enter(baseline(), near, far, out, j)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn upsample_pairs_from_sse2(near: &[u8], far: &[u8], out: &mut [u8], mut j: usize) -> usize {
     let n = near.len().min(far.len());
     let pairs = (out.len().saturating_sub(1) / 2).min(n.saturating_sub(1));
@@ -1037,7 +1066,7 @@ fn upsample_pairs_from_sse2(near: &[u8], far: &[u8], out: &mut [u8], mut j: usiz
 #[inline]
 pub(crate) fn dc<const SIZE: usize>(buf: &mut [u8], p: usize, stride: usize, top: bool, left: bool) {
     const { assert!(SIZE == 8 || SIZE == 16) };
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, size: usize, buf: &mut [u8], p: usize, stride: usize, top: bool, left: bool) {
             match size {
                 8 => dc_sse2::<8>(buf, p, stride, top, left),
@@ -1049,7 +1078,7 @@ pub(crate) fn dc<const SIZE: usize>(buf: &mut [u8], p: usize, stride: usize, top
     enter(baseline(), SIZE, buf, p, stride, top, left)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn dc_sse2<const SIZE: usize>(
     buf: &mut [u8],
     p: usize,
@@ -1093,7 +1122,7 @@ fn dc_sse2<const SIZE: usize>(
 /// 4x4 pixels at `pos` of `dst`.
 #[inline]
 pub(crate) fn add_dc(dc: i32, dst: &mut [u8], pos: usize, stride: usize) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, dc: i32, dst: &mut [u8], pos: usize, stride: usize) {
             add_dc_sse2(dc, dst, pos, stride)
         }
@@ -1101,7 +1130,7 @@ pub(crate) fn add_dc(dc: i32, dst: &mut [u8], pos: usize, stride: usize) {
     enter(baseline(), dc, dst, pos, stride)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn add_dc_sse2(dc: i32, dst: &mut [u8], pos: usize, stride: usize) {
     check(dst.len(), pos, 0, 3 * stride + 4);
     let dc = _mm_set1_epi16(dc as i16);
@@ -1116,7 +1145,7 @@ fn add_dc_sse2(dc: i32, dst: &mut [u8], pos: usize, stride: usize) {
 
 /// `(a + 2 * b + c + 2) >> 2` per byte, as libwebp's predictors compute it.
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn avg3(a: __m128i, b: __m128i, c: __m128i) -> __m128i {
     let lsb = _mm_and_si128(_mm_xor_si128(a, c), _mm_set1_epi8(1));
     _mm_avg_epu8(_mm_subs_epu8(_mm_avg_epu8(a, c), lsb), b)
@@ -1125,7 +1154,7 @@ fn avg3(a: __m128i, b: __m128i, c: __m128i) -> __m128i {
 /// Checks the bounds of a 4x4 prediction at `p` that reads the row above from one pixel to
 /// its left on and 8 bytes wide.
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn check4(len: usize, p: usize, stride: usize) {
     check(len, p, stride + 1, 3 * stride + 4);
 }
@@ -1133,7 +1162,7 @@ fn check4(len: usize, p: usize, stride: usize) {
 /// libwebp's `VE4_SSE2`.
 #[inline]
 pub(crate) fn ve4(buf: &mut [u8], p: usize, stride: usize) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize) {
             ve4_sse2(buf, p, stride)
         }
@@ -1141,7 +1170,7 @@ pub(crate) fn ve4(buf: &mut [u8], p: usize, stride: usize) {
     enter(baseline(), buf, p, stride)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn ve4_sse2(buf: &mut [u8], p: usize, stride: usize) {
     check4(buf.len(), p, stride);
     let t = load8(buf, p - stride - 1);
@@ -1154,7 +1183,7 @@ fn ve4_sse2(buf: &mut [u8], p: usize, stride: usize) {
 /// libwebp's `LD4_SSE2`.
 #[inline]
 pub(crate) fn ld4(buf: &mut [u8], p: usize, stride: usize) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize) {
             ld4_sse2(buf, p, stride)
         }
@@ -1162,7 +1191,7 @@ pub(crate) fn ld4(buf: &mut [u8], p: usize, stride: usize) {
     enter(baseline(), buf, p, stride)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn ld4_sse2(buf: &mut [u8], p: usize, stride: usize) {
     check4(buf.len(), p, stride);
     let top = p - stride;
@@ -1178,7 +1207,7 @@ fn ld4_sse2(buf: &mut [u8], p: usize, stride: usize) {
 /// libwebp's `RD4_SSE2`.
 #[inline]
 pub(crate) fn rd4(buf: &mut [u8], p: usize, stride: usize) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize) {
             rd4_sse2(buf, p, stride)
         }
@@ -1186,7 +1215,7 @@ pub(crate) fn rd4(buf: &mut [u8], p: usize, stride: usize) {
     enter(baseline(), buf, p, stride)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn rd4_sse2(buf: &mut [u8], p: usize, stride: usize) {
     check4(buf.len(), p, stride);
     let left = |buf: &[u8], y: usize| u32::from(buf[p + y * stride - 1]);
@@ -1205,7 +1234,7 @@ fn rd4_sse2(buf: &mut [u8], p: usize, stride: usize) {
 /// libwebp's `VR4_SSE2`.
 #[inline]
 pub(crate) fn vr4(buf: &mut [u8], p: usize, stride: usize) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize) {
             vr4_sse2(buf, p, stride)
         }
@@ -1213,7 +1242,7 @@ pub(crate) fn vr4(buf: &mut [u8], p: usize, stride: usize) {
     enter(baseline(), buf, p, stride)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn vr4_sse2(buf: &mut [u8], p: usize, stride: usize) {
     check4(buf.len(), p, stride);
     let (i, j, k) = (buf[p - 1], buf[p + stride - 1], buf[p + 2 * stride - 1]);
@@ -1239,7 +1268,7 @@ fn vr4_sse2(buf: &mut [u8], p: usize, stride: usize) {
 /// libwebp's `VL4_SSE2`.
 #[inline]
 pub(crate) fn vl4(buf: &mut [u8], p: usize, stride: usize) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize) {
             vl4_sse2(buf, p, stride)
         }
@@ -1247,7 +1276,7 @@ pub(crate) fn vl4(buf: &mut [u8], p: usize, stride: usize) {
     enter(baseline(), buf, p, stride)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn vl4_sse2(buf: &mut [u8], p: usize, stride: usize) {
     check4(buf.len(), p, stride);
     let one = _mm_set1_epi8(1);
@@ -1273,7 +1302,7 @@ fn vl4_sse2(buf: &mut [u8], p: usize, stride: usize) {
 #[inline]
 pub(crate) fn tm<const SIZE: usize>(buf: &mut [u8], p: usize, stride: usize) {
     const { assert!(SIZE == 4 || SIZE == 8 || SIZE == 16) };
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, size: usize, buf: &mut [u8], p: usize, stride: usize) {
             match size {
                 4 => tm_sse2::<4>(buf, p, stride),
@@ -1286,7 +1315,7 @@ pub(crate) fn tm<const SIZE: usize>(buf: &mut [u8], p: usize, stride: usize) {
     enter(baseline(), SIZE, buf, p, stride)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn tm_sse2<const SIZE: usize>(buf: &mut [u8], p: usize, stride: usize) {
     check(buf.len(), p, stride + 1, (SIZE - 1) * stride + SIZE);
     let zero = _mm_setzero_si128();
@@ -1312,14 +1341,14 @@ fn tm_sse2<const SIZE: usize>(buf: &mut [u8], p: usize, stride: usize) {
 
 /// Byte 15 of `x` in every byte.
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn broadcast_last(x: __m128i) -> __m128i {
     _mm_shuffle_epi32::<0xff>(_mm_shufflehi_epi16::<0xff>(_mm_unpackhi_epi8(x, x)))
 }
 
 /// The running sum of the 16 bytes of `x`, plus `left` in every byte.
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn running_sum(x: __m128i, left: __m128i) -> __m128i {
     let s = _mm_add_epi8(x, _mm_slli_si128::<1>(x));
     let s = _mm_add_epi8(s, _mm_slli_si128::<2>(s));
@@ -1334,7 +1363,7 @@ fn running_sum(x: __m128i, left: __m128i) -> __m128i {
 /// pixels left.
 #[inline]
 pub(crate) fn unfilter_gradient(prev: &[u8], row: &mut [u8], x: usize) -> usize {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, prev: &[u8], row: &mut [u8], x: usize) -> usize {
             unfilter_gradient_sse2(prev, row, x)
         }
@@ -1342,7 +1371,7 @@ pub(crate) fn unfilter_gradient(prev: &[u8], row: &mut [u8], x: usize) -> usize 
     enter(baseline(), prev, row, x)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn unfilter_gradient_sse2(prev: &[u8], row: &mut [u8], mut x: usize) -> usize {
     let n = row.len().min(prev.len());
     assert!(x >= 1);
@@ -1384,7 +1413,7 @@ fn unfilter_gradient_sse2(prev: &[u8], row: &mut [u8], mut x: usize) -> usize {
 /// pixels at a time. Returns where it stopped, with fewer than 16 pixels left.
 #[inline]
 pub(crate) fn unfilter_horizontal(row: &mut [u8], x: usize) -> usize {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, row: &mut [u8], x: usize) -> usize {
             unfilter_horizontal_sse2(row, x)
         }
@@ -1392,7 +1421,7 @@ pub(crate) fn unfilter_horizontal(row: &mut [u8], x: usize) -> usize {
     enter(baseline(), row, x)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn unfilter_horizontal_sse2(row: &mut [u8], mut x: usize) -> usize {
     assert!(x >= 1);
     let mut left = _mm_set1_epi8(row[x - 1] as i8);

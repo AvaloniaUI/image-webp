@@ -1,55 +1,86 @@
 //! SSE2 kernels of the VP8L inverse transforms after libwebp's `dsp/lossless_sse2.c`, bit-exact
-//! with the portable ones in `reverse_transform`. SSE2 is part of x86_64, so no runtime detection
-//! is needed and the register operations are safe to call. Pixels are RGBA bytes; every kernel
+//! with the portable ones in `reverse_transform`. They build where SSE2 is in the target's
+//! baseline (x86_64, and x86 targets that enable it), so no runtime detection is needed and the
+//! register operations are safe to call; on wasm32 with simd128 they build on
+//! `crate::sse2_wasm`, which implements the intrinsics. Pixels are RGBA bytes; every kernel
 //! works per channel, so the order is libwebp's. Memory goes through slices, through
 //! `safe_unaligned_simd` for four pixels.
 //!
 //! libwebp: Copyright Google Inc., BSD 3-Clause, see LICENSE-LIBWEBP.
 #![forbid(unsafe_code)]
 
-// Every entry enters its kernel with the SSE2 token of the target's baseline, which this
-// keeps present.
-const _: () = assert!(cfg!(target_feature = "sse2"));
+// Every entry enters its kernel with the instruction-set token of the target's baseline, which
+// this keeps present: SSE2 on x86, simd128 on wasm32.
+const _: () = assert!(cfg!(any(
+    all(target_feature = "sse2", target_feature = "fxsr"),
+    all(target_arch = "wasm32", target_feature = "simd128")
+)));
 
 /// The SSE2 token of the target's baseline.
+#[cfg(not(target_arch = "wasm32"))]
 #[inline(always)]
 fn baseline() -> fearless_simd::x86::Sse2 {
     fearless_simd::Level::baseline().as_sse2().unwrap()
 }
 
+/// The simd128 token of the target's baseline.
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn baseline() -> fearless_simd::wasm32::WasmSimd128 {
+    fearless_simd::Level::baseline().as_wasm_simd128().unwrap()
+}
+
+/// A `fearless_simd::kernel!` entered with the token `baseline` returns.
+macro_rules! entry {
+    (fn $name:ident($token:ident: Sse2 $(, $arg:ident: $ty:ty)* $(,)?) $(-> $ret:ty)? { $($body:tt)* }) => {
+        #[cfg(not(target_arch = "wasm32"))]
+        fearless_simd::kernel! { fn $name($token: Sse2 $(, $arg: $ty)*) $(-> $ret)? { $($body)* } }
+        #[cfg(target_arch = "wasm32")]
+        fearless_simd::kernel! { fn $name($token: WasmSimd128 $(, $arg: $ty)*) $(-> $ret)? { $($body)* } }
+    };
+}
+
+#[cfg(target_arch = "x86")]
+use core::arch::x86::*;
+#[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
+#[cfg(target_arch = "x86")]
+use safe_unaligned_simd::x86 as mem;
+#[cfg(target_arch = "x86_64")]
 use safe_unaligned_simd::x86_64 as mem;
+#[cfg(target_arch = "wasm32")]
+use crate::sse2_wasm::*;
 use std::ops::Range;
 
 /// Four pixels of `b` from byte `at`.
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn load4(b: &[u8], at: usize) -> __m128i {
     mem::_mm_loadu_si128(<&[u8; 16]>::try_from(&b[at..at + 16]).unwrap())
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn store4(b: &mut [u8], at: usize, v: __m128i) {
     mem::_mm_storeu_si128(<&mut [u8; 16]>::try_from(&mut b[at..at + 16]).unwrap(), v)
 }
 
 /// The pixel of `b` at byte `at`.
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn load1(b: &[u8], at: usize) -> __m128i {
     _mm_cvtsi32_si128(i32::from_ne_bytes(b[at..at + 4].try_into().unwrap()))
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn store1(b: &mut [u8], at: usize, v: __m128i) {
     b[at..at + 4].copy_from_slice(&_mm_cvtsi128_si32(v).to_ne_bytes());
 }
 
 /// `(a + b) >> 1` per byte.
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn average2(a: __m128i, b: __m128i) -> __m128i {
     _mm_sub_epi8(_mm_avg_epu8(a, b), _mm_and_si128(_mm_xor_si128(a, b), _mm_set1_epi8(1)))
 }
@@ -57,7 +88,7 @@ fn average2(a: __m128i, b: __m128i) -> __m128i {
 /// Adds a prediction from the row above only, four pixels at a time: `pred(top, top_left,
 /// top_right)`. The `n` pixels are at byte `out` of `b`, the row above at byte `top`.
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn add_upper(b: &mut [u8], out: usize, top: usize, n: usize, pred: impl Fn(__m128i, __m128i, __m128i) -> __m128i) {
     let mut i = 0;
     while i + 4 <= n {
@@ -79,7 +110,7 @@ fn add_upper(b: &mut [u8], out: usize, top: usize, n: usize, pred: impl Fn(__m12
 /// Adds a prediction that takes the pixel decoded just before, a pixel at a time:
 /// `pred(left, top, top_left, top_right)`.
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn add_serial(b: &mut [u8], out: usize, top: usize, n: usize, pred: impl Fn(__m128i, __m128i, __m128i, __m128i) -> __m128i) {
     let mut left = load1(b, out - 4);
     for i in 0..n {
@@ -95,7 +126,7 @@ fn add_serial(b: &mut [u8], out: usize, top: usize, n: usize, pred: impl Fn(__m1
 /// pixel is. Both sums with the residual are taken before the select, so the next left pixel
 /// waits only on the left one's distance.
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn add_select(b: &mut [u8], out: usize, top: usize, n: usize) {
     let mut left = load1(b, out - 4);
     for i in 0..n {
@@ -111,7 +142,7 @@ fn add_select(b: &mut [u8], out: usize, top: usize, n: usize) {
 
 /// Predictor 1, the left pixel: a prefix sum over each four pixels.
 #[inline]
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn add_left(b: &mut [u8], out: usize, n: usize) {
     let mut prev = _mm_set1_epi32(i32::from_ne_bytes(b[out - 4..out].try_into().unwrap()));
     let mut i = 0;
@@ -136,7 +167,7 @@ fn add_left(b: &mut [u8], out: usize, n: usize) {
 /// Predictor 1 on `image_data[range]`, which has a pixel before it.
 #[inline]
 pub(crate) fn predict_left(image_data: &mut [u8], range: Range<usize>) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, image_data: &mut [u8], range: Range<usize>) {
             predict_left_sse2(image_data, range)
         }
@@ -144,7 +175,7 @@ pub(crate) fn predict_left(image_data: &mut [u8], range: Range<usize>) {
     enter(baseline(), image_data, range)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn predict_left_sse2(image_data: &mut [u8], range: Range<usize>) {
     assert!(range.start >= 4 && range.start <= range.end && range.end <= image_data.len());
     add_left(image_data, range.start, (range.end - range.start) / 4)
@@ -154,7 +185,7 @@ fn predict_left_sse2(image_data: &mut [u8], range: Range<usize>) {
 /// second on, below the row above at `width` pixels before them.
 #[inline]
 pub(crate) fn predict(mode: u8, image_data: &mut [u8], range: Range<usize>, width: usize) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, mode: u8, image_data: &mut [u8], range: Range<usize>, width: usize) {
             predict_sse2(mode, image_data, range, width)
         }
@@ -162,7 +193,7 @@ pub(crate) fn predict(mode: u8, image_data: &mut [u8], range: Range<usize>, widt
     enter(baseline(), mode, image_data, range, width)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn predict_sse2(mode: u8, image_data: &mut [u8], range: Range<usize>, width: usize) {
     let stride = width * 4;
     // The top-left pixel is read 4 bytes before the row above, the top-right of the last pixel
@@ -205,7 +236,7 @@ fn predict_sse2(mode: u8, image_data: &mut [u8], range: Range<usize>, width: usi
 /// green to blue, green to red) per block of `block` pixels from `mults`.
 #[inline]
 pub(crate) fn color_transform_row(row: &mut [u8], block: usize, mults: &[u8]) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, row: &mut [u8], block: usize, mults: &[u8]) {
             color_transform_row_sse2(row, block, mults)
         }
@@ -213,7 +244,7 @@ pub(crate) fn color_transform_row(row: &mut [u8], block: usize, mults: &[u8]) {
     enter(baseline(), row, block, mults)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn color_transform_row_sse2(row: &mut [u8], block: usize, mults: &[u8]) {
     let n = row.len() / 4;
     assert!(mults.len() >= n.div_ceil(block) * 4);
@@ -227,7 +258,7 @@ fn color_transform_row_sse2(row: &mut [u8], block: usize, mults: &[u8]) {
 /// 16-bit products of `c << 8` and `t << 3`.
 #[inline]
 pub(crate) fn color_transform(pixels: &mut [u8], red_to_blue: u8, green_to_blue: u8, green_to_red: u8) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, pixels: &mut [u8], red_to_blue: u8, green_to_blue: u8, green_to_red: u8) {
             color_transform_sse2(pixels, red_to_blue, green_to_blue, green_to_red)
         }
@@ -235,7 +266,7 @@ pub(crate) fn color_transform(pixels: &mut [u8], red_to_blue: u8, green_to_blue:
     enter(baseline(), pixels, red_to_blue, green_to_blue, green_to_red)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn color_transform_sse2(pixels: &mut [u8], red_to_blue: u8, green_to_blue: u8, green_to_red: u8) {
     let n = pixels.len() / 4;
     let cst = |m: u8| i32::from(((m as i8 as i16) << 3) as u16);
@@ -265,7 +296,7 @@ fn color_transform_sse2(pixels: &mut [u8], red_to_blue: u8, green_to_blue: u8, g
 /// Adds green to red and blue.
 #[inline]
 pub(crate) fn add_green(image_data: &mut [u8]) {
-    fearless_simd::kernel! {
+    entry! {
         fn enter(_token: Sse2, image_data: &mut [u8]) {
             add_green_sse2(image_data)
         }
@@ -273,7 +304,7 @@ pub(crate) fn add_green(image_data: &mut [u8]) {
     enter(baseline(), image_data)
 }
 
-#[target_feature(enable = "sse2")]
+#[cfg_attr(not(target_arch = "wasm32"), target_feature(enable = "sse2"))]
 fn add_green_sse2(image_data: &mut [u8]) {
     let n = image_data.len() / 4;
     let step = |v: __m128i| {

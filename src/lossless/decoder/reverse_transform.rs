@@ -38,9 +38,9 @@ pub(crate) fn apply_predictor_transform(
     if y0 == 0 {
         let row = &mut image_data[width * 4..];
         row[3] = row[3].wrapping_add(255);
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(decoder_simd)]
         super::simd::predict_left(row, 4..width * 4);
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(not(decoder_simd))]
         apply_predictor_transform_1(row, 4..width * 4, width);
     }
     for r in 1..=rows {
@@ -67,16 +67,16 @@ pub(crate) fn apply_predictor_transform(
             let end_index = (r * width + (end << size_bits).min(width)) * 4;
             block_x = end;
 
-            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            #[cfg(decoder_simd)]
             super::simd::predict(predictor, image_data, start_index..end_index, width);
-            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            #[cfg(not(decoder_simd))]
             predict_portable(predictor, image_data, start_index..end_index, width);
         }
     }
 }
 
 /// Undoes predictor `mode` over `image_data[range]` as [`apply_predictor_transform`] does per run of blocks.
-#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+#[cfg_attr(decoder_simd, allow(dead_code))]
 fn predict_portable(mode: u8, image_data: &mut [u8], range: Range<usize>, width: usize) {
     match mode {
         0 => apply_predictor_transform_0(image_data, range, width),
@@ -382,7 +382,7 @@ pub(crate) fn apply_color_transform(
     size_bits: u8,
     transform_data: &[u8],
 ) {
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(decoder_simd)]
     {
         let block_xsize = usize::from(subsample_size(width, size_bits));
         for (y, row) in (y0..).zip(image_data.chunks_exact_mut(usize::from(width) * 4)) {
@@ -390,11 +390,11 @@ pub(crate) fn apply_color_transform(
             super::simd::color_transform_row(row, 1 << size_bits, &transform_data[start..start + block_xsize * 4]);
         }
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(decoder_simd))]
     apply_color_transform_portable(image_data, width, y0, size_bits, transform_data);
 }
 
-#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+#[cfg_attr(decoder_simd, allow(dead_code))]
 pub(crate) fn apply_color_transform_portable(
     image_data: &mut [u8],
     width: u16,
@@ -437,13 +437,13 @@ pub(crate) fn apply_color_transform_portable(
 }
 
 pub(crate) fn apply_subtract_green_transform(image_data: &mut [u8]) {
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(decoder_simd)]
     super::simd::add_green(image_data);
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(decoder_simd))]
     apply_subtract_green_portable(image_data);
 }
 
-#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+#[cfg_attr(decoder_simd, allow(dead_code))]
 pub(crate) fn apply_subtract_green_portable(image_data: &mut [u8]) {
     for pixel in image_data.chunks_exact_mut(4) {
         pixel[0] = pixel[0].wrapping_add(pixel[1]);
@@ -771,7 +771,7 @@ mod benches {
 }
 
 /// The SIMD kernels against the portable ones.
-#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(test, decoder_simd))]
 mod simd_tests {
     use rand::{Rng, SeedableRng};
 

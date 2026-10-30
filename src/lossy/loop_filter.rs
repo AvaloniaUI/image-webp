@@ -448,18 +448,18 @@ pub(crate) fn macroblock_filter_vertical_n<const N: usize>(
     }
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(decoder_simd)]
 pub(crate) use super::simd::{
     h16, h16i, h8, h8i, simple_h16, simple_h16i, simple_v16, simple_v16i, v16, v16i, v8, v8i,
 };
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(not(decoder_simd))]
 pub(crate) use portable::{
     h16, h16i, h8, h8i, simple_h16, simple_h16i, simple_v16, simple_v16i, v16, v16i, v8, v8i,
 };
 
 /// libwebp's edge filters (`VP8VFilter16`, `VP8HFilter8i`, ...): `p` is the first pixel past
 /// the edge, or the macroblock origin for the inner edges (`i`).
-#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+#[cfg_attr(decoder_simd, allow(dead_code))]
 pub(crate) mod portable {
     use super::*;
 
@@ -772,7 +772,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(decoder_simd)]
     #[test]
     fn simd_edges_match_portable() {
         use super::portable as pf;

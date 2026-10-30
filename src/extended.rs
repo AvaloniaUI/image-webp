@@ -122,9 +122,9 @@ pub(crate) fn unfilter_alpha_row(method: FilteringMethod, prev: Option<&[u8]>, r
             if let (FilteringMethod::Horizontal, Some(prev)) = (method, prev) {
                 row[0] = row[0].wrapping_add(prev[0]);
             }
-            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            #[cfg(decoder_simd)]
             let x = crate::lossy::unfilter_horizontal(row, 1);
-            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            #[cfg(not(decoder_simd))]
             let x = 1;
             let mut left = row[x - 1];
             for a in &mut row[x..] {
@@ -141,14 +141,14 @@ pub(crate) fn unfilter_alpha_row(method: FilteringMethod, prev: Option<&[u8]>, r
             row[0] = row[0].wrapping_add(prev[0]);
             let mut x = 1;
             while x < row.len() {
-                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                #[cfg(decoder_simd)]
                 {
                     x = crate::lossy::unfilter_gradient(prev, row, x);
                 }
                 // After a block the running sum stopped at, the next 16 pixels; without it, all.
-                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                #[cfg(decoder_simd)]
                 let end = row.len().min(x + 16);
-                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                #[cfg(not(decoder_simd))]
                 let end = row.len();
                 let mut left = row[x - 1];
                 for ((a, &top), &top_left) in

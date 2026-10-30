@@ -83,7 +83,7 @@ pub(crate) fn luma_kind(n: usize, block: &[i16; 16]) -> u8 {
         // version saturates at other steps than the full transform, so aarch64 always takes it.
         if n <= 3
             && (cfg!(target_arch = "aarch64")
-                || cfg!(target_arch = "x86_64")
+                || cfg!(all(decoder_simd, any(target_arch = "x86", target_arch = "x86_64", target_arch = "wasm32")))
                     && ((i32::from(block[0]) + 8192) | (i32::from(block[1]) + 8192) | (i32::from(block[4]) + 8192)) as u32
                         >= 16384)
         {
@@ -132,7 +132,7 @@ pub(crate) fn add_coeffs_uv(
     stride: usize,
 ) {
     let blocks = &mut blocks[..64];
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(decoder_simd, any(target_arch = "x86", target_arch = "x86_64", target_arch = "wasm32")))]
     if kinds[..4].contains(&FULL) {
         super::simd::transform_add_two(&blocks[..32], dst, pos, stride);
         super::simd::transform_add_two(&blocks[32..], dst, pos + 4 * stride, stride);
@@ -158,17 +158,17 @@ pub(crate) fn add_coeffs_uv(
 
 #[inline(always)]
 fn add_dc(dc: i32, dst: &mut [u8], pos: usize, stride: usize) {
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(decoder_simd)]
     super::simd::add_dc(dc, dst, pos, stride);
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(decoder_simd))]
     add_dc_portable(dc, dst, pos, stride);
 }
 
 #[inline(always)]
 fn transform_add(block: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(decoder_simd)]
     super::simd::transform_add(block, dst, pos, stride);
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(decoder_simd))]
     transform_add_portable(block, dst, pos, stride);
 }
 
@@ -191,7 +191,7 @@ fn transform_ac3_add(block: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
     }
 }
 
-#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+#[cfg_attr(decoder_simd, allow(dead_code))]
 fn add_dc_portable(dc: i32, dst: &mut [u8], pos: usize, stride: usize) {
     for y in 0..4 {
         for p in &mut dst[pos + y * stride..][..4] {
@@ -200,7 +200,7 @@ fn add_dc_portable(dc: i32, dst: &mut [u8], pos: usize, stride: usize) {
     }
 }
 
-#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+#[cfg_attr(decoder_simd, allow(dead_code))]
 pub(crate) fn transform_add_portable(block: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
     let mut b: [i32; 16] = core::array::from_fn(|i| i32::from(block[i]));
     idct4x4(&mut b);
@@ -302,7 +302,7 @@ mod tests {
         assert_eq!(BLOCK, inverse_dct_block);
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(decoder_simd)]
     #[test]
     fn simd_transform_matches_portable() {
         use rand::{Rng, SeedableRng};
@@ -323,7 +323,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(decoder_simd, any(target_arch = "x86", target_arch = "x86_64", target_arch = "wasm32")))]
     #[test]
     fn two_blocks_match_one_at_a_time() {
         use rand::{Rng, SeedableRng};
@@ -341,7 +341,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(decoder_simd, any(target_arch = "x86", target_arch = "x86_64", target_arch = "wasm32")))]
     #[test]
     fn ac3_matches_the_32_bit_transform() {
         use rand::{Rng, SeedableRng};
@@ -368,7 +368,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(decoder_simd, any(target_arch = "x86", target_arch = "x86_64", target_arch = "wasm32")))]
     #[test]
     fn chroma_planes_with_ac_take_the_full_transform_on_every_block() {
         let stride = 9;

@@ -79,9 +79,9 @@ fn yuv_to_b(y: u8, u: u8) -> u8 {
 /// the other one (or `near` again at the image edges), with the same weights as
 /// `get_fancy_chroma_value`.
 pub(crate) fn upsample_chroma_row(near: &[u8], far: &[u8], out: &mut [u8]) {
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(decoder_simd)]
     let start = super::simd::upsample_pairs(near, far, out);
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(decoder_simd))]
     let start = 0;
     upsample_chroma_row_from(near, far, out, start);
 }
@@ -111,9 +111,9 @@ pub(crate) fn fill_row_yuv<const BPP: usize>(
     u_row: &[u8],
     v_row: &[u8],
 ) {
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(decoder_simd)]
     let done = super::simd::yuv_to_rgb_row::<BPP>(y_row, u_row, v_row, row_buffer);
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(decoder_simd))]
     let done = 0;
     fill_row_yuv_portable::<BPP>(
         &mut row_buffer[done * BPP..],
@@ -254,7 +254,7 @@ mod tests {
         assert_eq!(yuv_to_g(y, u, v), 255);
         assert_eq!(yuv_to_b(y, u), 40);
     }
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(decoder_simd)]
     #[test]
     fn simd_rows_match_portable() {
         use rand::{Rng, SeedableRng};
@@ -276,7 +276,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(decoder_simd)]
     #[test]
     fn simd_upsampling_matches_portable() {
         use rand::{Rng, SeedableRng};

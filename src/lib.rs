@@ -41,6 +41,8 @@ mod rescaler;
 mod wide;
 mod lossless;
 mod lossy;
+#[cfg(all(decoder_simd, target_arch = "wasm32"))]
+mod sse2_wasm;
 
 /// An implementation of the VP8 Video Codec
 ///

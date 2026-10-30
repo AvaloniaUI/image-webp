@@ -13,16 +13,16 @@ use arithmetic_decoder::{by_position, ArithmeticDecoder, ModeProbs, PlaneProbs};
 mod arithmetic_decoder;
 mod common;
 mod loop_filter;
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(decoder_simd, target_arch = "aarch64"))]
 mod neon;
 mod prediction;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(decoder_simd, any(target_arch = "x86", target_arch = "x86_64", target_arch = "wasm32")))]
 mod sse2;
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(decoder_simd, target_arch = "aarch64"))]
 use neon as simd;
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(decoder_simd)]
 pub(crate) use simd::{unfilter_gradient, unfilter_horizontal};
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(decoder_simd, any(target_arch = "x86", target_arch = "x86_64", target_arch = "wasm32")))]
 use sse2 as simd;
 mod transform;
 #[cfg(feature = "encoder")]

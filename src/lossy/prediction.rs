@@ -123,9 +123,9 @@ macro_rules! simd_or_portable {
     ($($name:ident: $simd:expr, $portable:ident;)*) => {$(
         #[inline(always)]
         fn $name(ws: &mut [u8], x0: usize, y0: usize, stride: usize) {
-            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            #[cfg(decoder_simd)]
             $simd(ws, y0 * stride + x0, stride);
-            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            #[cfg(not(decoder_simd))]
             $portable(ws, x0, y0, stride);
         }
     )*};
@@ -142,13 +142,13 @@ simd_or_portable! {
 
 /// TrueMotion of a `SIZE`x`SIZE` block at `x0`, `y0`.
 pub(crate) fn predict_tm<const SIZE: usize>(ws: &mut [u8], x0: usize, y0: usize, stride: usize) {
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(decoder_simd)]
     super::simd::tm::<SIZE>(ws, y0 * stride + x0, stride);
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(decoder_simd))]
     predict_tmpred(ws, SIZE, x0, y0, stride);
 }
 
-#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+#[cfg_attr(decoder_simd, allow(dead_code))]
 fn predict_btmpred(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     predict_tmpred(a, 4, x0, y0, stride);
 }
@@ -176,13 +176,13 @@ pub(crate) fn predict_hpred(a: &mut [u8], size: usize, x0: usize, y0: usize, str
 /// DC prediction of the `SIZE`x`SIZE` block at 1, 1 from the row above and the column to the
 /// left, as far as they are given.
 pub(crate) fn predict_dc<const SIZE: usize>(ws: &mut [u8], stride: usize, above: bool, left: bool) {
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(decoder_simd)]
     super::simd::dc::<SIZE>(ws, stride + 1, stride, above, left);
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(decoder_simd))]
     predict_dcpred(ws, SIZE, stride, above, left);
 }
 
-#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+#[cfg_attr(decoder_simd, allow(dead_code))]
 pub(crate) fn predict_dcpred(a: &mut [u8], size: usize, stride: usize, above: bool, left: bool) {
     let mut sum = 0;
     let mut shf = if size == 8 { 2 } else { 3 };
@@ -216,7 +216,7 @@ pub(crate) fn predict_dcpred(a: &mut [u8], size: usize, stride: usize, above: bo
 
 // Clippy suggests the clamp method, but it seems to optimize worse as of rustc 1.82.0 nightly.
 #[allow(clippy::manual_clamp)]
-#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+#[cfg_attr(decoder_simd, allow(dead_code))]
 pub(crate) fn predict_tmpred(a: &mut [u8], size: usize, x0: usize, y0: usize, stride: usize) {
     // The formula for tmpred is:
     // X_ij = L_i + A_j - P (i, j=0, 1, 2, 3)
@@ -328,7 +328,7 @@ fn edge_pixels(
     (e0, e1, e2, e3, e4, e5, e6, e7, e8)
 }
 
-#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+#[cfg_attr(decoder_simd, allow(dead_code))]
 pub(crate) fn predict_bvepred(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     let p = topleft_pixel(a, x0, y0, stride);
     let (a0, a1, a2, a3, a4, ..) = top_pixels(a, x0, y0, stride);
@@ -359,7 +359,7 @@ pub(crate) fn predict_bhepred(a: &mut [u8], x0: usize, y0: usize, stride: usize)
     put_rows(a, x0, y0, stride, rows.map(|v| [v; 4]));
 }
 
-#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+#[cfg_attr(decoder_simd, allow(dead_code))]
 pub(crate) fn predict_bldpred(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     let (a0, a1, a2, a3, a4, a5, a6, a7) = top_pixels(a, x0, y0, stride);
 
@@ -381,7 +381,7 @@ pub(crate) fn predict_bldpred(a: &mut [u8], x0: usize, y0: usize, stride: usize)
     }
 }
 
-#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+#[cfg_attr(decoder_simd, allow(dead_code))]
 pub(crate) fn predict_brdpred(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     let (e0, e1, e2, e3, e4, e5, e6, e7, e8) = edge_pixels(a, x0, y0, stride);
 
@@ -402,7 +402,7 @@ pub(crate) fn predict_brdpred(a: &mut [u8], x0: usize, y0: usize, stride: usize)
     }
 }
 
-#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+#[cfg_attr(decoder_simd, allow(dead_code))]
 pub(crate) fn predict_bvrpred(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     let (_, e1, e2, e3, e4, e5, e6, e7, e8) = edge_pixels(a, x0, y0, stride);
 
@@ -424,7 +424,7 @@ pub(crate) fn predict_bvrpred(a: &mut [u8], x0: usize, y0: usize, stride: usize)
     a[y0 * stride + x0 + 3] = avg2(e7, e8);
 }
 
-#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+#[cfg_attr(decoder_simd, allow(dead_code))]
 pub(crate) fn predict_bvlpred(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     let (a0, a1, a2, a3, a4, a5, a6, a7) = top_pixels(a, x0, y0, stride);
 
@@ -598,7 +598,7 @@ mod benches {
 mod tests {
     use super::*;
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(decoder_simd)]
     #[test]
     fn simd_predictors_match_portable() {
         use crate::lossy::simd;
@@ -647,7 +647,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(decoder_simd)]
     #[test]
     fn simd_dc_matches_portable() {
         use crate::lossy::simd;
