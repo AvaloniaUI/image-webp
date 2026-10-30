@@ -872,6 +872,10 @@ impl<'a> Vp8Decoder<'a> {
         if !mb.coeffs_skipped {
             self.partitions[p].top_up(&mut *self.source)?;
             self.read_residual_data(&mut mb, mbx, p, blocks, kinds)?;
+        } else if self.partitions[p].is_past_eof() {
+            // libwebp checks the token partition after every macroblock, one that reads
+            // nothing from it included.
+            return Err(DecodingError::BitStreamError);
         } else {
             let top = &mut self.top[mbx].complexity;
             if mb.luma_mode != LumaMode::B {
