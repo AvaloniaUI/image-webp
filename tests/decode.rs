@@ -252,8 +252,10 @@ fn test_vp8l_max_width_and_height_dimensions() {
 #[test]
 fn corrupt_token_partitions_are_errors() {
     // An empty token partition: a size-0 entry in the partition table, or a first partition
-    // size that moves the table so that it reads one.
-    for file in ["empty-token-partition", "short-first-partition"] {
+    // size that moves the table so that it reads one. In skipped-row-empty-partition the row
+    // over the empty partition reads no coefficients; libwebp rejects it all the same, since
+    // its reader marks an empty partition as ended before the first macroblock.
+    for file in ["empty-token-partition", "short-first-partition", "skipped-row-empty-partition"] {
         let data = std::fs::read(format!("tests/images/corrupt/{file}.webp")).unwrap();
         let mut decoder = image_webp::WebPDecoder::new(Cursor::new(&data)).unwrap();
         let mut buf = vec![0; decoder.output_buffer_size().unwrap()];
