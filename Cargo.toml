@@ -3,7 +3,7 @@ name = "image-webp"
 version = "0.2.4"
 edition = "2021"
 license = "(MIT OR Apache-2.0) AND BSD-3-Clause"
-rust-version = "1.88"
+rust-version = "1.89"
 
 description = "WebP encoding and decoding in pure Rust"
 homepage = "https://github.com/image-rs/image-webp"
@@ -16,6 +16,7 @@ include = ["/src", "LICENSE-APACHE", "LICENSE-LIBWEBP", "LICENSE-MIT", "README.m
 byteorder-lite = "0.1.0"
 quick-error = "2.0.1"
 safe_unaligned_simd = "0.2.5"
+fearless_simd = { version = "1.2", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 paste = "1.0.14"
@@ -28,8 +29,8 @@ default = ["encoder", "rescaler-simd"]
 # The lossy, lossless and alpha encoders, with their SSE2, AVX2 and NEON kernels.
 encoder = []
 # SSE2, AVX2 and NEON kernels for scaled decoding; without them the rescaler runs portable
-# code. They use `unsafe` loads and stores and AVX2 detection. The decoder kernels load and
-# store through slices; their only `unsafe` is the call into each kernel's SSE2 or NEON
-# body, which both targets have in their baseline.
+# code. They use `unsafe` loads and stores and AVX2 detection. The decoder kernels hold no
+# `unsafe`: they load and store through slices and are entered through fearless_simd's
+# `kernel!` with the SSE2 or NEON token of the target's baseline.
 rescaler-simd = []
 _benchmarks = []

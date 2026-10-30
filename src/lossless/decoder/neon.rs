@@ -1,18 +1,26 @@
 //! NEON kernels of the VP8L inverse transforms after libwebp's `dsp/lossless_neon.c`, bit-exact
 //! with the portable ones in `reverse_transform`. NEON is part of aarch64, so no runtime detection
-//! is needed; each entry point enters its kernel through one call that the baseline makes sound.
+//! is needed; each entry point enters its kernel through fearless_simd's `kernel!` with the
+//! baseline's NEON token.
 //! Memory goes through slices, through `safe_unaligned_simd` for four pixels. Pixels are RGBA
 //! bytes; every predictor works per channel, so the order is libwebp's.
 //!
 //! libwebp: Copyright Google Inc., BSD 3-Clause, see LICENSE-LIBWEBP.
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 use core::arch::aarch64::*;
 use safe_unaligned_simd::aarch64 as mem;
 use std::ops::Range;
 
-// The wrappers below enter the kernels without runtime detection.
+// Every entry enters its kernel with the NEON token of the target's baseline, which this
+// keeps present.
 const _: () = assert!(cfg!(target_feature = "neon"));
+
+/// The NEON token of the target's baseline.
+#[inline(always)]
+fn baseline() -> fearless_simd::aarch64::Neon {
+    fearless_simd::Level::baseline().as_neon().unwrap()
+}
 
 /// Four pixels of `b` from byte `at`.
 #[inline]
@@ -162,11 +170,13 @@ fn clamped_add_subtract_half(a: uint8x16_t, b: uint8x16_t, c: uint8x16_t) -> uin
 
 /// Predictor 1 on `image_data[range]`, which has a pixel before it.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn predict_left(image_data: &mut [u8], range: Range<usize>) {
-    // SAFETY: NEON is part of the target's baseline, so `predict_left_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { predict_left_neon(image_data, range) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, image_data: &mut [u8], range: Range<usize>) {
+            predict_left_neon(image_data, range)
+        }
+    }
+    enter(baseline(), image_data, range)
 }
 
 #[target_feature(enable = "neon")]
@@ -178,11 +188,13 @@ fn predict_left_neon(image_data: &mut [u8], range: Range<usize>) {
 /// Undoes predictor `mode` (0 to 15) over `image_data[range]`, the pixels of one row from its
 /// second on, below the row above at `width` pixels before them.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn predict(mode: u8, image_data: &mut [u8], range: Range<usize>, width: usize) {
-    // SAFETY: NEON is part of the target's baseline, so `predict_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { predict_neon(mode, image_data, range, width) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, mode: u8, image_data: &mut [u8], range: Range<usize>, width: usize) {
+            predict_neon(mode, image_data, range, width)
+        }
+    }
+    enter(baseline(), mode, image_data, range, width)
 }
 
 #[target_feature(enable = "neon")]
@@ -220,11 +232,13 @@ fn predict_neon(mode: u8, image_data: &mut [u8], range: Range<usize>, width: usi
 /// The colour transform over whole pixels of `row`, with one multiplier triple (red to blue,
 /// green to blue, green to red) per block of `block` pixels from `mults`.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn color_transform_row(row: &mut [u8], block: usize, mults: &[u8]) {
-    // SAFETY: NEON is part of the target's baseline, so `color_transform_row_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { color_transform_row_neon(row, block, mults) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, row: &mut [u8], block: usize, mults: &[u8]) {
+            color_transform_row_neon(row, block, mults)
+        }
+    }
+    enter(baseline(), row, block, mults)
 }
 
 #[target_feature(enable = "neon")]
@@ -271,11 +285,13 @@ fn color_transform(pixels: &mut [u8], red_to_blue: u8, green_to_blue: u8, green_
 
 /// Adds green to red and blue.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn add_green(image_data: &mut [u8]) {
-    // SAFETY: NEON is part of the target's baseline, so `add_green_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { add_green_neon(image_data) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, image_data: &mut [u8]) {
+            add_green_neon(image_data)
+        }
+    }
+    enter(baseline(), image_data)
 }
 
 #[target_feature(enable = "neon")]

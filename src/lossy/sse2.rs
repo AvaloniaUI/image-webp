@@ -5,10 +5,17 @@
 //! the loads and stores index the slice, through `safe_unaligned_simd` for 16 bytes.
 //!
 //! libwebp: Copyright Google Inc., BSD 3-Clause, see LICENSE-LIBWEBP.
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
-// The wrappers below enter the kernels without runtime detection.
+// Every entry enters its kernel with the SSE2 token of the target's baseline, which this
+// keeps present.
 const _: () = assert!(cfg!(target_feature = "sse2"));
+
+/// The SSE2 token of the target's baseline.
+#[inline(always)]
+fn baseline() -> fearless_simd::x86::Sse2 {
+    fearless_simd::Level::baseline().as_sse2().unwrap()
+}
 
 use core::arch::x86_64::*;
 use safe_unaligned_simd::x86_64 as mem;
@@ -343,11 +350,13 @@ fn complex_mask(
 }
 
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn simple_v16(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
-    // SAFETY: SSE2 is part of the target's baseline, so `simple_v16_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { simple_v16_sse2(buf, p, stride, thresh) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
+            simple_v16_sse2(buf, p, stride, thresh)
+        }
+    }
+    enter(baseline(), buf, p, stride, thresh)
 }
 
 #[target_feature(enable = "sse2")]
@@ -363,11 +372,13 @@ fn simple_v16_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
 }
 
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn simple_h16(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
-    // SAFETY: SSE2 is part of the target's baseline, so `simple_h16_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { simple_h16_sse2(buf, p, stride, thresh) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
+            simple_h16_sse2(buf, p, stride, thresh)
+        }
+    }
+    enter(baseline(), buf, p, stride, thresh)
 }
 
 #[target_feature(enable = "sse2")]
@@ -380,11 +391,13 @@ fn simple_h16_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
 }
 
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn simple_v16i(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
-    // SAFETY: SSE2 is part of the target's baseline, so `simple_v16i_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { simple_v16i_sse2(buf, p, stride, thresh) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
+            simple_v16i_sse2(buf, p, stride, thresh)
+        }
+    }
+    enter(baseline(), buf, p, stride, thresh)
 }
 
 #[target_feature(enable = "sse2")]
@@ -395,11 +408,13 @@ fn simple_v16i_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
 }
 
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn simple_h16i(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
-    // SAFETY: SSE2 is part of the target's baseline, so `simple_h16i_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { simple_h16i_sse2(buf, p, stride, thresh) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
+            simple_h16i_sse2(buf, p, stride, thresh)
+        }
+    }
+    enter(baseline(), buf, p, stride, thresh)
 }
 
 #[target_feature(enable = "sse2")]
@@ -410,11 +425,13 @@ fn simple_h16i_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
 }
 
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn v16(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    // SAFETY: SSE2 is part of the target's baseline, so `v16_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { v16_sse2(buf, p, stride, thresh, ithresh, hev) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
+            v16_sse2(buf, p, stride, thresh, ithresh, hev)
+        }
+    }
+    enter(baseline(), buf, p, stride, thresh, ithresh, hev)
 }
 
 #[target_feature(enable = "sse2")]
@@ -436,11 +453,13 @@ fn v16_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, he
 }
 
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn h16(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    // SAFETY: SSE2 is part of the target's baseline, so `h16_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { h16_sse2(buf, p, stride, thresh, ithresh, hev) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
+            h16_sse2(buf, p, stride, thresh, ithresh, hev)
+        }
+    }
+    enter(baseline(), buf, p, stride, thresh, ithresh, hev)
 }
 
 #[target_feature(enable = "sse2")]
@@ -460,11 +479,13 @@ fn h16_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, he
 }
 
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn v16i(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    // SAFETY: SSE2 is part of the target's baseline, so `v16i_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { v16i_sse2(buf, p, stride, thresh, ithresh, hev) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
+            v16i_sse2(buf, p, stride, thresh, ithresh, hev)
+        }
+    }
+    enter(baseline(), buf, p, stride, thresh, ithresh, hev)
 }
 
 #[target_feature(enable = "sse2")]
@@ -497,11 +518,13 @@ fn v16i_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, h
 }
 
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn h16i(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    // SAFETY: SSE2 is part of the target's baseline, so `h16i_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { h16i_sse2(buf, p, stride, thresh, ithresh, hev) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
+            h16i_sse2(buf, p, stride, thresh, ithresh, hev)
+        }
+    }
+    enter(baseline(), buf, p, stride, thresh, ithresh, hev)
 }
 
 #[target_feature(enable = "sse2")]
@@ -526,11 +549,13 @@ fn h16i_sse2(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, h
 
 #[allow(clippy::too_many_arguments)]
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn v8(u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    // SAFETY: SSE2 is part of the target's baseline, so `v8_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { v8_sse2(u, v, p, stride, thresh, ithresh, hev) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
+            v8_sse2(u, v, p, stride, thresh, ithresh, hev)
+        }
+    }
+    enter(baseline(), u, v, p, stride, thresh, ithresh, hev)
 }
 
 #[target_feature(enable = "sse2")]
@@ -562,11 +587,13 @@ fn v8_sse2(
 
 #[allow(clippy::too_many_arguments)]
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn h8(u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    // SAFETY: SSE2 is part of the target's baseline, so `h8_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { h8_sse2(u, v, p, stride, thresh, ithresh, hev) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
+            h8_sse2(u, v, p, stride, thresh, ithresh, hev)
+        }
+    }
+    enter(baseline(), u, v, p, stride, thresh, ithresh, hev)
 }
 
 #[target_feature(enable = "sse2")]
@@ -596,11 +623,13 @@ fn h8_sse2(
 
 #[allow(clippy::too_many_arguments)]
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn v8i(u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    // SAFETY: SSE2 is part of the target's baseline, so `v8i_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { v8i_sse2(u, v, p, stride, thresh, ithresh, hev) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
+            v8i_sse2(u, v, p, stride, thresh, ithresh, hev)
+        }
+    }
+    enter(baseline(), u, v, p, stride, thresh, ithresh, hev)
 }
 
 #[target_feature(enable = "sse2")]
@@ -629,11 +658,13 @@ fn v8i_sse2(
 
 #[allow(clippy::too_many_arguments)]
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn h8i(u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    // SAFETY: SSE2 is part of the target's baseline, so `h8i_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { h8i_sse2(u, v, p, stride, thresh, ithresh, hev) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
+            h8i_sse2(u, v, p, stride, thresh, ithresh, hev)
+        }
+    }
+    enter(baseline(), u, v, p, stride, thresh, ithresh, hev)
 }
 
 #[target_feature(enable = "sse2")]
@@ -706,11 +737,18 @@ fn planar_to_24b_step(i: [__m128i; 6]) -> [__m128i; 6] {
 /// full-width chroma, 32 or 8 pixels at a time as libwebp's `VP8YuvToRgb32_SSE2` and
 /// `VP8YuvToRgba32_SSE2`. Returns how many pixels it converted.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn yuv_to_rgb_row<const BPP: usize>(y: &[u8], u: &[u8], v: &[u8], out: &mut [u8]) -> usize {
-    // SAFETY: SSE2 is part of the target's baseline, so `yuv_to_rgb_row_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { yuv_to_rgb_row_sse2::<BPP>(y, u, v, out) }
+    const { assert!(BPP == 3 || BPP == 4) };
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, bpp: usize, y: &[u8], u: &[u8], v: &[u8], out: &mut [u8]) -> usize {
+            match bpp {
+                3 => yuv_to_rgb_row_sse2::<3>(y, u, v, out),
+                4 => yuv_to_rgb_row_sse2::<4>(y, u, v, out),
+                _ => unreachable!(),
+            }
+        }
+    }
+    enter(baseline(), BPP, y, u, v, out)
 }
 
 #[target_feature(enable = "sse2")]
@@ -725,11 +763,18 @@ fn yuv_to_rgb_row_sse2<const BPP: usize>(
 
 /// `yuv_to_rgb_row` with the pixels before `i` already converted.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn yuv_to_rgb_row_from<const BPP: usize>(y: &[u8], u: &[u8], v: &[u8], out: &mut [u8], i: usize) -> usize {
-    // SAFETY: SSE2 is part of the target's baseline, so `yuv_to_rgb_row_from_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { yuv_to_rgb_row_from_sse2::<BPP>(y, u, v, out, i) }
+    const { assert!(BPP == 3 || BPP == 4) };
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, bpp: usize, y: &[u8], u: &[u8], v: &[u8], out: &mut [u8], i: usize) -> usize {
+            match bpp {
+                3 => yuv_to_rgb_row_from_sse2::<3>(y, u, v, out, i),
+                4 => yuv_to_rgb_row_from_sse2::<4>(y, u, v, out, i),
+                _ => unreachable!(),
+            }
+        }
+    }
+    enter(baseline(), BPP, y, u, v, out, i)
 }
 
 #[target_feature(enable = "sse2")]
@@ -848,11 +893,13 @@ fn load_coeffs4(block: &[i16], at: usize) -> __m128i {
 /// libwebp's `Transform_SSE2` for one block: the inverse transform of `block` (16
 /// coefficients that fit 16 bits) added to the 4x4 pixels at `pos` of `dst`.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn transform_add(block: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
-    // SAFETY: SSE2 is part of the target's baseline, so `transform_add_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { transform_add_sse2(block, dst, pos, stride) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, block: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
+            transform_add_sse2(block, dst, pos, stride)
+        }
+    }
+    enter(baseline(), block, dst, pos, stride)
 }
 
 #[target_feature(enable = "sse2")]
@@ -879,11 +926,13 @@ fn transform_add_sse2(block: &[i16], dst: &mut [u8], pos: usize, stride: usize) 
 /// libwebp's `Transform_SSE2` for two blocks side by side (`do_two`): the inverse transforms of
 /// `blocks` (32 coefficients that fit 16 bits) added to the 8x4 pixels at `pos` of `dst`.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn transform_add_two(blocks: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
-    // SAFETY: SSE2 is part of the target's baseline, so `transform_add_two_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { transform_add_two_sse2(blocks, dst, pos, stride) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, blocks: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
+            transform_add_two_sse2(blocks, dst, pos, stride)
+        }
+    }
+    enter(baseline(), blocks, dst, pos, stride)
 }
 
 #[target_feature(enable = "sse2")]
@@ -905,11 +954,13 @@ fn transform_add_two_sse2(blocks: &[i16], dst: &mut [u8], pos: usize, stride: us
 /// The interpolated pixels `out[2 * j + 1]` and `out[2 * j + 2]` of the leading chroma pairs
 /// `j` of `upsample_chroma_row`, 8 pairs at a time. Returns how many pairs it did.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn upsample_pairs(near: &[u8], far: &[u8], out: &mut [u8]) -> usize {
-    // SAFETY: SSE2 is part of the target's baseline, so `upsample_pairs_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { upsample_pairs_sse2(near, far, out) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, near: &[u8], far: &[u8], out: &mut [u8]) -> usize {
+            upsample_pairs_sse2(near, far, out)
+        }
+    }
+    enter(baseline(), near, far, out)
 }
 
 #[target_feature(enable = "sse2")]
@@ -919,11 +970,13 @@ fn upsample_pairs_sse2(near: &[u8], far: &[u8], out: &mut [u8]) -> usize {
 
 /// `upsample_pairs` with the pairs before `j` already done.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn upsample_pairs_from(near: &[u8], far: &[u8], out: &mut [u8], j: usize) -> usize {
-    // SAFETY: SSE2 is part of the target's baseline, so `upsample_pairs_from_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { upsample_pairs_from_sse2(near, far, out, j) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, near: &[u8], far: &[u8], out: &mut [u8], j: usize) -> usize {
+            upsample_pairs_from_sse2(near, far, out, j)
+        }
+    }
+    enter(baseline(), near, far, out, j)
 }
 
 #[target_feature(enable = "sse2")]
@@ -982,11 +1035,18 @@ fn upsample_pairs_from_sse2(near: &[u8], far: &[u8], out: &mut [u8], mut j: usiz
 /// a `SIZE`x`SIZE` block (8 or 16) at `p` set to the rounded mean of the row above and the
 /// column to the left, as far as they are given.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn dc<const SIZE: usize>(buf: &mut [u8], p: usize, stride: usize, top: bool, left: bool) {
-    // SAFETY: SSE2 is part of the target's baseline, so `dc_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { dc_sse2::<SIZE>(buf, p, stride, top, left) }
+    const { assert!(SIZE == 8 || SIZE == 16) };
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, size: usize, buf: &mut [u8], p: usize, stride: usize, top: bool, left: bool) {
+            match size {
+                8 => dc_sse2::<8>(buf, p, stride, top, left),
+                16 => dc_sse2::<16>(buf, p, stride, top, left),
+                _ => unreachable!(),
+            }
+        }
+    }
+    enter(baseline(), SIZE, buf, p, stride, top, left)
 }
 
 #[target_feature(enable = "sse2")]
@@ -1032,11 +1092,13 @@ fn dc_sse2<const SIZE: usize>(
 /// libwebp's `TransformDC`: `dc` (the DC coefficient plus rounding, shifted) added to the
 /// 4x4 pixels at `pos` of `dst`.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn add_dc(dc: i32, dst: &mut [u8], pos: usize, stride: usize) {
-    // SAFETY: SSE2 is part of the target's baseline, so `add_dc_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { add_dc_sse2(dc, dst, pos, stride) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, dc: i32, dst: &mut [u8], pos: usize, stride: usize) {
+            add_dc_sse2(dc, dst, pos, stride)
+        }
+    }
+    enter(baseline(), dc, dst, pos, stride)
 }
 
 #[target_feature(enable = "sse2")]
@@ -1070,11 +1132,13 @@ fn check4(len: usize, p: usize, stride: usize) {
 
 /// libwebp's `VE4_SSE2`.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn ve4(buf: &mut [u8], p: usize, stride: usize) {
-    // SAFETY: SSE2 is part of the target's baseline, so `ve4_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { ve4_sse2(buf, p, stride) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize) {
+            ve4_sse2(buf, p, stride)
+        }
+    }
+    enter(baseline(), buf, p, stride)
 }
 
 #[target_feature(enable = "sse2")]
@@ -1089,11 +1153,13 @@ fn ve4_sse2(buf: &mut [u8], p: usize, stride: usize) {
 
 /// libwebp's `LD4_SSE2`.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn ld4(buf: &mut [u8], p: usize, stride: usize) {
-    // SAFETY: SSE2 is part of the target's baseline, so `ld4_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { ld4_sse2(buf, p, stride) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize) {
+            ld4_sse2(buf, p, stride)
+        }
+    }
+    enter(baseline(), buf, p, stride)
 }
 
 #[target_feature(enable = "sse2")]
@@ -1111,11 +1177,13 @@ fn ld4_sse2(buf: &mut [u8], p: usize, stride: usize) {
 
 /// libwebp's `RD4_SSE2`.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn rd4(buf: &mut [u8], p: usize, stride: usize) {
-    // SAFETY: SSE2 is part of the target's baseline, so `rd4_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { rd4_sse2(buf, p, stride) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize) {
+            rd4_sse2(buf, p, stride)
+        }
+    }
+    enter(baseline(), buf, p, stride)
 }
 
 #[target_feature(enable = "sse2")]
@@ -1136,11 +1204,13 @@ fn rd4_sse2(buf: &mut [u8], p: usize, stride: usize) {
 
 /// libwebp's `VR4_SSE2`.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn vr4(buf: &mut [u8], p: usize, stride: usize) {
-    // SAFETY: SSE2 is part of the target's baseline, so `vr4_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { vr4_sse2(buf, p, stride) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize) {
+            vr4_sse2(buf, p, stride)
+        }
+    }
+    enter(baseline(), buf, p, stride)
 }
 
 #[target_feature(enable = "sse2")]
@@ -1168,11 +1238,13 @@ fn vr4_sse2(buf: &mut [u8], p: usize, stride: usize) {
 
 /// libwebp's `VL4_SSE2`.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn vl4(buf: &mut [u8], p: usize, stride: usize) {
-    // SAFETY: SSE2 is part of the target's baseline, so `vl4_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { vl4_sse2(buf, p, stride) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, buf: &mut [u8], p: usize, stride: usize) {
+            vl4_sse2(buf, p, stride)
+        }
+    }
+    enter(baseline(), buf, p, stride)
 }
 
 #[target_feature(enable = "sse2")]
@@ -1199,11 +1271,19 @@ fn vl4_sse2(buf: &mut [u8], p: usize, stride: usize) {
 
 /// libwebp's `TrueMotion_SSE2` of a `SIZE`x`SIZE` block (4, 8 or 16) at `p`.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn tm<const SIZE: usize>(buf: &mut [u8], p: usize, stride: usize) {
-    // SAFETY: SSE2 is part of the target's baseline, so `tm_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { tm_sse2::<SIZE>(buf, p, stride) }
+    const { assert!(SIZE == 4 || SIZE == 8 || SIZE == 16) };
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, size: usize, buf: &mut [u8], p: usize, stride: usize) {
+            match size {
+                4 => tm_sse2::<4>(buf, p, stride),
+                8 => tm_sse2::<8>(buf, p, stride),
+                16 => tm_sse2::<16>(buf, p, stride),
+                _ => unreachable!(),
+            }
+        }
+    }
+    enter(baseline(), SIZE, buf, p, stride)
 }
 
 #[target_feature(enable = "sse2")]
@@ -1253,11 +1333,13 @@ fn running_sum(x: __m128i, left: __m128i) -> __m128i {
 /// needs clamping. Returns where it stopped: at a block that clamps or with fewer than 16
 /// pixels left.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn unfilter_gradient(prev: &[u8], row: &mut [u8], x: usize) -> usize {
-    // SAFETY: SSE2 is part of the target's baseline, so `unfilter_gradient_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { unfilter_gradient_sse2(prev, row, x) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, prev: &[u8], row: &mut [u8], x: usize) -> usize {
+            unfilter_gradient_sse2(prev, row, x)
+        }
+    }
+    enter(baseline(), prev, row, x)
 }
 
 #[target_feature(enable = "sse2")]
@@ -1301,11 +1383,13 @@ fn unfilter_gradient_sse2(prev: &[u8], row: &mut [u8], mut x: usize) -> usize {
 /// The horizontal alpha unfiltering of `row[x..]` (`row[x - 1]` done), a running sum 16
 /// pixels at a time. Returns where it stopped, with fewer than 16 pixels left.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn unfilter_horizontal(row: &mut [u8], x: usize) -> usize {
-    // SAFETY: SSE2 is part of the target's baseline, so `unfilter_horizontal_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { unfilter_horizontal_sse2(row, x) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, row: &mut [u8], x: usize) -> usize {
+            unfilter_horizontal_sse2(row, x)
+        }
+    }
+    enter(baseline(), row, x)
 }
 
 #[target_feature(enable = "sse2")]

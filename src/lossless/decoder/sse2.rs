@@ -5,10 +5,17 @@
 //! `safe_unaligned_simd` for four pixels.
 //!
 //! libwebp: Copyright Google Inc., BSD 3-Clause, see LICENSE-LIBWEBP.
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
-// The wrappers below enter the kernels without runtime detection.
+// Every entry enters its kernel with the SSE2 token of the target's baseline, which this
+// keeps present.
 const _: () = assert!(cfg!(target_feature = "sse2"));
+
+/// The SSE2 token of the target's baseline.
+#[inline(always)]
+fn baseline() -> fearless_simd::x86::Sse2 {
+    fearless_simd::Level::baseline().as_sse2().unwrap()
+}
 
 use core::arch::x86_64::*;
 use safe_unaligned_simd::x86_64 as mem;
@@ -128,11 +135,13 @@ fn add_left(b: &mut [u8], out: usize, n: usize) {
 
 /// Predictor 1 on `image_data[range]`, which has a pixel before it.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn predict_left(image_data: &mut [u8], range: Range<usize>) {
-    // SAFETY: SSE2 is part of the target's baseline, so `predict_left_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { predict_left_sse2(image_data, range) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, image_data: &mut [u8], range: Range<usize>) {
+            predict_left_sse2(image_data, range)
+        }
+    }
+    enter(baseline(), image_data, range)
 }
 
 #[target_feature(enable = "sse2")]
@@ -144,11 +153,13 @@ fn predict_left_sse2(image_data: &mut [u8], range: Range<usize>) {
 /// Undoes predictor `mode` (0 to 15) over `image_data[range]`, the pixels of one row from its
 /// second on, below the row above at `width` pixels before them.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn predict(mode: u8, image_data: &mut [u8], range: Range<usize>, width: usize) {
-    // SAFETY: SSE2 is part of the target's baseline, so `predict_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { predict_sse2(mode, image_data, range, width) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, mode: u8, image_data: &mut [u8], range: Range<usize>, width: usize) {
+            predict_sse2(mode, image_data, range, width)
+        }
+    }
+    enter(baseline(), mode, image_data, range, width)
 }
 
 #[target_feature(enable = "sse2")]
@@ -193,11 +204,13 @@ fn predict_sse2(mode: u8, image_data: &mut [u8], range: Range<usize>, width: usi
 /// The colour transform over whole pixels of `row`, with one multiplier triple (red to blue,
 /// green to blue, green to red) per block of `block` pixels from `mults`.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn color_transform_row(row: &mut [u8], block: usize, mults: &[u8]) {
-    // SAFETY: SSE2 is part of the target's baseline, so `color_transform_row_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { color_transform_row_sse2(row, block, mults) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, row: &mut [u8], block: usize, mults: &[u8]) {
+            color_transform_row_sse2(row, block, mults)
+        }
+    }
+    enter(baseline(), row, block, mults)
 }
 
 #[target_feature(enable = "sse2")]
@@ -213,11 +226,13 @@ fn color_transform_row_sse2(row: &mut [u8], block: usize, mults: &[u8]) {
 /// where RGBA keeps them: the deltas `(t * c) >> 5` of signed bytes are the high halves of the
 /// 16-bit products of `c << 8` and `t << 3`.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn color_transform(pixels: &mut [u8], red_to_blue: u8, green_to_blue: u8, green_to_red: u8) {
-    // SAFETY: SSE2 is part of the target's baseline, so `color_transform_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { color_transform_sse2(pixels, red_to_blue, green_to_blue, green_to_red) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, pixels: &mut [u8], red_to_blue: u8, green_to_blue: u8, green_to_red: u8) {
+            color_transform_sse2(pixels, red_to_blue, green_to_blue, green_to_red)
+        }
+    }
+    enter(baseline(), pixels, red_to_blue, green_to_blue, green_to_red)
 }
 
 #[target_feature(enable = "sse2")]
@@ -249,11 +264,13 @@ fn color_transform_sse2(pixels: &mut [u8], red_to_blue: u8, green_to_blue: u8, g
 
 /// Adds green to red and blue.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn add_green(image_data: &mut [u8]) {
-    // SAFETY: SSE2 is part of the target's baseline, so `add_green_sse2` runs on every
-    // CPU this code is compiled for.
-    unsafe { add_green_sse2(image_data) }
+    fearless_simd::kernel! {
+        fn enter(_token: Sse2, image_data: &mut [u8]) {
+            add_green_sse2(image_data)
+        }
+    }
+    enter(baseline(), image_data)
 }
 
 #[target_feature(enable = "sse2")]

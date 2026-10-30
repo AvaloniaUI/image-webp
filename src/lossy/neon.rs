@@ -1,18 +1,25 @@
 //! NEON decoder kernels with the API of `sse2.rs`, ported from libwebp's `dsp/dec_neon.c`,
 //! `dsp/upsampling_neon.c` and the SSE2 kernels, bit-exact with the portable ones. NEON is
 //! part of aarch64, so no runtime detection is needed; each entry point enters its kernel
-//! through one call that the baseline makes sound. Memory goes through slices, through
+//! through fearless_simd's `kernel!` with the baseline's NEON token. Memory goes through slices, through
 //! `safe_unaligned_simd` for whole registers. Each kernel checks the bounds its loads and
 //! stores rely on; `p` is the offset of the first pixel past the edge.
 //!
 //! libwebp: Copyright Google Inc., BSD 3-Clause, see LICENSE-LIBWEBP.
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 use core::arch::aarch64::*;
 use safe_unaligned_simd::aarch64 as mem;
 
-// The wrappers below enter the kernels without runtime detection.
+// Every entry enters its kernel with the NEON token of the target's baseline, which this
+// keeps present.
 const _: () = assert!(cfg!(target_feature = "neon"));
+
+/// The NEON token of the target's baseline.
+#[inline(always)]
+fn baseline() -> fearless_simd::aarch64::Neon {
+    fearless_simd::Level::baseline().as_neon().unwrap()
+}
 
 #[inline]
 #[target_feature(enable = "neon")]
@@ -282,11 +289,13 @@ fn store8x16t_uv(c: [uint8x16_t; 8], u: &mut [u8], v: &mut [u8], at: usize, stri
 }
 
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn simple_v16(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
-    // SAFETY: NEON is part of the target's baseline, so `simple_v16_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { simple_v16_neon(buf, p, stride, thresh) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
+            simple_v16_neon(buf, p, stride, thresh)
+        }
+    }
+    enter(baseline(), buf, p, stride, thresh)
 }
 
 #[target_feature(enable = "neon")]
@@ -302,11 +311,13 @@ fn simple_v16_neon(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
 }
 
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn simple_h16(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
-    // SAFETY: NEON is part of the target's baseline, so `simple_h16_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { simple_h16_neon(buf, p, stride, thresh) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
+            simple_h16_neon(buf, p, stride, thresh)
+        }
+    }
+    enter(baseline(), buf, p, stride, thresh)
 }
 
 #[target_feature(enable = "neon")]
@@ -321,11 +332,13 @@ fn simple_h16_neon(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
 }
 
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn simple_v16i(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
-    // SAFETY: NEON is part of the target's baseline, so `simple_v16i_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { simple_v16i_neon(buf, p, stride, thresh) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
+            simple_v16i_neon(buf, p, stride, thresh)
+        }
+    }
+    enter(baseline(), buf, p, stride, thresh)
 }
 
 #[target_feature(enable = "neon")]
@@ -336,11 +349,13 @@ fn simple_v16i_neon(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
 }
 
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn simple_h16i(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
-    // SAFETY: NEON is part of the target's baseline, so `simple_h16i_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { simple_h16i_neon(buf, p, stride, thresh) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
+            simple_h16i_neon(buf, p, stride, thresh)
+        }
+    }
+    enter(baseline(), buf, p, stride, thresh)
 }
 
 #[target_feature(enable = "neon")]
@@ -351,11 +366,13 @@ fn simple_h16i_neon(buf: &mut [u8], p: usize, stride: usize, thresh: u8) {
 }
 
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn v16(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    // SAFETY: NEON is part of the target's baseline, so `v16_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { v16_neon(buf, p, stride, thresh, ithresh, hev) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
+            v16_neon(buf, p, stride, thresh, ithresh, hev)
+        }
+    }
+    enter(baseline(), buf, p, stride, thresh, ithresh, hev)
 }
 
 #[target_feature(enable = "neon")]
@@ -374,11 +391,13 @@ fn v16_neon(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, he
 }
 
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn h16(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    // SAFETY: NEON is part of the target's baseline, so `h16_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { h16_neon(buf, p, stride, thresh, ithresh, hev) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
+            h16_neon(buf, p, stride, thresh, ithresh, hev)
+        }
+    }
+    enter(baseline(), buf, p, stride, thresh, ithresh, hev)
 }
 
 #[target_feature(enable = "neon")]
@@ -394,11 +413,13 @@ fn h16_neon(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, he
 }
 
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn v16i(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    // SAFETY: NEON is part of the target's baseline, so `v16i_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { v16i_neon(buf, p, stride, thresh, ithresh, hev) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
+            v16i_neon(buf, p, stride, thresh, ithresh, hev)
+        }
+    }
+    enter(baseline(), buf, p, stride, thresh, ithresh, hev)
 }
 
 #[target_feature(enable = "neon")]
@@ -432,11 +453,13 @@ fn v16i_neon(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, h
 }
 
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn h16i(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    // SAFETY: NEON is part of the target's baseline, so `h16i_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { h16i_neon(buf, p, stride, thresh, ithresh, hev) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
+            h16i_neon(buf, p, stride, thresh, ithresh, hev)
+        }
+    }
+    enter(baseline(), buf, p, stride, thresh, ithresh, hev)
 }
 
 #[target_feature(enable = "neon")]
@@ -471,11 +494,13 @@ fn h16i_neon(buf: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, h
 
 #[allow(clippy::too_many_arguments)]
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn v8(u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    // SAFETY: NEON is part of the target's baseline, so `v8_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { v8_neon(u, v, p, stride, thresh, ithresh, hev) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
+            v8_neon(u, v, p, stride, thresh, ithresh, hev)
+        }
+    }
+    enter(baseline(), u, v, p, stride, thresh, ithresh, hev)
 }
 
 #[target_feature(enable = "neon")]
@@ -496,11 +521,13 @@ fn v8_neon(u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithr
 
 #[allow(clippy::too_many_arguments)]
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn h8(u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    // SAFETY: NEON is part of the target's baseline, so `h8_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { h8_neon(u, v, p, stride, thresh, ithresh, hev) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
+            h8_neon(u, v, p, stride, thresh, ithresh, hev)
+        }
+    }
+    enter(baseline(), u, v, p, stride, thresh, ithresh, hev)
 }
 
 #[target_feature(enable = "neon")]
@@ -517,11 +544,13 @@ fn h8_neon(u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithr
 
 #[allow(clippy::too_many_arguments)]
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn v8i(u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    // SAFETY: NEON is part of the target's baseline, so `v8i_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { v8i_neon(u, v, p, stride, thresh, ithresh, hev) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
+            v8i_neon(u, v, p, stride, thresh, ithresh, hev)
+        }
+    }
+    enter(baseline(), u, v, p, stride, thresh, ithresh, hev)
 }
 
 #[target_feature(enable = "neon")]
@@ -541,11 +570,13 @@ fn v8i_neon(u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ith
 
 #[allow(clippy::too_many_arguments)]
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn h8i(u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
-    // SAFETY: NEON is part of the target's baseline, so `h8i_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { h8i_neon(u, v, p, stride, thresh, ithresh, hev) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, u: &mut [u8], v: &mut [u8], p: usize, stride: usize, thresh: u8, ithresh: u8, hev: u8) {
+            h8i_neon(u, v, p, stride, thresh, ithresh, hev)
+        }
+    }
+    enter(baseline(), u, v, p, stride, thresh, ithresh, hev)
 }
 
 #[target_feature(enable = "neon")]
@@ -582,11 +613,18 @@ fn yuv444_to_rgb(y: &[u8], u: &[u8], v: &[u8], at: usize) -> [uint8x8_t; 3] {
 /// RGB (`BPP` 3) or RGBA with alpha 255 (`BPP` 4) of the leading pixels of a row with
 /// full-width chroma, 16 or 8 pixels at a time. Returns how many pixels it converted.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn yuv_to_rgb_row<const BPP: usize>(y: &[u8], u: &[u8], v: &[u8], out: &mut [u8]) -> usize {
-    // SAFETY: NEON is part of the target's baseline, so `yuv_to_rgb_row_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { yuv_to_rgb_row_neon::<BPP>(y, u, v, out) }
+    const { assert!(BPP == 3 || BPP == 4) };
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, bpp: usize, y: &[u8], u: &[u8], v: &[u8], out: &mut [u8]) -> usize {
+            match bpp {
+                3 => yuv_to_rgb_row_neon::<3>(y, u, v, out),
+                4 => yuv_to_rgb_row_neon::<4>(y, u, v, out),
+                _ => unreachable!(),
+            }
+        }
+    }
+    enter(baseline(), BPP, y, u, v, out)
 }
 
 #[target_feature(enable = "neon")]
@@ -663,11 +701,13 @@ fn add_row(b: &mut [u8], at: usize, t: int16x4_t) {
 /// libwebp's `TransformOne_NEON`: the inverse transform of `block` (16 coefficients that fit 16
 /// bits) in saturating 16 bits, added to the 4x4 pixels at `pos` of `dst`.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn transform_add(block: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
-    // SAFETY: NEON is part of the target's baseline, so `transform_add_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { transform_add_neon(block, dst, pos, stride) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, block: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
+            transform_add_neon(block, dst, pos, stride)
+        }
+    }
+    enter(baseline(), block, dst, pos, stride)
 }
 
 #[target_feature(enable = "neon")]
@@ -685,11 +725,13 @@ fn transform_add_neon(block: &[i16], dst: &mut [u8], pos: usize, stride: usize) 
 /// libwebp's `TransformAC3_NEON`: the inverse transform of `block`, whose only coefficients are
 /// 0, 1 and 4, in saturating 16 bits, added to the 4x4 pixels at `pos` of `dst`.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn transform_ac3_add(block: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
-    // SAFETY: NEON is part of the target's baseline, so `transform_ac3_add_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { transform_ac3_add_neon(block, dst, pos, stride) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, block: &[i16], dst: &mut [u8], pos: usize, stride: usize) {
+            transform_ac3_add_neon(block, dst, pos, stride)
+        }
+    }
+    enter(baseline(), block, dst, pos, stride)
 }
 
 #[target_feature(enable = "neon")]
@@ -712,11 +754,13 @@ fn transform_ac3_add_neon(block: &[i16], dst: &mut [u8], pos: usize, stride: usi
 /// `j` of `upsample_chroma_row`, 16 or 8 pairs at a time in 8 bits as libwebp's
 /// `UPSAMPLE_16PIXELS`. Returns how many pairs it did.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn upsample_pairs(near: &[u8], far: &[u8], out: &mut [u8]) -> usize {
-    // SAFETY: NEON is part of the target's baseline, so `upsample_pairs_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { upsample_pairs_neon(near, far, out) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, near: &[u8], far: &[u8], out: &mut [u8]) -> usize {
+            upsample_pairs_neon(near, far, out)
+        }
+    }
+    enter(baseline(), near, far, out)
 }
 
 #[target_feature(enable = "neon")]
@@ -760,11 +804,18 @@ fn upsample_pairs_neon(near: &[u8], far: &[u8], out: &mut [u8]) -> usize {
 /// `SIZE`x`SIZE` block (8 or 16) at `p` set to the rounded mean of the row above and the
 /// column to the left, as far as they are given.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn dc<const SIZE: usize>(buf: &mut [u8], p: usize, stride: usize, top: bool, left: bool) {
-    // SAFETY: NEON is part of the target's baseline, so `dc_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { dc_neon::<SIZE>(buf, p, stride, top, left) }
+    const { assert!(SIZE == 8 || SIZE == 16) };
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, size: usize, buf: &mut [u8], p: usize, stride: usize, top: bool, left: bool) {
+            match size {
+                8 => dc_neon::<8>(buf, p, stride, top, left),
+                16 => dc_neon::<16>(buf, p, stride, top, left),
+                _ => unreachable!(),
+            }
+        }
+    }
+    enter(baseline(), SIZE, buf, p, stride, top, left)
 }
 
 #[target_feature(enable = "neon")]
@@ -802,11 +853,13 @@ fn dc_neon<const SIZE: usize>(buf: &mut [u8], p: usize, stride: usize, top: bool
 /// libwebp's `TransformDC`: `dc` (the DC coefficient plus rounding, shifted) added to the
 /// 4x4 pixels at `pos` of `dst`.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn add_dc(dc: i32, dst: &mut [u8], pos: usize, stride: usize) {
-    // SAFETY: NEON is part of the target's baseline, so `add_dc_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { add_dc_neon(dc, dst, pos, stride) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, dc: i32, dst: &mut [u8], pos: usize, stride: usize) {
+            add_dc_neon(dc, dst, pos, stride)
+        }
+    }
+    enter(baseline(), dc, dst, pos, stride)
 }
 
 #[target_feature(enable = "neon")]
@@ -842,11 +895,13 @@ fn check4(len: usize, p: usize, stride: usize) {
 
 /// libwebp's `VE4`.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn ve4(buf: &mut [u8], p: usize, stride: usize) {
-    // SAFETY: NEON is part of the target's baseline, so `ve4_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { ve4_neon(buf, p, stride) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, buf: &mut [u8], p: usize, stride: usize) {
+            ve4_neon(buf, p, stride)
+        }
+    }
+    enter(baseline(), buf, p, stride)
 }
 
 #[target_feature(enable = "neon")]
@@ -861,11 +916,13 @@ fn ve4_neon(buf: &mut [u8], p: usize, stride: usize) {
 
 /// libwebp's `LD4`.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn ld4(buf: &mut [u8], p: usize, stride: usize) {
-    // SAFETY: NEON is part of the target's baseline, so `ld4_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { ld4_neon(buf, p, stride) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, buf: &mut [u8], p: usize, stride: usize) {
+            ld4_neon(buf, p, stride)
+        }
+    }
+    enter(baseline(), buf, p, stride)
 }
 
 #[target_feature(enable = "neon")]
@@ -883,11 +940,13 @@ fn ld4_neon(buf: &mut [u8], p: usize, stride: usize) {
 
 /// libwebp's `RD4`.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn rd4(buf: &mut [u8], p: usize, stride: usize) {
-    // SAFETY: NEON is part of the target's baseline, so `rd4_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { rd4_neon(buf, p, stride) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, buf: &mut [u8], p: usize, stride: usize) {
+            rd4_neon(buf, p, stride)
+        }
+    }
+    enter(baseline(), buf, p, stride)
 }
 
 #[target_feature(enable = "neon")]
@@ -909,11 +968,13 @@ fn rd4_neon(buf: &mut [u8], p: usize, stride: usize) {
 
 /// libwebp's `VR4`.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn vr4(buf: &mut [u8], p: usize, stride: usize) {
-    // SAFETY: NEON is part of the target's baseline, so `vr4_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { vr4_neon(buf, p, stride) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, buf: &mut [u8], p: usize, stride: usize) {
+            vr4_neon(buf, p, stride)
+        }
+    }
+    enter(baseline(), buf, p, stride)
 }
 
 #[target_feature(enable = "neon")]
@@ -938,11 +999,13 @@ fn vr4_neon(buf: &mut [u8], p: usize, stride: usize) {
 
 /// libwebp's `VL4`.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn vl4(buf: &mut [u8], p: usize, stride: usize) {
-    // SAFETY: NEON is part of the target's baseline, so `vl4_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { vl4_neon(buf, p, stride) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, buf: &mut [u8], p: usize, stride: usize) {
+            vl4_neon(buf, p, stride)
+        }
+    }
+    enter(baseline(), buf, p, stride)
 }
 
 #[target_feature(enable = "neon")]
@@ -968,11 +1031,19 @@ fn vl4_neon(buf: &mut [u8], p: usize, stride: usize) {
 
 /// libwebp's `TrueMotion` of a `SIZE`x`SIZE` block (4, 8 or 16) at `p`.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn tm<const SIZE: usize>(buf: &mut [u8], p: usize, stride: usize) {
-    // SAFETY: NEON is part of the target's baseline, so `tm_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { tm_neon::<SIZE>(buf, p, stride) }
+    const { assert!(SIZE == 4 || SIZE == 8 || SIZE == 16) };
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, size: usize, buf: &mut [u8], p: usize, stride: usize) {
+            match size {
+                4 => tm_neon::<4>(buf, p, stride),
+                8 => tm_neon::<8>(buf, p, stride),
+                16 => tm_neon::<16>(buf, p, stride),
+                _ => unreachable!(),
+            }
+        }
+    }
+    enter(baseline(), SIZE, buf, p, stride)
 }
 
 #[target_feature(enable = "neon")]
@@ -1005,11 +1076,13 @@ fn tm_neon<const SIZE: usize>(buf: &mut [u8], p: usize, stride: usize) {
 /// needs clamping. Returns where it stopped: at a block that clamps or with fewer than 16
 /// pixels left.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn unfilter_gradient(prev: &[u8], row: &mut [u8], x: usize) -> usize {
-    // SAFETY: NEON is part of the target's baseline, so `unfilter_gradient_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { unfilter_gradient_neon(prev, row, x) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, prev: &[u8], row: &mut [u8], x: usize) -> usize {
+            unfilter_gradient_neon(prev, row, x)
+        }
+    }
+    enter(baseline(), prev, row, x)
 }
 
 #[target_feature(enable = "neon")]
@@ -1046,11 +1119,13 @@ fn unfilter_gradient_neon(prev: &[u8], row: &mut [u8], mut x: usize) -> usize {
 /// The horizontal alpha unfiltering of `row[x..]` (`row[x - 1]` done), a running sum 16
 /// pixels at a time. Returns where it stopped, with fewer than 16 pixels left.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn unfilter_horizontal(row: &mut [u8], x: usize) -> usize {
-    // SAFETY: NEON is part of the target's baseline, so `unfilter_horizontal_neon` runs on every
-    // CPU this code is compiled for.
-    unsafe { unfilter_horizontal_neon(row, x) }
+    fearless_simd::kernel! {
+        fn enter(_token: Neon, row: &mut [u8], x: usize) -> usize {
+            unfilter_horizontal_neon(row, x)
+        }
+    }
+    enter(baseline(), row, x)
 }
 
 #[target_feature(enable = "neon")]
